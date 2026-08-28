@@ -335,6 +335,43 @@ def test_inherited_affinity_child_is_not_terminal_without_explicit_opt_in(
     assert child["session_affinity"] == {"flow_id": "flow-7", "terminal": False}
 
 
+def test_explicit_affinity_child_normalizes_shared_workspace_to_dir(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban"))
+    monkeypatch.setenv("HERMES_PROFILE", "worker")
+    project_id = _project(tmp_path)
+    conn = kb.connect()
+    try:
+        parent_id = _task(conn, project_id, workspace=tmp_path, session_id="origin-session")
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", parent_id)
+    from tools import kanban_tools
+
+    child = json.loads(
+        kanban_tools._handle_create(
+            {
+                "title": "terminal shared workspace",
+                "assignee": "worker",
+                "parents": [parent_id],
+                "workspace_kind": "worktree",
+                "workspace_path": str(tmp_path),
+                "project": project_id,
+                "session_affinity": {"flow_id": "flow-7", "terminal": True},
+            }
+        )
+    )
+    assert "task_id" in child, child
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, child["task_id"])
+        assert task is not None
+        assert task.workspace_kind == "dir"
+        assert task.workspace_path == str(tmp_path)
+    finally:
+        conn.close()
+
+
 def test_terminal_child_copies_origin_subscription(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban"))

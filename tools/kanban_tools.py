@@ -1481,8 +1481,12 @@ def _handle_create(args: dict, **kw) -> str:
                                 "session_affinity requires the current worker's "
                                 "workspace"
                             )
-                        workspace_kind = _self_task.workspace_kind
                         workspace_path = _self_task.workspace_path
+                    # Affinity means several task rows intentionally share one
+                    # already-created workspace. ``worktree`` is task-scoped in
+                    # create_task/dispatcher and would be re-keyed to the child
+                    # id, so persist the shared path as an explicit directory.
+                    workspace_kind = "dir"
                 elif canonical_assignee == parent_assignee:
                     # Terminal delivery is an explicit opt-in for each child;
                     # do not accidentally make every descendant terminal.
