@@ -1499,7 +1499,7 @@ def _handle_create(args: dict, **kw) -> str:
                             "session_affinity requires the current worker's "
                             "workspace"
                         )
-                    workspace_kind = _self_task.workspace_kind
+                    workspace_kind = "dir"
                     workspace_path = _self_task.workspace_path
             # A project link is safe to inherit because ``create_task`` turns
             # it into a fresh per-task worktree. Never inherit the parent's
