@@ -2777,6 +2777,26 @@ def cmd_chat(args):
             sys.exit(1)
         args.no_restore_cwd = True
 
+    # Affinity resume is stricter than an interactive resume: a missing,
+    # closed, or otherwise unreadable session must fail before the worker
+    # reaches the model loop.  The ordinary resume resolver intentionally
+    # reopens closed sessions, which is unsafe for a fenced Kanban flow.
+    if os.environ.get("HERMES_KANBAN_AFFINITY_TOKEN") and getattr(args, "resume", None):
+        try:
+            from hermes_cli.kanban_db import validate_worker_resume_session
+
+            validate_worker_resume_session(
+                args.resume,
+                db_path=Path(os.environ["HERMES_HOME"]) / "state.db"
+                if os.environ.get("HERMES_HOME")
+                else None,
+                workspace_path=os.getcwd(),
+                expected_profile=os.environ.get("HERMES_PROFILE"),
+            )
+        except Exception as exc:
+            print(f"Error: Kanban affinity resume rejected: {exc}")
+            sys.exit(1)
+
     # --resume latest: keyword for "most recent session" — same resolution
     # as `-c` with no name (workspace-scoped MRU, then global fallback).
     # The keyword wins over a session literally titled "latest"; that

@@ -78,6 +78,15 @@ def _launch_cwd_for_session(source: str) -> Optional[str]:
     a non-"local" backend (docker/ssh/modal/...) means the host cwd is
     irrelevant to the agent's tools, so we skip it there too.
     """
+    if source == "kanban":
+        workspace = (
+            os.environ.get("HERMES_KANBAN_WORKSPACE")
+            or os.environ.get("TERMINAL_CWD")
+            or ""
+        ).strip()
+        if workspace and os.path.isabs(workspace) and os.path.isdir(workspace):
+            return workspace
+        return None
     if source != "cli":
         return None
     backend = (os.environ.get("TERMINAL_ENV") or "local").strip().lower()
@@ -116,6 +125,7 @@ from agent.process_bootstrap import (
 )
 from agent.iteration_budget import IterationBudget
 from agent.interrupt_compat import request_hard_interrupt
+from hermes_cli.kanban_affinity import AffinityRegistrationError
 
 
 from hermes_cli.env_loader import load_hermes_dotenv
@@ -666,8 +676,26 @@ class AIAgent:
                 cwd=_launch_cwd_for_session(source),
                 profile_name=_profile_for_session,
             )
+            # A Kanban affinity worker must bind the real session id it just
+            # created before entering the model loop.  This is deliberately
+            # after SessionDB creation: the dispatcher cannot know the id of
+            # a first-run session in advance, and a late/stale worker must not
+            # be able to replace the fenced binding.
+            if os.environ.get("HERMES_KANBAN_AFFINITY_TOKEN"):
+                from hermes_cli.kanban_db import register_worker_session_from_env
+
+                if not register_worker_session_from_env(self.session_id):
+                    raise AffinityRegistrationError(
+                        "worker session affinity registration was rejected"
+                    )
             self._session_db_created = True
+        except AffinityRegistrationError:
+            raise
         except Exception as e:
+            if os.environ.get("HERMES_KANBAN_AFFINITY_TOKEN"):
+                raise AffinityRegistrationError(
+                    f"session DB creation failed for affinity worker: {e}"
+                ) from e
             # Transient failure (e.g. SQLite lock). Keep _session_db alive —
             # _session_db_created stays False so next run_conversation() retries.
             logger.warning(
@@ -8320,6 +8348,17 @@ class AIAgent:
         from agent.subagent_lifecycle import bind_subagent_parent
         effective_task_id = task_id or str(uuid.uuid4())
         session_id = str(getattr(self, "session_id", None) or "")
+        if os.environ.get("HERMES_KANBAN_AFFINITY_TOKEN"):
+            # Registration is a precondition of model work. Do not let a
+            # failed/stale fence degrade into an unbound session merely
+            # because the normal persistence path treats SQLite errors as
+            # best-effort.
+            if not self._session_db_created:
+                self._ensure_db_session()
+            if not self._session_db_created:
+                raise AffinityRegistrationError(
+                    "worker session affinity registration was rejected"
+                )
         task_context = {
             "session_id": session_id,
             "task_id": effective_task_id,

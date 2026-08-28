@@ -89,6 +89,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
 
+from hermes_cli.kanban_exit_codes import (
+    KANBAN_PROTOCOL_EXIT_CODE,
+    KANBAN_RATE_LIMIT_EXIT_CODE,
+)
+from hermes_cli.kanban_affinity import normalize_session_affinity
+from hermes_cli.kanban_affinity import (
+    AffinityBusy,
+    AffinityLease,
+    AffinityRegistrationError,
+)
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
 
@@ -101,6 +111,7 @@ _log = logging.getLogger(__name__)
 
 VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
+VALID_ORIGIN_SIGNALS = {"input", "revision"}
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
 # worker (or human) means by "blocked", so each can be routed differently
@@ -1134,6 +1145,14 @@ class Task:
     # set the env var. Lets clients render a per-session board without
     # relying on tenant + time-window heuristics.
     session_id: Optional[str] = None
+    # Logical flow affinity for the one worker session shared by a
+    # project/flow/profile tuple. Stored as a normalized JSON object.
+    session_affinity: Optional[dict] = None
+    # True when the persisted affinity JSON was present but could not be
+    # decoded as an object. Keep this separate from None: None is the
+    # intentional legacy/no-affinity value, while corruption must fail closed
+    # at dispatch instead of silently downgrading the task to a legacy worker.
+    session_affinity_corrupt: bool = False
     # Typed block reason (one of VALID_BLOCK_KINDS) or None for legacy/un-typed
     # blocks. Set by ``block_task``; preserved across unblock so a re-block for
     # the same kind is recognisable as an unblock↔re-block loop.
@@ -1154,6 +1173,17 @@ class Task:
                     skills_value = [str(s) for s in parsed if s]
             except Exception:
                 skills_value = None
+        affinity_value: Optional[dict] = None
+        affinity_corrupt = False
+        if "session_affinity" in keys and row["session_affinity"] is not None:
+            try:
+                parsed_affinity = json.loads(row["session_affinity"])
+                if isinstance(parsed_affinity, dict):
+                    affinity_value = parsed_affinity
+                else:
+                    affinity_corrupt = True
+            except Exception:
+                affinity_corrupt = True
         return cls(
             id=row["id"],
             title=row["title"],
@@ -1227,6 +1257,8 @@ class Task:
             session_id=(
                 row["session_id"] if "session_id" in keys else None
             ),
+            session_affinity=affinity_value,
+            session_affinity_corrupt=affinity_corrupt,
             block_kind=(
                 row["block_kind"] if "block_kind" in keys and row["block_kind"] else None
             ),
@@ -1236,6 +1268,391 @@ class Task:
                 else 0
             ),
         )
+
+
+def get_session_affinity(
+    conn: sqlite3.Connection,
+    task_or_id: Task | str,
+    *,
+    board: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
+    """Return the current fenced lease for an affinity task, if any."""
+    task = task_or_id if isinstance(task_or_id, Task) else get_task(conn, task_or_id)
+    if task is None or not task.session_affinity:
+        return None
+    board = _normalize_board_slug(board) or get_current_board()
+    row = conn.execute(
+        """SELECT board, project_id, flow_id, assignee, session_id,
+                  generation, lease_token, owner_task_id, owner_run_id,
+                  owner_claim_lock, workspace_path, updated_at
+             FROM kanban_session_affinity
+            WHERE board = ? AND project_id = ? AND flow_id = ? AND assignee = ?""",
+        (
+            board,
+            task.project_id,
+            task.session_affinity["flow_id"],
+            task.assignee,
+        ),
+    ).fetchone()
+    if row is None:
+        return None
+    result = dict(row)
+    result["terminal"] = bool(task.session_affinity.get("terminal", False))
+    return result
+
+
+def reserve_session_affinity(
+    conn: sqlite3.Connection,
+    task: Task,
+    *,
+    workspace_path: Optional[str] = None,
+    board: Optional[str] = None,
+) -> Optional[AffinityLease]:
+    """Fence the sole worker for a task's logical session affinity.
+
+    The reservation is made after task claim and before subprocess spawn. A
+    live reservation is never replaced; callers should leave the task ready for
+    a later tick when :class:`AffinityBusy` is raised.
+    """
+    if getattr(task, "session_affinity_corrupt", False):
+        raise AffinityRegistrationError("session affinity is corrupt")
+    affinity = normalize_session_affinity(task.session_affinity)
+    if affinity is None:
+        return None
+    if not task.project_id or not task.assignee:
+        raise AffinityRegistrationError(
+            "session affinity requires a canonical project and assignee"
+        )
+    board_slug = _normalize_board_slug(board) or get_current_board()
+    workspace = workspace_path or task.workspace_path
+    if not workspace or not os.path.isabs(str(workspace)):
+        raise AffinityRegistrationError(
+            "session affinity requires an absolute current workspace"
+        )
+    now = int(time.time())
+    token = secrets.token_urlsafe(32)
+    with write_txn(conn):
+        row = conn.execute(
+            """SELECT * FROM kanban_session_affinity
+                WHERE board = ? AND project_id = ? AND flow_id = ? AND assignee = ?""",
+            (board_slug, task.project_id, affinity["flow_id"], task.assignee),
+        ).fetchone()
+        if row is None:
+            prior = conn.execute(
+                """SELECT 1 FROM tasks t
+                    WHERE t.id != ? AND t.project_id = ? AND t.assignee = ?
+                      AND json_extract(t.session_affinity, '$.flow_id') = ?
+                      AND EXISTS (SELECT 1 FROM task_runs r WHERE r.task_id = t.id AND r.ended_at IS NOT NULL)
+                    LIMIT 1""",
+                (task.id, task.project_id, task.assignee, affinity["flow_id"]),
+            ).fetchone()
+            prior_run = conn.execute(
+                "SELECT 1 FROM task_runs WHERE task_id = ? AND id != ? LIMIT 1",
+                (task.id, task.current_run_id),
+            ).fetchone()
+            if prior is not None or prior_run is not None:
+                raise AffinityRegistrationError(
+                    "session affinity lease is missing or stale"
+                )
+        if row is not None and row["lease_token"]:
+            owner = conn.execute(
+                "SELECT status, current_run_id, claim_lock FROM tasks WHERE id = ?",
+                (row["owner_task_id"],),
+            ).fetchone()
+            if (
+                owner is not None
+                and owner["status"] == "running"
+                and owner["current_run_id"] == row["owner_run_id"]
+                and owner["claim_lock"] == row["owner_claim_lock"]
+            ):
+                raise AffinityBusy(
+                    f"affinity flow {affinity['flow_id']!r} is already running"
+                )
+        if row is not None and row["workspace_path"]:
+            if os.path.realpath(str(row["workspace_path"])) != os.path.realpath(str(workspace)):
+                raise AffinityRegistrationError(
+                    "session affinity workspace does not match the flow's "
+                    "canonical workspace"
+                )
+        if row is not None and row["generation"] > 0 and not row["session_id"]:
+            raise AffinityRegistrationError(
+                "session affinity lease has no registered session"
+            )
+        generation = int(row["generation"] if row is not None else 0) + 1
+        existing_session = row["session_id"] if row is not None else None
+        conn.execute(
+            """INSERT INTO kanban_session_affinity
+                  (board, project_id, flow_id, assignee, session_id,
+                   generation, lease_token, owner_task_id, owner_run_id,
+                   owner_claim_lock, workspace_path, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(board, project_id, flow_id, assignee) DO UPDATE SET
+                   session_id = excluded.session_id,
+                   generation = excluded.generation,
+                   lease_token = excluded.lease_token,
+                   owner_task_id = excluded.owner_task_id,
+                   owner_run_id = excluded.owner_run_id,
+                   owner_claim_lock = excluded.owner_claim_lock,
+                   workspace_path = excluded.workspace_path,
+                   updated_at = excluded.updated_at""",
+            (
+                board_slug,
+                task.project_id,
+                affinity["flow_id"],
+                task.assignee,
+                existing_session,
+                generation,
+                token,
+                task.id,
+                task.current_run_id,
+                task.claim_lock,
+                workspace,
+                now,
+            ),
+        )
+    return AffinityLease(
+        board=board_slug,
+        project_id=task.project_id,
+        flow_id=affinity["flow_id"],
+        assignee=task.assignee,
+        generation=generation,
+        token=token,
+        session_id=existing_session,
+        terminal=bool(affinity["terminal"]),
+    )
+
+
+def register_session_affinity(
+    conn: sqlite3.Connection,
+    task: Task,
+    lease: AffinityLease,
+    *,
+    session_id: str,
+) -> bool:
+    """Bind the actual Hermes session id to a still-valid worker lease."""
+    if not session_id or not session_id.strip():
+        raise AffinityRegistrationError("worker session_id is required")
+    task_affinity = normalize_session_affinity(task.session_affinity)
+    if (
+        task_affinity is None
+        or not task.project_id
+        or task.assignee != lease.assignee
+        or task.project_id != lease.project_id
+        or task_affinity["flow_id"] != lease.flow_id
+    ):
+        raise AffinityRegistrationError("worker lease identity does not match task")
+    with write_txn(conn):
+        current = conn.execute(
+            "SELECT status, current_run_id, claim_lock FROM tasks WHERE id = ?",
+            (task.id,),
+        ).fetchone()
+        row = conn.execute(
+            """SELECT session_id FROM kanban_session_affinity
+                WHERE board = ? AND project_id = ? AND flow_id = ? AND assignee = ?
+                  AND generation = ? AND lease_token = ?
+                  AND owner_task_id = ? AND owner_run_id = ?
+                  AND owner_claim_lock = ?""",
+            (
+                lease.board,
+                lease.project_id,
+                lease.flow_id,
+                lease.assignee,
+                lease.generation,
+                lease.token,
+                task.id,
+                task.current_run_id,
+                task.claim_lock,
+            ),
+        ).fetchone()
+        if (
+            current is None
+            or current["status"] != "running"
+            or current["current_run_id"] != task.current_run_id
+            or current["claim_lock"] != task.claim_lock
+            or row is None
+        ):
+            raise AffinityRegistrationError("worker lease is stale or fenced")
+        previous = row["session_id"]
+        if previous and previous != session_id:
+            raise AffinityRegistrationError(
+                "worker session does not match the flow's exact session"
+            )
+        conn.execute(
+            """UPDATE kanban_session_affinity
+                  SET session_id = ?, updated_at = ?
+                WHERE board = ? AND project_id = ? AND flow_id = ? AND assignee = ?
+                  AND generation = ? AND lease_token = ?""",
+            (
+                session_id,
+                int(time.time()),
+                lease.board,
+                lease.project_id,
+                lease.flow_id,
+                lease.assignee,
+                lease.generation,
+                lease.token,
+            ),
+        )
+    return True
+
+
+def release_session_affinity(
+    conn: sqlite3.Connection, lease: Optional[AffinityLease], *, reason: Optional[str] = None,
+) -> bool:
+    """Release a lease without deleting its exact session binding."""
+    if lease is None:
+        return False
+    with write_txn(conn):
+        cur = conn.execute(
+            """UPDATE kanban_session_affinity
+                  SET lease_token = NULL, owner_task_id = NULL,
+                      owner_run_id = NULL, owner_claim_lock = NULL,
+                      updated_at = ?
+                WHERE board = ? AND project_id = ? AND flow_id = ? AND assignee = ?
+                  AND generation = ? AND lease_token = ?""",
+            (
+                int(time.time()), lease.board, lease.project_id, lease.flow_id,
+                lease.assignee, lease.generation, lease.token,
+            ),
+        )
+    return bool(cur.rowcount)
+
+
+def register_worker_session_from_env(session_id: str) -> bool:
+    """Register a worker's real session using dispatcher-provided env fences."""
+    task_id = os.environ.get("HERMES_KANBAN_TASK")
+    token = os.environ.get("HERMES_KANBAN_AFFINITY_TOKEN")
+    generation = os.environ.get("HERMES_KANBAN_AFFINITY_GENERATION")
+    flow_id = os.environ.get("HERMES_KANBAN_AFFINITY_FLOW_ID")
+    project_id = os.environ.get("HERMES_KANBAN_AFFINITY_PROJECT_ID")
+    run_id = os.environ.get("HERMES_KANBAN_RUN_ID")
+    claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
+    if not all((task_id, token, generation, flow_id, project_id, run_id, claim_lock)):
+        return False
+    try:
+        conn = connect(board=os.environ.get("HERMES_KANBAN_BOARD"))
+        try:
+            task = get_task(conn, task_id)
+            if task is None:
+                return False
+            try:
+                if task.current_run_id != int(run_id) or task.claim_lock != claim_lock:
+                    return False
+            except (TypeError, ValueError):
+                return False
+            try:
+                from hermes_cli.profiles import resolve_profile_env
+
+                validate_worker_resume_session(
+                    session_id,
+                    db_path=Path(resolve_profile_env(task.assignee or "")) / "state.db",
+                    workspace_path=os.environ.get("HERMES_KANBAN_WORKSPACE"),
+                    expected_profile=task.assignee,
+                )
+            except AffinityRegistrationError:
+                return False
+            except (OSError, ValueError, TypeError):
+                return False
+            lease = AffinityLease(
+                board=_normalize_board_slug(os.environ.get("HERMES_KANBAN_BOARD"))
+                or get_current_board(),
+                project_id=project_id,
+                flow_id=flow_id,
+                assignee=task.assignee or "",
+                generation=int(generation),
+                token=token,
+            )
+            return register_session_affinity(
+                conn, task, lease, session_id=session_id,
+            )
+        finally:
+            conn.close()
+    except (AffinityRegistrationError, ValueError, TypeError, sqlite3.Error):
+        _log.warning("kanban worker session affinity registration rejected", exc_info=True)
+        return False
+
+
+def validate_worker_resume_session(
+    session_id: str,
+    *,
+    db_path: Optional[Path | str] = None,
+    workspace_path: Optional[str] = None,
+    expected_profile: Optional[str] = None,
+) -> dict[str, Any]:
+    """Validate an affinity worker's exact session before it does work.
+
+    Unlike the normal CLI resume path, affinity workers may not silently turn
+    a missing or closed session into a new session.  Returning a descriptive
+    :class:`AffinityRegistrationError` lets the dispatcher record a durable
+    failure instead of allowing a worker to act in an unrelated context.
+    """
+    if not isinstance(session_id, str) or not session_id.strip():
+        raise AffinityRegistrationError("affinity session is missing")
+    session_db = None
+    try:
+        from hermes_state import SessionDB
+
+        session_db = SessionDB(
+            db_path=Path(db_path) if db_path is not None else None,
+            read_only=True,
+        )
+        row = session_db.get_session(session_id)
+        if row is None:
+            raise AffinityRegistrationError(
+                f"affinity session {session_id!r} is missing"
+            )
+        if row.get("ended_at") is not None:
+            raise AffinityRegistrationError(
+                f"affinity session {session_id!r} is closed"
+            )
+        if row.get("source") != "kanban":
+            raise AffinityRegistrationError(
+                f"affinity session {session_id!r} has an invalid source"
+            )
+        if expected_profile:
+            expected = _canonical_assignee(expected_profile)
+            recorded = row.get("profile_name")
+            if recorded and _canonical_assignee(str(recorded)) != expected:
+                raise AffinityRegistrationError(
+                    f"affinity session {session_id!r} belongs to a different profile"
+                )
+            if not recorded and expected != "default":
+                raise AffinityRegistrationError(
+                    f"affinity session {session_id!r} has no profile binding"
+                )
+        if workspace_path:
+            recorded_cwd = row.get("cwd")
+            if not recorded_cwd:
+                raise AffinityRegistrationError(
+                    f"affinity session {session_id!r} has no workspace binding"
+                )
+            if os.path.realpath(str(recorded_cwd)) != os.path.realpath(workspace_path):
+                raise AffinityRegistrationError(
+                    f"affinity session {session_id!r} is bound to a different workspace"
+                )
+        try:
+            messages = session_db.get_messages(session_id)
+        except Exception as exc:
+            raise AffinityRegistrationError(
+                f"affinity session {session_id!r} is corrupt"
+            ) from exc
+        if not isinstance(messages, list):
+            raise AffinityRegistrationError(
+                f"affinity session {session_id!r} is corrupt"
+            )
+        return row
+    except AffinityRegistrationError:
+        raise
+    except Exception as exc:
+        raise AffinityRegistrationError(
+            f"affinity session {session_id!r} is missing or unreadable"
+        ) from exc
+    finally:
+        if session_db is not None:
+            try:
+                session_db.close()
+            except Exception:
+                pass
 
 
 @dataclass
@@ -1410,6 +1827,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- set the env var. Indexed so per-session list queries stay cheap on
     -- larger boards.
     session_id           TEXT,
+    -- Optional logical-session affinity. Stored as JSON with flow_id and
+    -- terminal; the dispatcher uses the tuple (board, project, flow,
+    -- assignee) to resume one exact worker session at a time.
+    session_affinity     TEXT,
     -- Typed block reason set by ``block_task`` (one of VALID_BLOCK_KINDS, or
     -- NULL for legacy/un-typed blocks). Drives routing: ``dependency`` never
     -- sits in ``blocked`` (goes to ``todo`` for parent-gating); the others go
@@ -1423,6 +1844,25 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
     block_recurrences    INTEGER NOT NULL DEFAULT 0
+);
+
+-- One fenced worker session per logical flow/profile/project. ``lease_token``
+-- is cleared when a run exits; ``generation`` fences late workers from an old
+-- attempt even when their process survives a reclaim.
+CREATE TABLE IF NOT EXISTS kanban_session_affinity (
+    board              TEXT NOT NULL,
+    project_id         TEXT NOT NULL,
+    flow_id            TEXT NOT NULL,
+    assignee           TEXT NOT NULL,
+    session_id         TEXT,
+    generation         INTEGER NOT NULL DEFAULT 0,
+    lease_token        TEXT,
+    owner_task_id      TEXT,
+    owner_run_id       INTEGER,
+    owner_claim_lock   TEXT,
+    workspace_path     TEXT,
+    updated_at         INTEGER NOT NULL,
+    PRIMARY KEY (board, project_id, flow_id, assignee)
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2662,6 +3102,10 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(
             conn, "tasks", "session_id", "session_id TEXT"
         )
+    if "session_affinity" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "session_affinity", "session_affinity TEXT"
+        )
 
     if "block_kind" not in cols:
         # Typed block reason (VALID_BLOCK_KINDS) or NULL for legacy/un-typed
@@ -2690,9 +3134,38 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_idempotency ON tasks(idempotency_key)"
     )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)")
     conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)"
+        """CREATE TABLE IF NOT EXISTS kanban_session_affinity (
+            board TEXT NOT NULL,
+            project_id TEXT NOT NULL,
+            flow_id TEXT NOT NULL,
+            assignee TEXT NOT NULL,
+            session_id TEXT,
+            generation INTEGER NOT NULL DEFAULT 0,
+            lease_token TEXT,
+            owner_task_id TEXT,
+            owner_run_id INTEGER,
+            owner_claim_lock TEXT,
+            workspace_path TEXT,
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY (board, project_id, flow_id, assignee)
+        )"""
     )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_affinity_session "
+        "ON kanban_session_affinity(session_id)"
+    )
+
+    attachment_cols = {
+        row["name"] for row in conn.execute("PRAGMA table_info(task_attachments)")
+    }
+    if attachment_cols and "sha256" not in attachment_cols:
+        # Legacy rows remain NULL: their original sender digest is unknown, so
+        # hashing current bytes would falsely certify already-corrupt evidence.
+        _add_column_if_missing(
+            conn, "task_attachments", "sha256", "sha256 TEXT"
+        )
 
     # task_events gained a run_id column; back-fill it as NULL for
     # historical events (they predate runs and can't be attributed).
@@ -3180,6 +3653,7 @@ def create_task(
     goal_max_turns: Optional[int] = None,
     initial_status: str = "running",
     session_id: Optional[str] = None,
+    session_affinity: Optional[Mapping[str, Any]] = None,
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
@@ -3226,6 +3700,7 @@ def create_task(
     model_override = (model_override or "").strip() or None
     provider_override = (provider_override or "").strip() or None
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
+    session_affinity = normalize_session_affinity(session_affinity)
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
     assignee = _canonical_assignee(assignee)
@@ -3346,7 +3821,41 @@ def create_task(
                 # ``<repo>/.worktrees/<task-id>`` dir keyed on the new task id.
                 project_repo = str(project_obj.primary_path)
 
+    if session_affinity is not None and not project_id:
+        raise ValueError("session-affinity tasks require a canonical project_id")
+
     parents = tuple(p for p in parents if p)
+    if session_affinity is not None and parents:
+        parent_rows = conn.execute(
+            f"""SELECT project_id, assignee, session_affinity FROM tasks
+                WHERE id IN ({','.join('?' * len(parents))})""",
+            parents,
+        ).fetchall()
+        affinity_parents = [
+            row for row in parent_rows if row["session_affinity"]
+        ]
+        if affinity_parents:
+            matching = False
+            for parent in affinity_parents:
+                try:
+                    parent_affinity = normalize_session_affinity(
+                        json.loads(parent["session_affinity"])
+                    )
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                if (
+                    parent_affinity
+                    and parent["project_id"] == project_id
+                    and parent["assignee"] == assignee
+                    and parent_affinity["flow_id"] == session_affinity["flow_id"]
+                ):
+                    matching = True
+                    break
+            if not matching:
+                raise ValueError(
+                    "session-affinity child must be a same-affinity child "
+                    "of its current worker task"
+                )
 
     # Normalise + validate skills: strip whitespace, drop empties, dedupe
     # (preserving order). Refuse commas inside a single name so we don't
@@ -3497,8 +4006,8 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, session_affinity
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3524,6 +4033,7 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        json.dumps(session_affinity) if session_affinity else None,
                     ),
                 )
                 for pid in parents:
@@ -3601,6 +4111,60 @@ def _inherit_notify_subs(
     parent_ids = tuple(dict.fromkeys(p for p in parents if p))
     if not parent_ids:
         return
+    child_row = conn.execute(
+        "SELECT session_affinity, project_id, assignee FROM tasks WHERE id = ?",
+        (child_id,),
+    ).fetchone()
+    if child_row is None:
+        return
+    child_affinity = None
+    if child_row["session_affinity"]:
+        try:
+            child_affinity = normalize_session_affinity(
+                json.loads(child_row["session_affinity"])
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            # Task creation validates this field.  Treat a corrupted legacy
+            # row as non-inheritable rather than copying a notification to an
+            # arbitrary flow.
+            return
+    parent_rows = conn.execute(
+        f"""SELECT id, project_id, assignee, session_affinity FROM tasks
+            WHERE id IN ({','.join('?' * len(parent_ids))})""",
+        parent_ids,
+    ).fetchall()
+    parent_has_affinity = any(row["session_affinity"] for row in parent_rows)
+    if child_affinity is not None or parent_has_affinity:
+        # Ordinary affinity workers are intentionally silent to the origin.
+        # Only an explicitly terminal child may inherit the origin's
+        # subscription, and only from a same-flow/same-profile parent.
+        if child_affinity is None or not child_affinity["terminal"]:
+            return
+        matching_parents = []
+        for parent in parent_rows:
+            if (
+                parent["project_id"] != child_row["project_id"]
+                or parent["assignee"] != child_row["assignee"]
+                or not parent["session_affinity"]
+            ):
+                continue
+            try:
+                parent_affinity = normalize_session_affinity(
+                    json.loads(parent["session_affinity"])
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if parent_affinity and parent_affinity["flow_id"] == child_affinity["flow_id"]:
+                matching_parents.append(parent["id"])
+        parent_ids = tuple(matching_parents)
+        if not parent_ids:
+            return
+        # Ordinary affinity children deliberately do not carry the origin
+        # subscription, so a terminal grandchild cannot rely on copying from
+        # its immediate parent. Recover it from the trusted originating
+        # session provenance instead; the affinity/project/profile/flow checks
+        # above still constrain which child is allowed to do this.
+        _inherit_origin_signal_subs(conn, child_id, created_at=created_at)
     row = conn.execute(
         "SELECT COALESCE(MAX(id), 0) AS cursor FROM task_events WHERE task_id = ?",
         (child_id,),
@@ -3626,6 +4190,75 @@ def _inherit_notify_subs(
             *parent_ids,
         ),
     )
+
+
+def _inherit_origin_signal_subs(
+    conn: sqlite3.Connection, task_id: str, *, created_at: Optional[int] = None
+) -> None:
+    """Route one explicit origin signal to the trusted originating sub.
+
+    Affinity workers do not inherit ordinary origin subscriptions. A worker
+    can nevertheless ask for ``input`` or ``revision`` and wake the creator;
+    the existing task ``session_id`` is the trusted provenance key for finding
+    that creator's subscription. The subscription cursor starts at the
+    target's current event tail, so only the signal being written is delivered.
+    """
+    row = conn.execute(
+        "SELECT session_id FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None or not row["session_id"]:
+        return
+    cursor = conn.execute(
+        "SELECT COALESCE(MAX(id), 0) AS cursor FROM task_events WHERE task_id = ?",
+        (task_id,),
+    ).fetchone()
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO kanban_notify_subs
+            (task_id, platform, chat_id, thread_id, user_id, user_id_alt,
+             chat_type, notifier_profile, delivery_mode, delivery_metadata,
+             created_at, last_event_id)
+        SELECT ?, platform, chat_id, thread_id, user_id, user_id_alt,
+               COALESCE(chat_type, 'dm'), notifier_profile,
+               COALESCE(delivery_mode, 'notify'), delivery_metadata, ?, ?
+          FROM kanban_notify_subs s
+          JOIN tasks source ON source.id = s.task_id
+         WHERE source.session_id = ? AND s.task_id != ?
+        """,
+        (
+            task_id,
+            int(created_at if created_at is not None else time.time()),
+            int(cursor["cursor"] if cursor is not None else 0),
+            row["session_id"],
+            task_id,
+        ),
+    )
+
+
+def _route_affinity_terminal(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: str,
+    outcome: str = "failed",
+) -> bool:
+    """Emit one terminal flow event and route it to the origin subscription."""
+    task = get_task(conn, task_id)
+    if task is None or not task.session_affinity:
+        return False
+    with write_txn(conn):
+        _inherit_origin_signal_subs(conn, task_id)
+        _append_event(
+            conn,
+            task_id,
+            "flow_terminal",
+            {
+                "reason": str(reason)[:500],
+                "outcome": str(outcome),
+                "flow_id": task.session_affinity.get("flow_id"),
+            },
+        )
+    return True
 
 
 def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:
@@ -4375,6 +5008,21 @@ def _end_run(
     conn.execute(
         "UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,),
     )
+    # A lease protects only an active run. Preserve the exact session binding
+    # and generation for the next matching run, but clear ownership atomically
+    # with the run transition so a completed/crashed worker cannot block the
+    # flow or appear to remain the sole writer.
+    conn.execute(
+        """UPDATE kanban_session_affinity
+              SET lease_token = NULL,
+                  owner_task_id = NULL,
+                  owner_run_id = NULL,
+                  owner_claim_lock = NULL,
+                  updated_at = ?
+            WHERE owner_task_id = ? AND owner_run_id = ?
+              AND lease_token IS NOT NULL""",
+        (now, task_id, run_id),
+    )
     return run_id
 
 
@@ -4471,7 +5119,7 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     """
     row = conn.execute(
         "SELECT kind FROM task_events "
-        "WHERE task_id = ? AND kind IN ('blocked', 'unblocked') "
+        "WHERE task_id = ? AND kind IN ('blocked', 'origin_signal', 'unblocked') "
         "ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
@@ -4491,7 +5139,7 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
         "WHERE task_id = ? AND kind IN ("
         "'blocked', 'block_loop_detected', 'dependency_wait', 'gave_up', "
         "'unblocked', 'changes_requested', 'review_reopened', 'status', 'reclaimed', "
-        "'stale', 'timed_out', 'crashed', 'spawn_failed', 'rate_limited'"
+        "'stale', 'timed_out', 'crashed', 'spawn_failed', 'rate_limited', 'origin_signal'"
         ") ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
@@ -4734,6 +5382,38 @@ def claim_task(
         run_id=run_id,
     )
     return claimed
+
+
+def _release_claim_for_affinity_busy(
+    conn: sqlite3.Connection,
+    task: Task,
+    *,
+    source_status: str = "ready",
+) -> None:
+    """Return a claimed task to its source lane without charging a failure."""
+    with write_txn(conn):
+        conn.execute(
+            """UPDATE task_runs
+                  SET status = 'released', outcome = 'affinity_busy', ended_at = ?,
+                      claim_lock = NULL, claim_expires = NULL, worker_pid = NULL
+                WHERE id = ? AND status = 'running'""",
+            (int(time.time()), task.current_run_id),
+        )
+        conn.execute(
+            """UPDATE tasks
+                  SET status = ?, claim_lock = NULL,
+                      claim_expires = NULL, worker_pid = NULL,
+                      current_run_id = NULL
+                WHERE id = ? AND status = 'running' AND current_run_id = ?""",
+            (source_status, task.id, task.current_run_id),
+        )
+        _append_event(
+            conn,
+            task.id,
+            "affinity_deferred",
+            {"reason": "logical flow already has a live worker"},
+            run_id=task.current_run_id,
+        )
 
 
 def claim_review_task(
@@ -5435,10 +6115,21 @@ def complete_task(
         if not _parents_satisfied(conn, task_id):
             return False
         prior = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?",
+            "SELECT status, session_affinity FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         prior_status = prior["status"] if prior else None
+        flow_terminal = False
+        flow_id = None
+        if prior is not None and prior["session_affinity"]:
+            try:
+                prior_affinity = normalize_session_affinity(
+                    json.loads(prior["session_affinity"])
+                )
+                flow_terminal = bool(prior_affinity and prior_affinity["terminal"])
+                flow_id = prior_affinity["flow_id"] if prior_affinity else None
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
         if expected_run_id is None:
             cur = conn.execute(
                 """
@@ -5528,6 +6219,9 @@ def complete_task(
             "result_len": len(result) if result else 0,
             "summary": ev_summary or None,
         }
+        if flow_terminal:
+            _inherit_origin_signal_subs(conn, task_id)
+            completed_payload["flow_id"] = flow_id
         if verified_cards:
             completed_payload["verified_cards"] = verified_cards
         # Carry artifact paths in the event payload so the gateway
@@ -5545,7 +6239,7 @@ def complete_task(
                 if cleaned_artifacts:
                     completed_payload["artifacts"] = cleaned_artifacts
         _append_event(
-            conn, task_id, "completed",
+            conn, task_id, "flow_terminal" if flow_terminal else "completed",
             completed_payload,
             run_id=run_id,
         )
@@ -6168,6 +6862,7 @@ def block_task(
     *,
     reason: Optional[str] = None,
     kind: Optional[str] = None,
+    origin_signal: Optional[str] = None,
     expected_run_id: Optional[int] = None,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
@@ -6197,10 +6892,21 @@ def block_task(
     Returns True on any successful transition (to ``blocked``, ``todo``, or
     ``triage``), False when the task wasn't in a blockable state.
     """
+    if kind in VALID_ORIGIN_SIGNALS:
+        if origin_signal is not None and origin_signal != kind:
+            raise ValueError("block kind and origin_signal must match")
+        origin_signal = kind
+        kind = "needs_input"
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
+    if origin_signal is not None and origin_signal not in VALID_ORIGIN_SIGNALS:
+        raise ValueError(
+            f"origin_signal must be one of {sorted(VALID_ORIGIN_SIGNALS)} or None"
+        )
+    if origin_signal is not None and kind == "dependency":
+        raise ValueError("origin_signal cannot be used for dependency blocks")
     recurrences = 0
     with write_txn(conn):
         cur_row = conn.execute(
@@ -6258,6 +6964,7 @@ def block_task(
                     "reason": reason,
                     "kind": kind,
                     "source_status": source_status,
+                    "origin_signal": origin_signal,
                 },
                 run_id=run_id,
             )
@@ -6310,6 +7017,8 @@ def block_task(
                 run_id = _synthesize_ended_run(
                     conn, task_id, outcome="blocked", summary=reason,
                 )
+            if origin_signal:
+                _inherit_origin_signal_subs(conn, task_id)
             _append_event(
                 conn, task_id, "block_loop_detected",
                 {
@@ -6318,6 +7027,7 @@ def block_task(
                     "recurrences": recurrences,
                     "limit": BLOCK_RECURRENCE_LIMIT,
                     "source_status": source_status,
+                    "origin_signal": origin_signal,
                 },
                 run_id=run_id,
             )
@@ -6368,13 +7078,16 @@ def block_task(
                     outcome="blocked",
                     summary=reason,
                 )
+            if origin_signal:
+                _inherit_origin_signal_subs(conn, task_id)
             _append_event(
-                conn, task_id, "blocked",
+                conn, task_id, "origin_signal" if origin_signal else "blocked",
                 {
                     "reason": reason,
                     "kind": kind,
                     "recurrences": recurrences,
                     "source_status": source_status,
+                    "origin_signal": origin_signal,
                 },
                 run_id=run_id,
             )
@@ -7963,10 +8676,14 @@ class DispatchResult:
     ``(task_id, assignee, current_running_count)``. NOT an
     operator-actionable failure — the task will be picked up on a
     subsequent tick when the assignee has capacity. Separate bucket so
-    telemetry / dashboards can show "this profile is busy" vs
+    Separate bucket so telemetry / dashboards can show "this profile is busy" vs
     "task is genuinely stuck"."""
+    affinity_deferred: list[tuple[str, str]] = field(default_factory=list)
+    """Tasks deferred because another worker owns their logical flow lease."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
+    protocol_violations: list[str] = field(default_factory=list)
+    """Reclaimed worker ids whose turn ended without one valid durable handoff."""
     auto_blocked: list[str] = field(default_factory=list)
     """Task ids auto-blocked by the spawn-failure circuit breaker."""
     timed_out: list[str] = field(default_factory=list)
@@ -8446,6 +9163,10 @@ def enforce_max_runtime(
                     "retry_status": retry_status,
                 },
             )
+            if tripped:
+                _route_affinity_terminal(
+                    conn, tid, reason=failure_error, outcome="failed"
+                )
     return timed_out
 
 
@@ -8787,6 +9508,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     (the public return stays the crashed-only ``list[str]``).
     """
     crashed: list[str] = []
+    protocol_violations: list[str] = []
     rate_limited: list[str] = []
     # Per-crash details collected inside the main txn, used after it
     # closes to run ``_record_task_failure`` (which needs its own
@@ -8934,6 +9656,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     rate_limited.append(row["id"])
                 else:
                     if protocol_violation:
+                        protocol_violations.append(row["id"])
                         # Stamp the failure error now: a below-budget
                         # violation never reaches ``_record_task_failure``
                         # (which stamps this column for every other failure
@@ -9019,6 +9742,9 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 )
                 if tripped:
                     auto_blocked.append(tid)
+                    _route_affinity_terminal(
+                        conn, tid, reason=error_text, outcome="failed"
+                    )
                 continue
             fp = _error_fingerprint(error_text)
             is_systemic = _fp_counts.get(fp, 0) >= 3
@@ -9033,11 +9759,22 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             )
             if tripped:
                 auto_blocked.append(tid)
+                _route_affinity_terminal(
+                    conn, tid, reason=error_text, outcome="failed"
+                )
     # Stash auto-blocked ids on the function for the dispatch loop to pick up.
     # Keeps the public return type (``list[str]``) stable for direct callers
     # and tests that destructure the result; ``dispatch_once`` reads this
     # side-channel attribute to populate ``DispatchResult.auto_blocked``.
     detect_crashed_workers._last_auto_blocked = auto_blocked  # type: ignore[attr-defined]
+    # Explicit subset for telemetry: these are lifecycle protocol failures,
+    # not execution crashes, even though they remain in the compatibility
+    # ``crashed`` return list because their worker process was reclaimed.
+    setattr(
+        detect_crashed_workers,
+        "_last_protocol_violations",
+        protocol_violations,
+    )
     # Same side-channel for rate-limited requeues — these did NOT count a
     # failure and are NOT crashes, so they stay out of the ``crashed`` return.
     detect_crashed_workers._last_rate_limited = rate_limited  # type: ignore[attr-defined]
@@ -9659,6 +10396,9 @@ def _dispatch_once_locked(
         conn, stale_timeout_seconds=stale_timeout_seconds,
     )
     result.crashed = detect_crashed_workers(conn)
+    result.protocol_violations = list(
+        getattr(detect_crashed_workers, "_last_protocol_violations", [])
+    )
     # detect_crashed_workers stashes protocol-violation auto-blocks on
     # itself so the public list-return stays stable. Pull them into the
     # DispatchResult here so telemetry / tests see the trip.
@@ -9875,24 +10615,61 @@ def _dispatch_once_locked(
             )
             if auto:
                 result.auto_blocked.append(claimed.id)
+                _route_affinity_terminal(
+                    conn, claimed.id, reason=f"workspace: {exc}", outcome="failed"
+                )
             continue
         # Persist the resolved workspace path so the worker can cd there.
         set_workspace_path(conn, claimed.id, str(workspace))
         if claimed.workspace_kind == "worktree":
-            set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
+            effective_branch_name = (
+                resolved_branch_name
+                or (claimed.branch_name or "").strip()
+                or f"wt/{claimed.id}"
+            )
+            set_branch_name(conn, claimed.id, effective_branch_name)
+            # ``claimed`` predates the persistence above. Keep the object
+            # passed to _default_spawn in sync so the first spawn exports
+            # HERMES_KANBAN_BRANCH instead of only later retries seeing it.
+            claimed.branch_name = effective_branch_name
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
+        affinity_lease = None
+        if claimed.session_affinity or claimed.session_affinity_corrupt:
+            try:
+                affinity_lease = reserve_session_affinity(
+                    conn, claimed, workspace_path=str(workspace), board=board,
+                )
+            except AffinityBusy as exc:
+                _release_claim_for_affinity_busy(conn, claimed)
+                result.affinity_deferred.append((claimed.id, str(exc)))
+                continue
+            except (AffinityRegistrationError, ValueError) as exc:
+                auto = _record_spawn_failure(
+                    conn, claimed.id, f"session affinity: {exc}",
+                    failure_limit=failure_limit,
+                )
+                if auto:
+                    result.auto_blocked.append(claimed.id)
+                    _route_affinity_terminal(
+                        conn, claimed.id,
+                        reason=f"session affinity: {exc}",
+                        outcome="failed",
+                    )
+                continue
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
             # Back-compat: older spawn_fn signatures accept only
             # (task, workspace). Test stubs in the suite rely on that.
-            # Introspect the callable and pass `board` only when supported.
+            # Introspect the callable and pass affinity/board only when supported.
             import inspect
             try:
                 sig = inspect.signature(_spawn)
+                spawn_kwargs = {}
+                if "affinity" in sig.parameters:
+                    spawn_kwargs["affinity"] = affinity_lease
                 if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
-                else:
-                    pid = _spawn(claimed, str(workspace))
+                    spawn_kwargs["board"] = board
+                pid = _spawn(claimed, str(workspace), **spawn_kwargs)
             except (TypeError, ValueError):
                 pid = _spawn(claimed, str(workspace))
             if pid:
@@ -9916,17 +10693,21 @@ def _dispatch_once_locked(
             # Track the new in-flight count for this profile so later
             # iterations in this same tick respect the per-profile cap
             # (#21582). Subsequent ticks re-query from the DB.
-            if _per_profile_cap is not None and claimed.assignee:
+            if _profile_limits_enabled and claimed.assignee:
                 _per_profile_running[claimed.assignee] = (
                     _per_profile_running.get(claimed.assignee, 0) + 1
                 )
         except Exception as exc:
+            release_session_affinity(conn, affinity_lease, reason="spawn_failed")
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
                 failure_limit=failure_limit,
             )
             if auto:
                 result.auto_blocked.append(claimed.id)
+                _route_affinity_terminal(
+                    conn, claimed.id, reason=str(exc), outcome="failed"
+                )
 
     # ---- review column dispatch ----
     # Review tasks are tasks that a worker moved to 'review' after
@@ -10002,12 +10783,49 @@ def _dispatch_once_locked(
             )
             if auto:
                 result.auto_blocked.append(claimed.id)
+                _route_affinity_terminal(
+                    conn, claimed.id, reason=f"workspace: {exc}", outcome="failed"
+                )
             continue
         # Persist the resolved workspace path so the worker can cd there.
         set_workspace_path(conn, claimed.id, str(workspace))
         if claimed.workspace_kind == "worktree":
-            set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
+            effective_branch_name = (
+                resolved_branch_name
+                or (claimed.branch_name or "").strip()
+                or f"wt/{claimed.id}"
+            )
+            set_branch_name(conn, claimed.id, effective_branch_name)
+            # ``claimed`` predates the persistence above. Keep the object
+            # passed to _default_spawn in sync so the first spawn exports
+            # HERMES_KANBAN_BRANCH instead of only later retries seeing it.
+            claimed.branch_name = effective_branch_name
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
+        affinity_lease = None
+        if claimed.session_affinity or claimed.session_affinity_corrupt:
+            try:
+                affinity_lease = reserve_session_affinity(
+                    conn, claimed, workspace_path=str(workspace), board=board,
+                )
+            except AffinityBusy as exc:
+                _release_claim_for_affinity_busy(
+                    conn, claimed, source_status="review"
+                )
+                result.affinity_deferred.append((claimed.id, str(exc)))
+                continue
+            except (AffinityRegistrationError, ValueError) as exc:
+                auto = _record_spawn_failure(
+                    conn, claimed.id, f"session affinity: {exc}",
+                    failure_limit=failure_limit,
+                )
+                if auto:
+                    result.auto_blocked.append(claimed.id)
+                    _route_affinity_terminal(
+                        conn, claimed.id,
+                        reason=f"session affinity: {exc}",
+                        outcome="failed",
+                    )
+                continue
         # Force-load the sdlc-review skill for review agents — it carries
         # the review logic (AC verification, merge, etc.). The mandatory
         # kanban lifecycle is already injected into every worker's system
@@ -10021,10 +10839,12 @@ def _dispatch_once_locked(
             import inspect
             try:
                 sig = inspect.signature(_spawn)
+                spawn_kwargs = {}
+                if "affinity" in sig.parameters:
+                    spawn_kwargs["affinity"] = affinity_lease
                 if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
-                else:
-                    pid = _spawn(claimed, str(workspace))
+                    spawn_kwargs["board"] = board
+                pid = _spawn(claimed, str(workspace), **spawn_kwargs)
             except (TypeError, ValueError):
                 pid = _spawn(claimed, str(workspace))
             if pid:
@@ -10036,17 +10856,21 @@ def _dispatch_once_locked(
             )
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
             spawned += 1
-            if _per_profile_cap is not None and claimed.assignee:
+            if _profile_limits_enabled and claimed.assignee:
                 _per_profile_running[claimed.assignee] = (
                     _per_profile_running.get(claimed.assignee, 0) + 1
                 )
         except Exception as exc:
+            release_session_affinity(conn, affinity_lease, reason="spawn_failed")
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
                 failure_limit=failure_limit,
             )
             if auto:
                 result.auto_blocked.append(claimed.id)
+                _route_affinity_terminal(
+                    conn, claimed.id, reason=str(exc), outcome="failed"
+                )
     return result
 
 
@@ -10343,6 +11167,7 @@ def _default_spawn(
     workspace: str,
     *,
     board: Optional[str] = None,
+    affinity: Optional[AffinityLease] = None,
 ) -> Optional[int]:
     """Fire-and-forget ``hermes -p <profile> chat -q ...`` subprocess.
 
@@ -10371,6 +11196,13 @@ def _default_spawn(
     # session binds ContextVars in this process.
     from gateway.session_context import _VAR_MAP
     for key in _VAR_MAP:
+        env.pop(key, None)
+    for key in (
+        "HERMES_KANBAN_AFFINITY_TOKEN",
+        "HERMES_KANBAN_AFFINITY_GENERATION",
+        "HERMES_KANBAN_AFFINITY_FLOW_ID",
+        "HERMES_KANBAN_AFFINITY_PROJECT_ID",
+    ):
         env.pop(key, None)
 
     # Inject HERMES_HOME so the worker reads the profile-scoped config.yaml
@@ -10423,6 +11255,18 @@ def _default_spawn(
         env["HERMES_KANBAN_RUN_ID"] = str(task.current_run_id)
     if task.claim_lock:
         env["HERMES_KANBAN_CLAIM_LOCK"] = task.claim_lock
+    if affinity is not None:
+        env["HERMES_KANBAN_AFFINITY_TOKEN"] = affinity.token
+        env["HERMES_KANBAN_AFFINITY_GENERATION"] = str(affinity.generation)
+        env["HERMES_KANBAN_AFFINITY_FLOW_ID"] = affinity.flow_id
+        env["HERMES_KANBAN_AFFINITY_PROJECT_ID"] = affinity.project_id
+        if affinity.session_id:
+            validate_worker_resume_session(
+                affinity.session_id,
+                db_path=Path(env["HERMES_HOME"]) / "state.db",
+                workspace_path=workspace,
+                expected_profile=profile_arg,
+            )
     # Goal-loop mode: the worker reads these and wraps its run in the
     # Ralph-style /goal judge loop (see cli.py quiet-mode path). Only set
     # when enabled so non-goal tasks keep a clean env.
@@ -10509,6 +11353,11 @@ def _default_spawn(
         "chat",
         "-q", prompt,
     ])
+    if affinity is not None:
+        # The task workspace is authoritative. ``--no-restore-cwd`` prevents
+        # the resumed session's historical cwd from overriding that pin.
+        cmd.extend(["--resume", affinity.session_id] if affinity.session_id else [])
+        cmd.extend(["--in", workspace, "--no-restore-cwd"])
     if task.goal_mode:
         # Goal-mode workers must take the fully-quiet single-query path:
         # the kanban goal-loop hook (_run_kanban_goal_loop_q) only runs in

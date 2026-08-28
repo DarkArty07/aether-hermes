@@ -217,7 +217,7 @@ class GatewayKanbanWatchersMixin:
         # but is not a block (see kanban_db.request_review); the task is not
         # archived, so the subscription stays alive and later review
         # cycles keep notifying.
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested")
+        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "origin_signal", "flow_terminal")
         # Subscriptions are removed only when the task reaches the irreversible
         # archived status. ``done`` is reversible in review/controller flows,
         # so removing its subscription would silence a later reopen. We used
@@ -432,17 +432,27 @@ class GatewayKanbanWatchersMixin:
                                             sub.get("task_id"), platform or "<missing>",
                                         )
                                         continue
+                                    task = _kb.get_task(conn, sub["task_id"])
+                                    notify_kinds = TERMINAL_KINDS
+                                    if task is not None and task.session_affinity:
+                                        # Affinity flows keep their origin
+                                        # subscription silent for internal
+                                        # lifecycle milestones. Only explicit
+                                        # origin signals and flow terminal
+                                        # events cross this boundary.
+                                        notify_kinds = (
+                                            "origin_signal", "flow_terminal"
+                                        )
                                     old_cursor, cursor, events = _kb.claim_unseen_events_for_sub(
                                         conn,
                                         task_id=sub["task_id"],
                                         platform=sub["platform"],
                                         chat_id=sub["chat_id"],
                                         thread_id=sub.get("thread_id") or "",
-                                        kinds=TERMINAL_KINDS,
+                                        kinds=notify_kinds,
                                     )
                                     if not events:
                                         continue
-                                    task = _kb.get_task(conn, sub["task_id"])
                                     logger.debug(
                                         "kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                                         len(events), sub["task_id"], slug, old_cursor, cursor,
@@ -560,6 +570,27 @@ class GatewayKanbanWatchersMixin:
                             if ev.payload and ev.payload.get("reason"):
                                 reason = f": {str(ev.payload['reason'])[:160]}"
                             msg = f"⏸ {board_tag}{tag}Kanban {sub['task_id']} blocked{reason}"
+                        elif kind == "origin_signal":
+                            signal = "input"
+                            if ev.payload and ev.payload.get("origin_signal"):
+                                signal = str(ev.payload["origin_signal"])
+                            reason = ""
+                            if ev.payload and ev.payload.get("reason"):
+                                reason = f": {str(ev.payload['reason'])[:160]}"
+                            msg = (
+                                f"⚠ {board_tag}{tag}Kanban {sub['task_id']} "
+                                f"requests {signal}{reason}"
+                            )
+                        elif kind == "flow_terminal":
+                            reason = ""
+                            if ev.payload and ev.payload.get("summary"):
+                                reason = f" — {str(ev.payload['summary'])[:200]}"
+                            elif ev.payload and ev.payload.get("reason"):
+                                reason = f": {str(ev.payload['reason'])[:200]}"
+                            msg = (
+                                f"■ {board_tag}{tag}Kanban {sub['task_id']} "
+                                f"flow terminal{reason}"
+                            )
                         elif kind == "gave_up":
                             err = ""
                             if ev.payload and ev.payload.get("error"):
@@ -759,7 +790,7 @@ class GatewayKanbanWatchersMixin:
                         #   claim exactly like a failed send() above, so the
                         #   next tick retries.
                         task_terminal = task and task.status == "archived"
-                        _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked")
+                        _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "origin_signal", "flow_terminal")
                         _wake_kinds = (
                             {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
                             if wake_agent
@@ -796,6 +827,10 @@ class GatewayKanbanWatchersMixin:
                             if "crashed" in _wake_kinds: _parts.append(t("gateway.kanban.wake.crashed"))
                             if "timed_out" in _wake_kinds: _parts.append(t("gateway.kanban.wake.timed_out"))
                             if "blocked" in _wake_kinds: _parts.append(t("gateway.kanban.wake.blocked"))
+                            if "origin_signal" in _wake_kinds:
+                                _parts.append("origin signal")
+                            if "flow_terminal" in _wake_kinds:
+                                _parts.append("flow terminal")
                             _status = t("gateway.kanban.wake.status_joiner").join(_parts) or t("gateway.kanban.wake.status_default")
                             _synth = t(
                                 "gateway.kanban.wake.message",

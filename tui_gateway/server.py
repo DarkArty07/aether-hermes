@@ -9463,7 +9463,7 @@ def _notification_event_dedup_key(evt: dict) -> tuple:
 # event behind an unclaimed row.
 _KANBAN_NOTIFY_KINDS = (
     "completed", "blocked", "gave_up", "crashed", "timed_out",
-    "status", "archived", "unblocked",
+    "status", "archived", "unblocked", "origin_signal", "flow_terminal",
 )
 _KANBAN_SILENT_KINDS = frozenset({"archived", "unblocked"})
 _KANBAN_POLL_SECONDS = 5.0
@@ -9593,6 +9593,17 @@ def _format_kanban_event_text(sub: dict, task, ev, board_slug: str) -> Optional[
     if kind == "blocked":
         reason = f": {str(payload.get('reason'))[:160]}" if payload.get("reason") else ""
         return f"⏸ {board_tag}{tag}Kanban {task_id} blocked{reason}"
+    if kind == "origin_signal":
+        signal = str(payload.get("origin_signal") or "input")
+        reason = f": {str(payload.get('reason'))[:160]}" if payload.get("reason") else ""
+        return f"⚠ {board_tag}{tag}Kanban {task_id} requests {signal}{reason}"
+    if kind == "flow_terminal":
+        reason = ""
+        if payload.get("summary"):
+            reason = f" — {str(payload['summary'])[:200]}"
+        elif payload.get("reason"):
+            reason = f": {str(payload['reason'])[:200]}"
+        return f"■ {board_tag}{tag}Kanban {task_id} flow terminal{reason}"
     if kind == "gave_up":
         err = f"\n{str(payload.get('error'))[:200]}" if payload.get("error") else ""
         return f"✖ {board_tag}{tag}Kanban {task_id} gave up after repeated spawn failures{err}"
@@ -9684,17 +9695,23 @@ def _collect_kanban_notifications(session: dict) -> list:
                     continue
                 if sub.get("chat_id") != session_key:
                     continue
+                task = _kb.get_task(conn, sub["task_id"])
+                notify_kinds = _KANBAN_NOTIFY_KINDS
+                if task is not None and getattr(task, "session_affinity", None):
+                    # Affinity workers are silent on internal lifecycle
+                    # milestones. Only explicit origin signals and the flow's
+                    # terminal event may reach the originating TUI session.
+                    notify_kinds = ("origin_signal", "flow_terminal")
                 _old, _new, events = _kb.claim_unseen_events_for_sub(
                     conn,
                     task_id=sub["task_id"],
                     platform=sub["platform"],
                     chat_id=sub["chat_id"],
                     thread_id=sub.get("thread_id") or "",
-                    kinds=_KANBAN_NOTIFY_KINDS,
+                    kinds=notify_kinds,
                 )
                 if not events:
                     continue
-                task = _kb.get_task(conn, sub["task_id"])
                 for ev in events:
                     text = _format_kanban_event_text(sub, task, ev, slug)
                     if text:

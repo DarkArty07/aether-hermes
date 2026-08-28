@@ -832,13 +832,19 @@ def _handle_block(args: dict, **kw) -> str:
         return tool_error("reason is required — explain what input you need")
     reason = redact_sensitive_text(str(reason), force=True)
     kind = args.get("kind")
+    origin_signal = args.get("origin_signal")
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
-        if kind is not None and kind not in kb.VALID_BLOCK_KINDS:
+        if kind is not None and kind not in kb.VALID_BLOCK_KINDS and kind not in kb.VALID_ORIGIN_SIGNALS:
             conn.close()
             return tool_error(
                 f"kind must be one of {sorted(kb.VALID_BLOCK_KINDS)} (or omit it)"
+            )
+        if origin_signal is not None and origin_signal not in kb.VALID_ORIGIN_SIGNALS:
+            conn.close()
+            return tool_error(
+                f"origin_signal must be one of {sorted(kb.VALID_ORIGIN_SIGNALS)}"
             )
         # Goal-mode block gate (Issue #38696, sibling of the kanban_complete
         # judge gate in #38367). kanban_block is a second exit path out of
@@ -869,6 +875,7 @@ def _handle_block(args: dict, **kw) -> str:
                 conn, tid,
                 reason=reason,
                 kind=kind,
+                origin_signal=origin_signal,
                 expected_run_id=_worker_run_id(tid),
             )
             if not ok:
@@ -885,6 +892,7 @@ def _handle_block(args: dict, **kw) -> str:
                 run_id=run.id if run else None,
                 status=landed.status if landed else "blocked",
                 block_kind=kind,
+                origin_signal=origin_signal,
             )
         finally:
             conn.close()
@@ -1370,11 +1378,10 @@ def _handle_create(args: dict, **kw) -> str:
     # would stamp — and later wake — the wrong session.
     from tools.async_delegation import _current_origin_session_id
 
-    session_id = (
-        args.get("session_id")
-        or _current_origin_session_id()
-        or os.environ.get("HERMES_SESSION_ID")
-    )
+    # ``session_id`` is provenance supplied by the trusted request/session
+    # context.  Never accept a model-provided session id: doing so would let a
+    # task redirect notifications or wakes into an unrelated conversation.
+    session_id = _current_origin_session_id() or os.environ.get("HERMES_SESSION_ID")
     priority = args.get("priority")
     # Resolve workspace. Workspace sharing is always explicit: omitted fields
     # mean a fresh scratch workspace, even when a dispatcher-spawned worker
@@ -1423,16 +1430,85 @@ def _handle_create(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            _self_tid = os.environ.get("HERMES_KANBAN_TASK")
+            _self_task = kb.get_task(conn, _self_tid) if _self_tid else None
+            if _self_task is not None and _self_task.session_id:
+                # A worker's HERMES_SESSION_ID is its private transcript id,
+                # not the originating conversation provenance. Preserve the
+                # trusted task value when propagating a child so terminal and
+                # explicit origin signals continue to reach the real caller.
+                session_id = _self_task.session_id
+            requested_affinity = args.get("session_affinity")
+            if requested_affinity is not None:
+                try:
+                    requested_affinity = kb.normalize_session_affinity(
+                        requested_affinity
+                    )
+                except ValueError as exc:
+                    return tool_error(f"kanban_create: {exc}")
+            # A worker may inherit its current flow only when it creates a
+            # same-profile child.  A different assignee must opt out rather
+            # than accidentally joining the parent's exact-session lease.
+            current_affinity = (
+                _self_task.session_affinity if _self_task is not None else None
+            )
+            canonical_assignee = kb._canonical_assignee(str(assignee))
+            if current_affinity:
+                parent_assignee = kb._canonical_assignee(_self_task.assignee or "")
+                if requested_affinity is not None:
+                    if (
+                        canonical_assignee != parent_assignee
+                        or requested_affinity["flow_id"]
+                        != current_affinity["flow_id"]
+                    ):
+                        return tool_error(
+                            "session_affinity may only match the current "
+                            "worker's flow and assignee"
+                        )
+                    if (
+                        workspace_path
+                        and _self_task.workspace_path
+                        and os.path.realpath(workspace_path)
+                        != os.path.realpath(_self_task.workspace_path)
+                    ):
+                        return tool_error(
+                            "session_affinity child must use the current "
+                            "worker's workspace"
+                        )
+                    if not workspace_path:
+                        if not _self_task.workspace_path:
+                            return tool_error(
+                                "session_affinity requires the current worker's "
+                                "workspace"
+                            )
+                        workspace_kind = _self_task.workspace_kind
+                        workspace_path = _self_task.workspace_path
+                elif canonical_assignee == parent_assignee:
+                    # Terminal delivery is an explicit opt-in for each child;
+                    # do not accidentally make every descendant terminal.
+                    requested_affinity = {
+                        "flow_id": current_affinity["flow_id"],
+                        "terminal": False,
+                    }
+                    if not _self_task.workspace_path:
+                        return tool_error(
+                            "session_affinity requires the current worker's "
+                            "workspace"
+                        )
+                    workspace_kind = _self_task.workspace_kind
+                    workspace_path = _self_task.workspace_path
             # A project link is safe to inherit because ``create_task`` turns
             # it into a fresh per-task worktree. Never inherit the parent's
             # literal workspace kind/path; directory sharing must be explicit.
-            if _inherit_project and project_id is None:
-                _self_tid = os.environ.get("HERMES_KANBAN_TASK")
-                if _self_tid:
-                    _self_task = kb.get_task(conn, _self_tid)
-                    if _self_task is not None and _self_task.project_id:
-                        project_id = _self_task.project_id
-                        project_source_task_id = _self_task.id
+            if _inherit_project:
+                if _self_task is not None and _self_task.project_id:
+                    if project_id is not None and project_id != _self_task.project_id:
+                        return tool_error(
+                            "project_id does not match the worker task's "
+                            "canonical project"
+                        )
+                    project_id = _self_task.project_id
+                    project_source_task_id = _self_task.id
             new_tid = kb.create_task(
                 conn,
                 title=str(title).strip(),
@@ -1461,6 +1537,7 @@ def _handle_create(args: dict, **kw) -> str:
                 initial_status=str(initial_status),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
+                session_affinity=requested_affinity,
             )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
@@ -1470,6 +1547,7 @@ def _handle_create(args: dict, **kw) -> str:
                 workspace_kind=new_task.workspace_kind if new_task else None,
                 workspace_path=new_task.workspace_path if new_task else None,
                 project_id=new_task.project_id if new_task else None,
+                session_affinity=new_task.session_affinity if new_task else None,
                 subscribed=subscribed,
             )
         finally:
@@ -1527,6 +1605,19 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
         # If config can't load we still default to True — this is the
         # user-friendly behaviour that mirrors the pre-gate implementation.
         pass
+
+    try:
+        from hermes_cli import kanban_db as _kb
+
+        _task = _kb.get_task(conn, task_id)
+        if _task and _task.session_affinity:
+            _affinity = _kb.normalize_session_affinity(_task.session_affinity)
+            if not _affinity or not _affinity["terminal"]:
+                return False
+    except Exception:
+        # Subscription bookkeeping is best-effort, but a malformed affinity
+        # value must not broaden delivery to an ordinary internal child.
+        return False
 
     platform = ""
     chat_id = ""
@@ -1887,11 +1978,25 @@ KANBAN_BLOCK_SCHEMA = {
             },
             "kind": {
                 "type": "string",
-                "enum": ["dependency", "needs_input", "capability", "transient"],
+                "enum": [
+                    "dependency", "needs_input", "capability", "transient",
+                    "input", "revision",
+                ],
                 "description": (
                     "Why you're blocked. 'dependency' waits in todo and "
                     "resumes automatically; the others surface to a human. "
                     "Omit only if none apply."
+                ),
+            },
+            "origin_signal": {
+                "type": "string",
+                "enum": ["input", "revision"],
+                "description": (
+                    "Optional explicit signal for the trusted originating "
+                    "subscription. Use 'input' when a human answer is needed "
+                    "or 'revision' when the work needs a changed spec. This "
+                    "is the only non-terminal worker event routed to the "
+                    "origin; ordinary internal blockers stay internal."
                 ),
             },
             "board": _board_schema_prop(),
@@ -2212,6 +2317,22 @@ KANBAN_CREATE_SCHEMA = {
                     "primary repo with a deterministic branch (project slug + "
                     "task id), instead of a random branch."
                 ),
+            },
+            "session_affinity": {
+                "type": "object",
+                "description": (
+                    "Optional logical worker-session affinity. Set flow_id "
+                    "to join one exact session for this project and assignee. "
+                    "Set terminal=true only on the final same-affinity child. "
+                    "A worker-created child may inherit affinity only for its "
+                    "current flow and assignee."
+                ),
+                "properties": {
+                    "flow_id": {"type": "string", "minLength": 1},
+                    "terminal": {"type": "boolean"},
+                },
+                "required": ["flow_id"],
+                "additionalProperties": False,
             },
             "triage": {
                 "type": "boolean",
