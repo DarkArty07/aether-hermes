@@ -135,6 +135,9 @@ def test_affinity_spawn_uses_exact_resume_and_workspace_pin(tmp_path, monkeypatc
     assert argv[argv.index("--resume") + 1] == "session-1"
     assert "--no-restore-cwd" in argv
     assert argv[argv.index("--in") + 1] == str(workspace)
+    child_env = captured["kwargs"]["env"]
+    assert child_env["HERMES_KANBAN_FLOW_ID"] == lease.flow_id
+    assert child_env["HERMES_KANBAN_AFFINITY_FLOW_ID"] == lease.flow_id
 
 
 def test_kanban_worker_session_records_current_workspace(tmp_path, monkeypatch):

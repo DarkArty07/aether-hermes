@@ -11259,6 +11259,10 @@ def _default_spawn(
         env["HERMES_KANBAN_AFFINITY_TOKEN"] = affinity.token
         env["HERMES_KANBAN_AFFINITY_GENERATION"] = str(affinity.generation)
         env["HERMES_KANBAN_AFFINITY_FLOW_ID"] = affinity.flow_id
+        # Stable model-facing alias: the Aether envelope intentionally keeps
+        # the opaque flow id out of prose, while a same-profile worker must be
+        # able to mark one explicit terminal child for its current flow.
+        env["HERMES_KANBAN_FLOW_ID"] = affinity.flow_id
         env["HERMES_KANBAN_AFFINITY_PROJECT_ID"] = affinity.project_id
         if affinity.session_id:
             validate_worker_resume_session(
