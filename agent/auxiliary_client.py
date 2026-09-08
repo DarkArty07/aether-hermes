@@ -1518,6 +1518,13 @@ class _CodexCompletionsAdapter:
             "store": False,
         }
 
+        # Port from upstream NousResearch/hermes-agent@9fd44b4dfc44138b9e5d5689acb56c438364ff7b
+        # agent/auxiliary_client.py:1367-1370: forward request-scoped extra_headers
+        # to the Responses streaming endpoint (issue #301).
+        extra_headers = kwargs.get("extra_headers")
+        if isinstance(extra_headers, dict) and extra_headers:
+            resp_kwargs["extra_headers"] = dict(extra_headers)
+
         # Preserve the chat.completions timeout contract. This adapter is used
         # by auxiliary calls such as context compression; if the timeout is not
         # forwarded and enforced, a Codex Responses stream can sit behind a
@@ -5016,6 +5023,38 @@ def _replan_synchronous_cache_sections(
     )
 
 
+def _safe_request_extra_headers(
+    extra_headers: Optional[Dict[str, str]],
+) -> Optional[Dict[str, str]]:
+    """Return a fresh copy of safe request-scoped metadata for fallback forwarding.
+
+    Excludes Authorization, Proxy-Authorization, Cookie, and provider-specific
+    API key or token authentication headers so destination authentication is
+    resolved by the destination client without credential leakage (#301).
+    """
+    if not extra_headers or not isinstance(extra_headers, dict):
+        return None
+    safe: Dict[str, str] = {}
+    for k, v in extra_headers.items():
+        if not isinstance(k, str):
+            continue
+        lower_k = k.strip().lower()
+        if lower_k in {
+            "authorization",
+            "proxy-authorization",
+            "cookie",
+            "set-cookie",
+            "api-key",
+            "x-api-key",
+            "x-goog-api-key",
+            "anthropic-api-key",
+            "x-auth-token",
+        } or lower_k.endswith("-api-key") or lower_k.endswith("-token"):
+            continue
+        safe[k] = str(v)
+    return safe if safe else None
+
+
 def _call_fallback_candidate_sync(
     fb_client: Any,
     fb_model: Optional[str],
@@ -5029,6 +5068,7 @@ def _call_fallback_candidate_sync(
     effective_timeout: float,
     effective_extra_body: dict,
     reasoning_config: Optional[dict],
+    extra_headers: Optional[Dict[str, str]] = None,
 ) -> Optional[Any]:
     """Call one fallback candidate with stale-credential recovery.
 
@@ -5070,6 +5110,9 @@ def _call_fallback_candidate_sync(
         tools=fallback_tools, timeout=effective_timeout,
         extra_body=effective_extra_body, reasoning_config=reasoning_config,
         base_url=destination.base_url, task=task)
+    safe_fb_headers = _safe_request_extra_headers(extra_headers)
+    if safe_fb_headers:
+        fb_kwargs["extra_headers"] = dict(safe_fb_headers)
     try:
         return _validate_llm_response(
             _relay_sync_completion(
@@ -5115,6 +5158,8 @@ def _call_fallback_candidate_sync(
                     extra_body=effective_extra_body,
                     reasoning_config=reasoning_config,
                     base_url=retry_destination.base_url, task=task)
+                if safe_fb_headers:
+                    retry_kwargs["extra_headers"] = dict(safe_fb_headers)
                 try:
                     return _validate_llm_response(
                         _relay_sync_completion(
@@ -5154,6 +5199,7 @@ async def _call_fallback_candidate_async(
     effective_timeout: float,
     effective_extra_body: dict,
     reasoning_config: Optional[dict],
+    extra_headers: Optional[Dict[str, str]] = None,
 ) -> Optional[Any]:
     """Async mirror of :func:`_call_fallback_candidate_sync`."""
     fb_timeout = _fallback_entry_timeout(task, fb_label)
@@ -5176,6 +5222,9 @@ async def _call_fallback_candidate_async(
         tools=fallback_tools, timeout=effective_timeout,
         extra_body=effective_extra_body, reasoning_config=reasoning_config,
         base_url=destination.base_url, task=task)
+    safe_fb_headers = _safe_request_extra_headers(extra_headers)
+    if safe_fb_headers:
+        fb_kwargs["extra_headers"] = dict(safe_fb_headers)
     try:
         return _validate_llm_response(
             await _relay_async_completion(
@@ -5222,6 +5271,8 @@ async def _call_fallback_candidate_async(
                     extra_body=effective_extra_body,
                     reasoning_config=reasoning_config,
                     base_url=retry_destination.base_url, task=task)
+                if safe_fb_headers:
+                    retry_kwargs["extra_headers"] = dict(safe_fb_headers)
                 try:
                     return _validate_llm_response(
                         await _relay_async_completion(
@@ -9839,7 +9890,8 @@ def _call_llm_impl(
                     temperature=temperature, max_tokens=max_tokens,
                     tools=tools, effective_timeout=effective_timeout,
                     effective_extra_body=effective_extra_body,
-                    reasoning_config=reasoning_config)
+                    reasoning_config=reasoning_config,
+                    extra_headers=extra_headers)
                 if fb_resp is not None:
                     return fb_resp
                 # The candidate had a stale/unrefreshable credential and was
@@ -9857,7 +9909,8 @@ def _call_llm_impl(
                         temperature=temperature, max_tokens=max_tokens,
                         tools=tools, effective_timeout=effective_timeout,
                         effective_extra_body=effective_extra_body,
-                        reasoning_config=reasoning_config)
+                        reasoning_config=reasoning_config,
+                        extra_headers=extra_headers)
                     if fb_resp is not None:
                         return fb_resp
             # All fallback layers exhausted — emit a single user-visible
@@ -9954,6 +10007,7 @@ async def async_call_llm(
     timeout: float = None,
     extra_body: dict = None,
     reasoning_config: Optional[dict] = None,
+    extra_headers: Optional[Dict[str, str]] = None,
     route_info: Optional[Dict[str, str]] = None,
 ) -> Any:
     """Run an asynchronous auxiliary LLM request under the configured limit."""
@@ -9975,6 +10029,7 @@ async def async_call_llm(
             timeout=timeout,
             extra_body=extra_body,
             reasoning_config=reasoning_config,
+            extra_headers=extra_headers,
             route_info=route_info,
         )
     finally:
@@ -9997,6 +10052,7 @@ async def _async_call_llm_impl(
     timeout: float = None,
     extra_body: dict = None,
     reasoning_config: Optional[dict] = None,
+    extra_headers: Optional[Dict[str, str]] = None,
     route_info: Optional[Dict[str, str]] = None,
 ) -> Any:
     """Centralized asynchronous LLM call.
@@ -10108,6 +10164,8 @@ async def _async_call_llm_impl(
         tools=tools, timeout=effective_timeout, extra_body=effective_extra_body,
         reasoning_config=reasoning_config,
         base_url=_client_base or resolved_base_url, task=task)
+    if extra_headers:
+        kwargs["extra_headers"] = dict(extra_headers)
 
     # Convert image blocks for Anthropic-compatible endpoints (e.g. MiniMax)
     if _is_anthropic_compat_endpoint(request_provider, _client_base):
@@ -10360,6 +10418,7 @@ async def _async_call_llm_impl(
                     effective_timeout=effective_timeout,
                     effective_extra_body=effective_extra_body,
                     reasoning_config=reasoning_config,
+                    extra_headers=extra_headers,
                 )
 
         # ── Same-provider credential-pool recovery (mirrors sync) ─────
@@ -10403,6 +10462,7 @@ async def _async_call_llm_impl(
                         effective_timeout=effective_timeout,
                         effective_extra_body=effective_extra_body,
                         reasoning_config=reasoning_config,
+                        extra_headers=extra_headers,
                     )
                 except Exception as retry2_err:
                     if (_is_payment_error(retry2_err) or _is_auth_error(retry2_err)
@@ -10509,7 +10569,8 @@ async def _async_call_llm_impl(
                     temperature=temperature, max_tokens=max_tokens,
                     tools=tools, effective_timeout=effective_timeout,
                     effective_extra_body=effective_extra_body,
-                    reasoning_config=reasoning_config)
+                    reasoning_config=reasoning_config,
+                    extra_headers=extra_headers)
                 if fb_resp is not None:
                     return fb_resp
                 # Stale/unrefreshable candidate credential — quarantined; walk
@@ -10531,7 +10592,8 @@ async def _async_call_llm_impl(
                         temperature=temperature, max_tokens=max_tokens,
                         tools=tools, effective_timeout=effective_timeout,
                         effective_extra_body=effective_extra_body,
-                        reasoning_config=reasoning_config)
+                        reasoning_config=reasoning_config,
+                        extra_headers=extra_headers)
                     if fb_resp is not None:
                         return fb_resp
             # All fallback layers exhausted — warn before re-raising. (#26882)
