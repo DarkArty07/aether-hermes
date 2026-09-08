@@ -1,3 +1,5 @@
+> **Aether-maintained fork:** the maintained branch is `aether-main`. Read [AETHER_FORK.md](AETHER_FORK.md) for provenance, verification and known limitations. Upstream installation/update instructions below are retained for reference; they are not the qualified Aether distribution path.
+
 <p align="center">
   <img src="assets/banner.png" alt="Hermes Agent" width="100%">
 </p>
