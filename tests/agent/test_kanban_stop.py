@@ -209,3 +209,32 @@ def test_budget_exhaustion_is_violation_not_clean_exit(clear_kanban_env):
     # Backward-compatible builder still has no nudge after budget exhaustion;
     # conversation_loop must use the structured decision to fail the turn.
     assert build_kanban_stop_nudge(messages=[], attempts=2, max_attempts=2) is None
+
+
+def test_evaluate_kanban_stop_allows_when_durable_recovery_matches(clear_kanban_env, tmp_path):
+    from hermes_cli.kanban_db import claim_task, complete_task, connect, create_task
+
+    db_path = tmp_path / "kanban.db"
+    conn = connect(db_path)
+    try:
+        tid = create_task(conn, title="Test Task", assignee="implementer")
+        claimed = claim_task(conn, tid)
+        assert claimed is not None and claimed.current_run_id is not None
+        run_id = claimed.current_run_id
+        complete_task(conn, tid, expected_run_id=run_id, summary="Completed cleanly")
+    finally:
+        conn.close()
+
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", tid)
+    clear_kanban_env.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+    clear_kanban_env.setenv("HERMES_KANBAN_DB", str(db_path))
+
+    messages = []
+    assert assess_kanban_handoff(messages).status is HandoffStatus.MISSING
+
+    decision = evaluate_kanban_stop(messages=messages)
+    assert decision.action is StopAction.ALLOW
+    assert decision.nudge is None
+    assert decision.assessment.status is HandoffStatus.MISSING
+    assert "durable" in decision.reason.lower() or "completed" in decision.reason.lower()
+    assert build_kanban_stop_nudge(messages=messages) is None
