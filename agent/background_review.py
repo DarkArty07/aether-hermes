@@ -22,11 +22,142 @@ import copy
 import json
 import logging
 import os
-from typing import Any, Dict, List, Optional
+import threading
+from contextlib import contextmanager, suppress
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from agent.thread_scoped_output import thread_scoped_silence
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Background-review run token and cancellation handshake.
+#
+# Supports reserve-before-start, deny-admission, and identity-qualified cleanup.
+# ---------------------------------------------------------------------------
+
+
+class _BackgroundReviewRun:
+    """Per-review cancellation and request-completion handshake."""
+
+    def __init__(self) -> None:
+        self.cancel_requested = threading.Event()
+        self.request_done = threading.Event()
+        self._lock = threading.Lock()
+        self._review_agent = None
+        self._request_finished = False
+        self._cancel_dispatched = False
+
+    def begin_request(self, review_agent: Any) -> bool:
+        """Atomically admit the first provider-capable review phase."""
+        with self._lock:
+            if self.cancel_requested.is_set() or self._request_finished:
+                return False
+            self._review_agent = review_agent
+            return True
+
+    def cancel(self) -> Any:
+        """Fence startup and return the running fork, if one was admitted."""
+        with self._lock:
+            self.cancel_requested.set()
+            if self._review_agent is None or self._cancel_dispatched:
+                return None
+            self._cancel_dispatched = True
+            return self._review_agent
+
+    def mark_request_finished(self) -> bool:
+        """Latch request completion once; the caller publishes the event."""
+        with self._lock:
+            if self._request_finished:
+                return False
+            self._request_finished, self._review_agent = True, None
+            return True
+
+    def interrupt(self, reason: Optional[str] = None, hard_cancel: bool = False) -> None:
+        """Propagate interrupt from parent or live turn."""
+        agent_to_interrupt = self.cancel()
+        if agent_to_interrupt is not None:
+            try:
+                agent_to_interrupt.interrupt(reason, hard_cancel=hard_cancel)
+            except Exception:
+                pass
+
+
+@contextmanager
+def _optional_lock(agent: Any, attr: str) -> Iterator[None]:
+    """Context manager over a lock attribute that may be absent on test stubs."""
+    lock = getattr(agent, attr, None)
+    if lock is None:
+        yield
+        return
+    with lock:
+        yield
+
+
+def prepare_background_review_run(agent: Any) -> Optional[_BackgroundReviewRun]:
+    """Install a unique run token on the parent before Thread.start()."""
+    run = _BackgroundReviewRun()
+    try:
+        lock = getattr(agent, "_background_review_lock", None)
+        if lock is None:
+            lock = agent._background_review_lock = threading.Lock()
+        with lock:
+            current = getattr(agent, "_background_review_run", None)
+            if current is not None and not current.request_done.is_set():
+                return None
+            agent._background_review_run = run
+            agent._background_review_agent = run
+        with _optional_lock(agent, "_active_children_lock"):
+            if hasattr(agent, "_active_children"):
+                agent._active_children.append(run)
+    except (AttributeError, TypeError):
+        return None
+    return run
+
+
+def finish_background_review_run(agent: Any, run: Optional[_BackgroundReviewRun]) -> None:
+    """Publish one run's request exit without clearing a successor (ABA-safe)."""
+    if run is None or not run.mark_request_finished():
+        return
+    with _optional_lock(agent, "_background_review_lock"):
+        if getattr(agent, "_background_review_run", None) is run:
+            agent._background_review_run = None
+        if getattr(agent, "_background_review_agent", None) is run:
+            agent._background_review_agent = None
+    with _optional_lock(agent, "_active_children_lock"):
+        if hasattr(agent, "_active_children"):
+            with suppress(ValueError, AttributeError):
+                agent._active_children.remove(run)
+    run.request_done.set()
+
+
+def _track_review_fork(
+    agent: Any,
+    review_agent: Any,
+    review_run: Optional[_BackgroundReviewRun] = None,
+    *,
+    register: bool,
+) -> None:
+    """Add (register=True) or remove the fork on the PARENT's tracking slots."""
+    if review_agent is None:
+        return
+    with _optional_lock(agent, "_background_review_lock"):
+        if hasattr(agent, "_background_review_agent"):
+            if register:
+                agent._background_review_agent = review_agent
+            elif agent._background_review_agent is review_agent:
+                agent._background_review_agent = None
+    with _optional_lock(agent, "_active_children_lock"):
+        if hasattr(agent, "_active_children"):
+            if register:
+                if review_run is not None:
+                    with suppress(ValueError, AttributeError):
+                        agent._active_children.remove(review_run)
+                agent._active_children.append(review_agent)
+            else:
+                with suppress(ValueError, AttributeError):
+                    agent._active_children.remove(review_agent)
 
 
 # ---------------------------------------------------------------------------
@@ -655,6 +786,7 @@ def _run_review_in_thread(
     agent: Any,
     messages_snapshot: List[Dict],
     prompt: str,
+    review_run: Optional[_BackgroundReviewRun] = None,
 ) -> None:
     """Worker function executed in the background-review daemon thread.
 
@@ -662,6 +794,10 @@ def _run_review_in_thread(
     review prompt, and surfaces a compact action summary back to the user
     via ``agent._safe_print`` and ``agent.background_review_callback``.
     """
+    if review_run is not None and review_run.cancel_requested.is_set():
+        finish_background_review_run(agent, review_run)
+        return
+
     # Local import to avoid a hard circular dep at module load.
     from run_agent import AIAgent
     from tools.terminal_tool import set_approval_callback as _set_approval_callback
@@ -689,26 +825,8 @@ def _run_review_in_thread(
         """Idempotent: clears the review fork from both tracking slots.
         Called from the run_conversation finally and the outer safety-net finally.
         """
-        if agent_ref is None:
-            return
-        if hasattr(agent, "_background_review_agent"):
-            _br_lock = getattr(agent, "_background_review_lock", None)
-            if _br_lock is not None:
-                with _br_lock:
-                    if agent._background_review_agent is agent_ref:
-                        agent._background_review_agent = None
-            elif agent._background_review_agent is agent_ref:
-                agent._background_review_agent = None
-        if hasattr(agent, "_active_children"):
-            try:
-                _ac_lock = getattr(agent, "_active_children_lock", None)
-                if _ac_lock is not None:
-                    with _ac_lock:
-                        agent._active_children.remove(agent_ref)
-                else:
-                    agent._active_children.remove(agent_ref)
-            except (ValueError, AttributeError):
-                pass
+        _track_review_fork(agent, agent_ref, review_run, register=False)
+        finish_background_review_run(agent, review_run)
 
     try:
         # Silence stdout/stderr for THIS worker thread only.  A process-global
@@ -909,26 +1027,17 @@ def _run_review_in_thread(
             # Register this fork on the PARENT's _active_children (the same
             # list interrupt() fans out to for subagent delegation) and
             # _background_review_agent (a direct pointer the next live turn
-            # uses to proactively cancel a still-running review). Without
-            # this, a review still streaming when the next turn starts races
-            # the live turn against the same session_id/credentials — producing
-            # doubled prompt-token accounting and a Ctrl+C-proof lockup.
-            # Best-effort: agents built without agent_init.py (test stubs)
-            # degrade to "no cross-cancellation" rather than aborting the review.
-            if hasattr(agent, "_background_review_agent"):
-                _br_lock = getattr(agent, "_background_review_lock", None)
-                if _br_lock is not None:
-                    with _br_lock:
-                        agent._background_review_agent = review_agent
-                else:
-                    agent._background_review_agent = review_agent
-            if hasattr(agent, "_active_children"):
-                _ac_lock = getattr(agent, "_active_children_lock", None)
-                if _ac_lock is not None:
-                    with _ac_lock:
-                        agent._active_children.append(review_agent)
-                else:
-                    agent._active_children.append(review_agent)
+            # uses to proactively cancel a still-running review).
+            admitted = True
+            if review_run is not None:
+                admitted = review_run.begin_request(review_agent)
+            if not admitted:
+                # Pre-admission cancellation requested: do not admit to tool loop or send requests
+                _track_review_fork(agent, review_agent, review_run, register=False)
+                finish_background_review_run(agent, review_run)
+                return
+
+            _track_review_fork(agent, review_agent, review_run, register=True)
 
             from model_tools import get_tool_definitions
             from hermes_cli.plugins import (
@@ -1096,6 +1205,7 @@ def spawn_background_review_thread(
     review_memory: bool = False,
     review_skills: bool = False,
     focus: Optional[str] = None,
+    review_run: Optional[_BackgroundReviewRun] = None,
 ):
     """Build the review thread target and prompt for a background review.
 
@@ -1109,6 +1219,9 @@ def spawn_background_review_thread(
     post-turn reviews pass ``None`` — their prompts are byte-identical to
     before this parameter existed.
     """
+    if review_run is None:
+        review_run = prepare_background_review_run(agent)
+
     # Pick the right prompt based on which triggers fired.  Allow per-agent
     # override (the prompts moved to module-level constants but old code paths
     # that set agent._MEMORY_REVIEW_PROMPT etc. directly keep working).
@@ -1129,7 +1242,7 @@ def spawn_background_review_thread(
         )
 
     def _target() -> None:
-        _run_review_in_thread(agent, messages_snapshot, prompt)
+        _run_review_in_thread(agent, messages_snapshot, prompt, review_run=review_run)
 
     return _target, prompt
 
@@ -1138,6 +1251,9 @@ __all__ = [
     "_MEMORY_REVIEW_PROMPT",
     "_SKILL_REVIEW_PROMPT",
     "_COMBINED_REVIEW_PROMPT",
+    "_BackgroundReviewRun",
+    "prepare_background_review_run",
+    "finish_background_review_run",
     "spawn_background_review_thread",
     "summarize_background_review_actions",
     "build_memory_write_metadata",
