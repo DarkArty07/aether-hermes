@@ -1,5 +1,9 @@
 """Tests for named custom provider and 'main' alias resolution in auxiliary_client."""
 
+import http.server
+import json
+import os
+import threading
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -408,3 +412,223 @@ class TestResolveProviderClientMainRuntimeCustom:
         assert model == "explicit-model"
         assert "explicit.example.com" in str(client.base_url)
         assert client.api_key == "sk-explicit"
+
+
+class _B292RecordingHandler(http.server.BaseHTTPRequestHandler):
+    received_requests = []
+
+    def do_POST(self):
+        content_len = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(content_len) if content_len > 0 else b""
+        parsed_body = {}
+        if body:
+            try:
+                parsed_body = json.loads(body.decode("utf-8"))
+            except Exception:
+                pass
+        self.__class__.received_requests.append({
+            "path": self.path,
+            "headers": dict(self.headers),
+            "body": parsed_body,
+        })
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        response_payload = {
+            "id": "chatcmpl-test",
+            "choices": [
+                {
+                    "message": {"role": "assistant", "content": "named-custom-response"},
+                    "finish_reason": "stop",
+                }
+            ],
+        }
+        self.wfile.write(json.dumps(response_payload).encode("utf-8"))
+
+    def log_message(self, format, *args):
+        pass
+
+
+@pytest.fixture
+def b292_recorder():
+    import http.server
+    _B292RecordingHandler.received_requests = []
+    server = http.server.HTTPServer(("127.0.0.1", 0), _B292RecordingHandler)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{port}/v1"
+    try:
+        yield {"server": server, "base_url": base_url, "requests": _B292RecordingHandler.received_requests}
+    finally:
+        server.shutdown()
+        import agent.auxiliary_client as aux
+        aux.shutdown_cached_clients()
+
+
+class TestNamedCustomQualificationB292:
+    """B292: Qualify named custom provider resolution and preservation."""
+
+    def test_direct_named_custom_both_spellings(self, b292_recorder):
+        """Both custom:<name> and bare <name> spellings route to named endpoint and credential."""
+        import agent.auxiliary_client as aux
+        base_url = b292_recorder["base_url"]
+        requests = b292_recorder["requests"]
+
+        cfg = {
+            "providers": {
+                "named-eval-prov": {
+                    "name": "named-eval-prov",
+                    "base_url": base_url,
+                    "key_env": "NAMED_EVAL_KEY",
+                    "api_mode": "chat_completions",
+                    "default_model": "bare-custom-model",
+                }
+            }
+        }
+
+        with patch.dict(os.environ, {
+            "NAMED_EVAL_KEY": "synth-named-key-456",
+            "OPENAI_API_KEY": "unrelated-global-openai-key",
+            "ANTHROPIC_API_KEY": "unrelated-global-anthropic-key",
+        }):
+            with patch("hermes_cli.config.load_config", return_value=cfg), \
+                 patch("hermes_cli.config.load_config_readonly", return_value=cfg), \
+                 patch("hermes_cli.runtime_provider.load_config", return_value=cfg):
+
+                aux.shutdown_cached_clients()
+                resp1 = aux.call_llm(
+                    task="compression",
+                    provider="custom:named-eval-prov",
+                    model="bare-custom-model",
+                    api_mode="chat_completions",
+                    messages=[{"role": "user", "content": "hello spelling 1"}],
+                )
+                assert resp1.choices[0].message.content == "named-custom-response"
+
+                aux.shutdown_cached_clients()
+                resp2 = aux.call_llm(
+                    task="compression",
+                    provider="named-eval-prov",
+                    model="bare-custom-model",
+                    api_mode="chat_completions",
+                    messages=[{"role": "user", "content": "hello spelling 2"}],
+                )
+                assert resp2.choices[0].message.content == "named-custom-response"
+
+        assert len(requests) == 2
+        for req in requests:
+            auth_hdr = req["headers"].get("Authorization", "")
+            assert auth_hdr == "Bearer synth-named-key-456"
+            assert "unrelated-global" not in auth_hdr
+            assert req["body"].get("model") == "bare-custom-model"
+
+    def test_configured_fallback_named_custom_both_spellings(self, b292_recorder):
+        """Configured fallback routes to named custom provider with both spellings."""
+        import agent.auxiliary_client as aux
+        base_url = b292_recorder["base_url"]
+        requests = b292_recorder["requests"]
+
+        def run_fallback(spelling: str):
+            cfg = {
+                "providers": {
+                    "named-eval-prov": {
+                        "name": "named-eval-prov",
+                        "base_url": base_url,
+                        "key_env": "NAMED_EVAL_KEY",
+                        "api_mode": "chat_completions",
+                        "default_model": "fallback-bare-model",
+                    }
+                },
+                "auxiliary": {
+                    "test_task": {
+                        "fallback_chain": [
+                            {"provider": spelling, "model": "fallback-bare-model"}
+                        ]
+                    }
+                },
+            }
+            aux.shutdown_cached_clients()
+            with patch.dict(os.environ, {
+                "PRIMARY_KEY": "synth-pri-key-111",
+                "NAMED_EVAL_KEY": "synth-named-key-456",
+            }):
+                with patch("hermes_cli.config.load_config", return_value=cfg), \
+                     patch("hermes_cli.config.load_config_readonly", return_value=cfg), \
+                     patch("hermes_cli.runtime_provider.load_config", return_value=cfg), \
+                     patch("agent.auxiliary_client._transient_retry_count", return_value=0):
+                    return aux.call_llm(
+                        task="test_task",
+                        provider="custom",
+                        model="pri-model",
+                        base_url="http://127.0.0.1:1/v1",
+                        api_key="synth-pri-key-111",
+                        api_mode="chat_completions",
+                        messages=[{"role": "user", "content": f"fallback test {spelling}"}],
+                    )
+
+        r1 = run_fallback("custom:named-eval-prov")
+        assert r1.choices[0].message.content == "named-custom-response"
+
+        r2 = run_fallback("named-eval-prov")
+        assert r2.choices[0].message.content == "named-custom-response"
+
+        assert len(requests) == 2
+        for req in requests:
+            auth_hdr = req["headers"].get("Authorization", "")
+            assert auth_hdr == "Bearer synth-named-key-456"
+            assert "synth-pri-key-111" not in auth_hdr
+            assert req["body"].get("model") == "fallback-bare-model"
+
+    def test_missing_named_custom_not_silently_another_provider(self):
+        """Missing named custom config must raise rather than silently resolving to another provider."""
+        import agent.auxiliary_client as aux
+        cfg = {"providers": {}}
+        aux.shutdown_cached_clients()
+        with patch("hermes_cli.config.load_config", return_value=cfg), \
+             patch("hermes_cli.config.load_config_readonly", return_value=cfg), \
+             patch("hermes_cli.runtime_provider.load_config", return_value=cfg):
+
+            with pytest.raises(RuntimeError, match="not found|no API key"):
+                aux.call_llm(
+                    task="compression",
+                    provider="custom:definitely-nonexistent-prov",
+                    model="some-model",
+                    messages=[{"role": "user", "content": "hi"}],
+                )
+
+            with pytest.raises(RuntimeError, match="not found|no API key"):
+                aux.call_llm(
+                    task="compression",
+                    provider="definitely-nonexistent-prov",
+                    model="some-model",
+                    messages=[{"role": "user", "content": "hi"}],
+                )
+
+    def test_anonymous_custom_preservation(self, b292_recorder):
+        """Anonymous custom (provider='custom' + explicit base_url) is preserved."""
+        import agent.auxiliary_client as aux
+        base_url = b292_recorder["base_url"]
+        requests = b292_recorder["requests"]
+
+        aux.shutdown_cached_clients()
+        resp = aux.call_llm(
+            task="compression",
+            provider="custom",
+            base_url=base_url,
+            api_key="anon-synth-key-789",
+            model="anon-model",
+            api_mode="chat_completions",
+            messages=[{"role": "user", "content": "hi anon"}],
+        )
+        assert resp.choices[0].message.content == "named-custom-response"
+        assert len(requests) == 1
+        assert requests[0]["headers"].get("Authorization") == "Bearer anon-synth-key-789"
+
+    def test_builtin_provider_preservation_not_shadowed(self):
+        """Built-in provider (e.g. openrouter) is preserved and not shadowed by custom provider lookup."""
+        from hermes_cli.runtime_provider import _get_named_custom_provider
+
+        assert _get_named_custom_provider("openrouter") is None
+        assert _get_named_custom_provider("openai") is None
+        assert _get_named_custom_provider("auto") is None
