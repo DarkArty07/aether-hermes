@@ -54,6 +54,22 @@ Activation is separate from source publication: the active database requires a v
 5. Pin the exact qualified fork commit/artifact in the eventual Aether release. Keep source, built assets, dependencies, license notices, state migrations and rollback evidence attributable.
 6. Never commit operator profiles, credentials, databases, sessions, local build environments or private backups. Do not delete state to make tests or migrations pass.
 
+## Runtime reliability corrections (Aether #267/#292/#294/#295/#301/#304)
+
+These changes land on `aether-main` from independently reviewed unit commits. They do not activate the live TUI/gateway. Inherited GitHub Actions remain disabled and are not claimed green. Local runner evidence is in Aether `specs/runtime-reliability-bugs/evidence/`.
+
+| Issue | Disposition | Inspectable commit | Scope |
+| --- | --- | --- | --- |
+| [#304](https://github.com/DarkArty07/Aether-Agents/issues/304) | reproduced-and-fixed | `169572a845f30bda0231cb97035bfce5fb9e981d` | `agent/kanban_stop.py` |
+| [#295](https://github.com/DarkArty07/Aether-Agents/issues/295) | reproduced-and-fixed | `b58db22b4968e837a745a42cae5cb007f3819a8c` | `agent/error_classifier.py` |
+| [#292](https://github.com/DarkArty07/Aether-Agents/issues/292) | already-working-with-integrated-evidence | `2337bd2d9efbf0421ac121877936e92bb9486e70` (tests only) | `tests/agent/test_auxiliary_named_custom_providers.py` |
+| [#301](https://github.com/DarkArty07/Aether-Agents/issues/301) | reproduced-and-fixed | `0f56400b1603c8195590a04da47424a0df40b145` | `agent/auxiliary_client.py` |
+| [#294](https://github.com/DarkArty07/Aether-Agents/issues/294) | reproduced-and-fixed | `cf5ff5fe2f51116364a10a9941f58f280e7ff4c4` | `agent/background_review.py` |
+
+Aether laboratory isolation for #267 is in `DarkArty07/Aether-Agents`, not this fork.
+
+Rollback of a single behavior is the corresponding unit commit revert. Do not restore whole files that also contain unrelated downstream hunks. Retirement follows the Aether ledger entries in `HERMES_LOCAL_PATCHES.md`.
+
 ## Current blocking incident
 
-[Aether #305](https://github.com/DarkArty07/Aether-Agents/issues/305) tracks spontaneous TUI turn cancellation under session-store contention. The inherited HLP-305 patch bounds retry of a transient lease-refresh lock but does not establish which transaction held the original lock. Its full root-cause and reload/canary status remain tracked there; do not call the incident fully fixed merely because this baseline was preserved.
+[Aether #305](https://github.com/DarkArty07/Aether-Agents/issues/305) tracks spontaneous TUI turn cancellation under session-store contention. The inherited HLP-305 patch bounds retry of a transient lease-refresh lock but does not establish which transaction held the original lock. Its full root-cause and reload/canary status remain tracked there; do not call the incident fully fixed merely because this baseline was preserved. The runtime-reliability corrections above do not close #305.
