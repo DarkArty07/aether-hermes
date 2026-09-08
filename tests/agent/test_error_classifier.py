@@ -306,6 +306,80 @@ class TestClassifyApiError:
         e = MockAPIError("Service Unavailable", status_code=503)
         result = classify_api_error(e)
         assert result.reason == FailoverReason.overloaded
+        assert result.retryable is True
+        assert result.should_fallback is False
+
+    def test_503_exhausted_pool_classified_with_fallback(self):
+        """B295: Explicit exhausted-pool 503 ('no available Codex accounts')
+        must classify with should_fallback=True and retryable=False to avoid
+        same-route retry exhaustion."""
+        e = MockAPIError("No available Codex accounts", status_code=503)
+        result = classify_api_error(e)
+        assert result.status_code == 503
+        assert result.reason == FailoverReason.server_error
+        assert result.retryable is False
+        assert result.should_fallback is True
+
+    def test_503_exhausted_pool_case_insensitive(self):
+        """B295: Match 'no available Codex accounts' case-insensitively."""
+        for msg in [
+            "no available codex accounts",
+            "NO AVAILABLE CODEX ACCOUNTS",
+            "There are currently No Available Codex Accounts in the pool",
+        ]:
+            e = MockAPIError(msg, status_code=503)
+            result = classify_api_error(e)
+            assert result.should_fallback is True, f"Failed to match: {msg}"
+            assert result.retryable is False
+
+    def test_503_unsupported_error_code_not_treated_as_exhausted_pool(self):
+        """B295: Guessed structured codes without the evidenced phrase remain generic overload."""
+        e = MockAPIError(
+            "Service Unavailable",
+            status_code=503,
+            body={"error": {"code": "pool_exhausted", "message": "Service Unavailable"}},
+        )
+        result = classify_api_error(e)
+        assert result.reason == FailoverReason.overloaded
+        assert result.should_fallback is False
+        assert result.retryable is True
+
+    def test_503_context_overflow_preserved_as_compression_recovery(self):
+        """B295 preservation: 503 with context overflow body routes to context_overflow with
+        should_compress=True and is not treated as exhausted pool."""
+        e = MockAPIError(
+            "context_length_exceeded: maximum context length is 8192 tokens",
+            status_code=503,
+            body={
+                "error": {
+                    "message": "context_length_exceeded: maximum context length is 8192 tokens",
+                    "code": "context_length_exceeded",
+                }
+            },
+        )
+        result = classify_api_error(e)
+        assert result.reason == FailoverReason.context_overflow
+        assert result.should_compress is True
+        assert result.should_fallback is False
+        assert result.retryable is True
+
+    def test_503_generic_overload_remains_retryable(self):
+        """B295: Generic 503 overload without pool exhaustion signal
+        preserves transient overload backoff (retryable=True, should_fallback=False)."""
+        e = MockAPIError("Service Unavailable", status_code=503)
+        result = classify_api_error(e)
+        assert result.reason == FailoverReason.overloaded
+        assert result.retryable is True
+        assert result.should_fallback is False
+
+    def test_503_unrelated_unavailable_not_treated_as_exhausted_pool(self):
+        """B295: Do not generalize to generic unavailable or catalog unavailable."""
+        for msg in ["catalog unavailable", "model unavailable", "backend unavailable"]:
+            e = MockAPIError(msg, status_code=503)
+            result = classify_api_error(e)
+            assert result.reason == FailoverReason.overloaded
+            assert result.should_fallback is False
+            assert result.retryable is True
 
 
     def test_408_request_timeout_is_retryable_timeout(self):
