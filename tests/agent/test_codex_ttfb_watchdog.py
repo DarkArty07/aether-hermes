@@ -178,6 +178,26 @@ def test_wait_notice_omits_reconnect_when_all_deadlines_are_non_finite(
     assert recovery == ""
 
 
+def test_wait_notice_blames_provider_only_before_any_event():
+    """No event yet is the only state that implicates the backend."""
+    from agent import chat_completion_helpers as h
+
+    assert h._codex_wait_notice_cause(None) == "provider may be slow or overloaded"
+
+
+def test_wait_notice_names_thinking_once_events_flow():
+    """An event already landed proves the connection is alive.
+
+    The non-streaming wrapper aggregates a Codex stream, so a long wait with
+    events arriving is a reasoning turn -- reporting an overloaded provider
+    there is a false accusation the metrics cannot contradict.
+    """
+    from agent import chat_completion_helpers as h
+
+    assert h._codex_wait_notice_cause(1000.0) == "the model is thinking"
+    assert h._codex_wait_notice_cause(0.0) == "the model is thinking"
+
+
 
 
 

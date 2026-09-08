@@ -8588,8 +8588,15 @@ class AIAgent:
                 _lease_refresh_interval = float(
                     getattr(self, "_session_turn_lease_refresh_interval", 60.0)
                 )
+                # A refresh error caused by SQLite contention does not prove
+                # that this holder lost authority. The row remains fenced by
+                # its existing TTL, so retain the turn only while there is
+                # enough time for another complete refresh attempt.
+                durable_turn_lease_refresh_deadline = time.monotonic() + _lease_ttl
 
                 def _refresh_durable_turn_lease() -> None:
+                    nonlocal durable_turn_lease_refresh_deadline
+
                     def _interrupt_turn(message: str) -> None:
                         nonlocal durable_turn_lease_interrupt_message
                         with durable_turn_lease_activity_lock:
@@ -8626,9 +8633,31 @@ class AIAgent:
                                     "the transcript."
                                 )
                                 return
-                        except Exception:
+                            durable_turn_lease_refresh_deadline = (
+                                time.monotonic() + _lease_ttl
+                            )
+                        except Exception as exc:
                             if durable_turn_lease_stop.is_set():
                                 return
+                            from hermes_state import classify_persistence_error
+
+                            retry_budget = max(_lease_refresh_interval, 1.0) + max(
+                                float(getattr(_turn_db, "_WRITE_PATIENCE_S", 20.0)),
+                                0.0,
+                            )
+                            if (
+                                classify_persistence_error(exc) == "locked"
+                                and time.monotonic() + retry_budget
+                                < durable_turn_lease_refresh_deadline
+                            ):
+                                logger.warning(
+                                    "Session turn lease refresh met transient storage "
+                                    "contention; retaining the current holder for a "
+                                    "bounded retry: %s",
+                                    getattr(self, "session_id", None) or session_id,
+                                    exc_info=True,
+                                )
+                                continue
                             logger.warning(
                                 "Failed to refresh session turn lease: %s",
                                 getattr(self, "session_id", None) or session_id,

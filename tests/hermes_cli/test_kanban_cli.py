@@ -24,6 +24,12 @@ def kanban_home(tmp_path, monkeypatch):
     return home
 
 
+def _escalate_via_block_loop(conn, task_id: str, *, kind: str | None = None):
+    assert kb.block_task(conn, task_id, reason="repeat", kind=kind)
+    assert kb.unblock_task(conn, task_id)
+    assert kb.block_task(conn, task_id, reason="repeat", kind=kind)
+
+
 # ---------------------------------------------------------------------------
 # Workspace flag parsing
 # ---------------------------------------------------------------------------
@@ -57,6 +63,35 @@ def test_kanban_list_json_includes_session_id(kanban_home):
     )
 
 
+def test_kanban_create_accepts_session_affinity(kanban_home):
+    from hermes_cli import projects_db
+
+    with projects_db.connect_closing() as project_conn:
+        project_id = projects_db.create_project(
+            project_conn, name="CLI affinity", primary_path=str(kanban_home)
+        )
+    parser = argparse.ArgumentParser(prog="hermes", add_help=False)
+    sub = parser.add_subparsers(dest="command")
+    kc.build_parser(sub)
+    args = parser.parse_args(
+        [
+            "kanban",
+            "create",
+            "affined task",
+            "--project",
+            project_id,
+            "--session-affinity",
+            '{"flow_id":"flow-cli","terminal":true}',
+            "--json",
+        ]
+    )
+    assert kc.kanban_command(args) == 0
+
+    with kb.connect_closing() as conn:
+        task = next(task for task in kb.list_tasks(conn, limit=10) if task.title == "affined task")
+    assert task.session_affinity == {"flow_id": "flow-cli", "terminal": True}
+
+
 def test_kanban_show_text_renders_graph_with_open_connection(kanban_home):
     with kb.connect_closing() as conn:
         parent_id = kb.create_task(conn, title="parent task")
@@ -68,6 +103,37 @@ def test_kanban_show_text_renders_graph_with_open_connection(kanban_home):
     assert f"Task {child_id}: child task" in output
     assert f"parents:   {parent_id}" in output
     assert "Cannot operate on a closed database" not in output
+
+
+def test_unblock_recover_escalated_refuses_before_explicit_routing(kanban_home):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(
+            conn,
+            title="preserve me",
+            body="operator recovery",
+            assignee="worker",
+            created_by="operator",
+            workspace_kind="worktree",
+            workspace_path="/tmp/kanban-recovery-checkout",
+            branch_name="feature/recovery-check",
+        )
+        _escalate_via_block_loop(conn, tid, kind="capability")
+
+    output = kc.run_slash(f"unblock --recover-escalated {tid}")
+    assert "cannot recover escalation" in output, output
+    assert "route the task first" in output, output
+
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "triage"
+        assert task.block_kind == "capability"
+        assert task.block_recurrences >= 2
+        assert kb.is_block_loop_escalated(conn, tid)
+        assert not any(
+            event.kind == "triage_escalation_recovered"
+            for event in kb.list_events(conn, tid)
+        )
 
 
 def test_board_override_is_isolated_per_concurrent_call(kanban_home, monkeypatch):

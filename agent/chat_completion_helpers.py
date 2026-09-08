@@ -676,6 +676,20 @@ def _estimate_chunk_bytes(chunk: Any) -> int:
     return size
 
 
+def _codex_wait_notice_cause(last_event_ts: Optional[float]) -> str:
+    """Name what a Codex wait actually is, from the one signal that can tell.
+
+    ``last_event_ts`` is stamped on *any* stream event. Once one has landed the
+    connection is demonstrably alive, so the wait is the model reasoning -- not
+    a slow or overloaded backend. Naming the backend there sends operators
+    hunting a network fault that is not happening, which is the whole reason
+    this string is computed rather than hardcoded.
+    """
+    if last_event_ts is not None:
+        return "the model is thinking"
+    return "provider may be slow or overloaded"
+
+
 def _codex_wait_notice_recovery(
     *,
     stale_timeout: float,
@@ -1587,22 +1601,21 @@ def interruptible_api_call(agent, api_kwargs: dict):
         if _poll_count % 100 == 0:  # 100 × 0.3s = 30s
             _elapsed = time.time() - _call_start
             try:
+                _last_event_ts = getattr(agent, "_codex_stream_last_event_ts", None)
                 _recovery = _codex_wait_notice_recovery(
                     stale_timeout=_stale_timeout,
                     ttfb_enabled=_ttfb_enabled,
                     ttfb_timeout=_ttfb_timeout,
-                    last_event_ts=getattr(
-                        agent, "_codex_stream_last_event_ts", None
-                    ),
+                    last_event_ts=_last_event_ts,
                     call_start=_call_start,
                     idle_enabled=_codex_idle_enabled,
                     idle_timeout=_codex_idle_timeout,
                     elapsed=_elapsed,
                 )
+                _cause = _codex_wait_notice_cause(_last_event_ts)
                 agent._emit_wait_notice(
                     f"⏳ waiting on {api_kwargs.get('model', 'the provider')} — "
-                    f"{int(_elapsed)}s with no response yet (provider may be slow "
-                    f"or overloaded{_recovery})"
+                    f"{int(_elapsed)}s with no response yet ({_cause}{_recovery})"
                 )
             except Exception:
                 logger.debug("wait-notice construction failed", exc_info=True)

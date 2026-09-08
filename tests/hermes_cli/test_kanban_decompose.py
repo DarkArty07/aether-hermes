@@ -75,6 +75,30 @@ def _patch_list_profiles(names: list[str]):
     ]
 
 
+def _escalate_via_block_loop(conn, task_id: str, *, kind: str | None = None):
+    """Replay the durable block -> unblock -> same-kind block sequence."""
+    assert kb.block_task(conn, task_id, reason="review-required: inspect", kind=kind)
+    assert kb.unblock_task(conn, task_id)
+    assert kb.block_task(conn, task_id, reason="review-required: inspect", kind=kind)
+    return kb.get_task(conn, task_id)
+
+
+def _task_snapshot(conn, task_id: str) -> dict:
+    row = conn.execute(
+        "SELECT title, body, assignee, created_by, workspace_kind, "
+        "workspace_path, branch_name, status, block_kind, block_recurrences "
+        "FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    assert row is not None
+    return {
+        "task": dict(row),
+        "parents": kb.parent_ids(conn, task_id),
+        "children": kb.child_ids(conn, task_id),
+        "count": conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0],
+    }
+
+
 def test_decompose_with_fanout_creates_children(kanban_home):
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="ship a feature", triage=True)
@@ -143,6 +167,246 @@ def test_decompose_fanout_false_invalid_llm_assignee_uses_default(kanban_home):
         task = kb.get_task(conn, tid)
     assert task is not None
     assert task.assignee == "fallback"
+
+
+@pytest.mark.parametrize("kind", [None, "capability"])
+def test_escalated_triage_is_excluded_and_auto_refused_before_llm(kanban_home, kind):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="review handoff", body="preserve this")
+        task = _escalate_via_block_loop(conn, tid, kind=kind)
+        assert task.status == "triage"
+        assert task.block_kind == kind
+        assert kb.is_block_loop_escalated(conn, tid)
+
+    assert tid not in decomp.list_triage_ids()
+    with patch("agent.auxiliary_client.call_llm") as call_llm:
+        outcome = decomp.decompose_task(
+            tid,
+            author=decomp.AUTO_DECOMPOSER_AUTHOR,
+        )
+    assert outcome.ok is False
+    assert "refusing" in outcome.reason
+    call_llm.assert_not_called()
+
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status == "triage"
+        assert not any(
+            event.kind == "triage_escalation_recovered"
+            for event in kb.list_events(conn, tid)
+        )
+
+
+def test_auto_refusal_preserves_worktree_snapshot_and_graph(kanban_home, tmp_path):
+    with kb.connect_closing() as conn:
+        parent = kb.create_task(conn, title="upstream", assignee="parent")
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (parent,))
+        conn.commit()
+        tid = kb.create_task(
+            conn,
+            title="preserve title",
+            body="preserve body",
+            assignee="worker",
+            created_by="operator",
+            workspace_kind="worktree",
+            workspace_path=str(tmp_path / "repo" / "checkout"),
+            branch_name="feature/preserve",
+        )
+        child = kb.create_task(conn, title="downstream", assignee="child")
+        kb.link_tasks(conn, parent_id=parent, child_id=tid)
+        kb.link_tasks(conn, parent_id=tid, child_id=child)
+        _escalate_via_block_loop(conn, tid, kind=None)
+        before = _task_snapshot(conn, tid)
+
+    with patch("agent.auxiliary_client.call_llm") as call_llm:
+        outcome = decomp.decompose_task(
+            tid,
+            author=decomp.AUTO_DECOMPOSER_AUTHOR,
+        )
+    assert outcome.ok is False
+    call_llm.assert_not_called()
+
+    with kb.connect_closing() as conn:
+        assert _task_snapshot(conn, tid) == before
+
+
+def test_fresh_triage_is_still_listed_for_auto_decompose(kanban_home):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="fresh idea", triage=True)
+    assert tid in decomp.list_triage_ids()
+
+
+def test_escalation_predicate_uses_event_order_not_mutable_fields(kanban_home):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="event ordering", triage=True)
+        conn.execute(
+            "UPDATE tasks SET block_kind='capability', block_recurrences=99 "
+            "WHERE id=?",
+            (tid,),
+        )
+        conn.commit()
+        assert not kb.is_block_loop_escalated(conn, tid)
+
+        with kb.write_txn(conn):
+            kb._append_event(conn, tid, "block_loop_detected")
+        assert kb.is_block_loop_escalated(conn, tid)
+        assert kb.specify_triage_task(
+            conn,
+            tid,
+            body="operator-routed work",
+            author="operator",
+        )
+        assert kb.recover_escalated_triage_task(conn, tid)
+        assert not kb.is_block_loop_escalated(conn, tid)
+
+        with kb.write_txn(conn):
+            kb._append_event(conn, tid, "block_loop_detected")
+        assert kb.is_block_loop_escalated(conn, tid)
+
+
+def test_triage_feed_preserves_tenant_and_priority_order(kanban_home):
+    with kb.connect_closing() as conn:
+        low = kb.create_task(
+            conn, title="low", triage=True, tenant="alpha", priority=1,
+        )
+        high = kb.create_task(
+            conn, title="high", triage=True, tenant="alpha", priority=9,
+        )
+        other = kb.create_task(
+            conn, title="other tenant", triage=True, tenant="beta", priority=50,
+        )
+        excluded = kb.create_task(
+            conn, title="excluded", tenant="alpha", priority=100,
+        )
+        _escalate_via_block_loop(conn, excluded, kind=None)
+
+    assert decomp.list_triage_ids(tenant="alpha") == [high, low]
+    assert decomp.list_triage_ids(tenant="beta") == [other]
+
+
+def test_failed_manual_decompose_keeps_escalation_and_snapshot(kanban_home):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="manual decision", body="unchanged")
+        _escalate_via_block_loop(conn, tid, kind="capability")
+        before = _task_snapshot(conn, tid)
+
+    patches = _patch_list_profiles(["orchestrator", "fallback"])
+    for p in patches:
+        p.start()
+    try:
+        with patch(
+            "hermes_cli.kanban_decompose._load_config",
+            return_value={"kanban": {"default_assignee": "fallback"}},
+        ), patch(
+            "agent.auxiliary_client.call_llm",
+            side_effect=RuntimeError("auxiliary unavailable"),
+        ):
+            outcome = decomp.decompose_task(tid, author="operator")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok is False
+    with kb.connect_closing() as conn:
+        assert _task_snapshot(conn, tid) == before
+        assert kb.is_block_loop_escalated(conn, tid)
+        assert tid not in decomp.list_triage_ids()
+        assert not any(
+            event.kind == "triage_escalation_recovered"
+            for event in kb.list_events(conn, tid)
+        )
+
+
+def test_malformed_manual_decompose_keeps_escalation(kanban_home):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="malformed response")
+        _escalate_via_block_loop(conn, tid, kind="capability")
+
+    patches = _patch_list_profiles(["orchestrator", "fallback"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client("not valid json"):
+            outcome = decomp.decompose_task(tid, author="operator")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok is False
+    with kb.connect_closing() as conn:
+        assert kb.is_block_loop_escalated(conn, tid)
+        assert tid not in decomp.list_triage_ids()
+        assert not any(
+            event.kind == "triage_escalation_recovered"
+            for event in kb.list_events(conn, tid)
+        )
+
+
+def test_failed_manual_db_promotion_does_not_recover(kanban_home):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="db failure")
+        _escalate_via_block_loop(conn, tid, kind="capability")
+
+    payload = jsonlib.dumps({
+        "fanout": False,
+        "title": "would change",
+        "body": "would change",
+    })
+    patches = _patch_list_profiles(["orchestrator", "fallback"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(payload), patch(
+            "hermes_cli.kanban_decompose._load_config",
+            return_value={"kanban": {"default_assignee": "fallback"}},
+        ), patch.object(kb, "specify_triage_task", return_value=False):
+            outcome = decomp.decompose_task(tid, author="operator")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok is False
+    with kb.connect_closing() as conn:
+        assert kb.is_block_loop_escalated(conn, tid)
+        assert not any(
+            event.kind == "triage_escalation_recovered"
+            for event in kb.list_events(conn, tid)
+        )
+
+
+def test_manual_fanout_recovers_only_after_atomic_graph_success(kanban_home):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="fan out manually")
+        _escalate_via_block_loop(conn, tid, kind="capability")
+
+    payload = jsonlib.dumps({
+        "fanout": True,
+        "tasks": [
+            {"title": "research", "body": "inspect", "assignee": "researcher", "parents": []},
+            {"title": "build", "body": "implement", "assignee": "engineer", "parents": [0]},
+        ],
+    })
+    patches = _patch_list_profiles(["orchestrator", "researcher", "engineer"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(payload), _patch_extra_body():
+            outcome = decomp.decompose_task(tid, author="operator")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    assert outcome.child_ids and len(outcome.child_ids) == 2
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, tid)
+        assert task.status == "todo"
+        assert task.block_kind is None
+        assert task.block_recurrences == 0
+        assert not kb.is_block_loop_escalated(conn, tid)
+        assert any(
+            event.kind == "triage_escalation_recovered"
+            for event in kb.list_events(conn, tid)
+        )
 
 
 def test_decompose_returns_false_when_task_not_triage(kanban_home):

@@ -355,6 +355,56 @@ def test_run_conversation_interrupts_when_lease_refresh_lost(monkeypatch):
     assert "lease lost" in str(interrupt_calls[0][0]).lower()
 
 
+def test_run_conversation_retries_transient_locked_lease_refresh(monkeypatch):
+    db = _DB()
+    agent = _agent_with_db(db)
+    agent._session_turn_lease_refresh_interval = 0.01
+    interrupt_calls = []
+    attempts = {"n": 0}
+
+    def track_interrupt(message=None, hard_cancel=False):
+        interrupt_calls.append((message, hard_cancel))
+        agent._interrupt_requested = True
+        agent._interrupt_message = message
+
+    agent.interrupt = track_interrupt
+
+    def refresh_locked_once(session_id, holder, **kwargs):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return True
+
+    db.refresh_session_turn_lease = refresh_locked_once
+
+    def fake_run(_agent, _message, _system, history, *_args, **_kwargs):
+        deadline = time.monotonic() + 2.0
+        while attempts["n"] < 2 and time.monotonic() < deadline:
+            if getattr(_agent, "_interrupt_requested", False):
+                return {
+                    "final_response": "",
+                    "messages": history,
+                    "api_calls": 0,
+                    "completed": False,
+                    "interrupted": True,
+                }
+            time.sleep(0.01)
+        assert attempts["n"] >= 2
+        return {"final_response": "ok", "messages": history, "failed": False}
+
+    monkeypatch.setattr("agent.conversation_loop.run_conversation", fake_run)
+
+    result = AIAgent.run_conversation(
+        agent,
+        "new message",
+        conversation_history=[{"role": "user", "content": "seed"}],
+    )
+
+    assert result["final_response"] == "ok"
+    assert result.get("interrupted") is not True
+    assert interrupt_calls == []
+
+
 def test_run_conversation_interrupts_when_lease_refresh_errors(monkeypatch):
     db = _DB()
     agent = _agent_with_db(db)

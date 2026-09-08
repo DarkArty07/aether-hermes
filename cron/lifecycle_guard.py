@@ -440,6 +440,11 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
     try:
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode):
+            # Directories cannot be executed or read as scripts. Treat them
+            # as nothing to scan while preserving fail-closed behavior for
+            # devices, sockets, FIFOs, and other non-regular objects.
+            if stat.S_ISDIR(metadata.st_mode):
+                return None, False
             return None, True
         # Sniff a small prefix first: files that are clearly compiled
         # binaries (executable magic, or NUL bytes in the head) are never

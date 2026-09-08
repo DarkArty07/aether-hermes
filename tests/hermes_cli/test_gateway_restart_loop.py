@@ -200,7 +200,10 @@ class TestGatewaySelfTargetingGuard:
     """Verify hermes gateway stop/restart refuse when _HERMES_GATEWAY=1."""
 
     def test_stop_refuses_inside_gateway(self, monkeypatch):
-        monkeypatch.setenv("_HERMES_GATEWAY", "1")
+        from tools import process_registry
+        monkeypatch.setattr(
+            process_registry, "_is_supervised_gateway_process", lambda: True
+        )
         from hermes_cli.gateway import gateway_command
         args = Namespace(gateway_command="stop", all=False, system=False)
         with pytest.raises(SystemExit) as exc_info:
@@ -254,15 +257,16 @@ class TestTerminalToolGatewayLifecycleGuard:
 
     def _patch_env(self, monkeypatch, fake_env, *, inside_gateway: bool):
         import tools.terminal_tool as tt
+        from tools import process_registry
         eid = "default"
         monkeypatch.setattr(tt, "_active_environments", {eid: fake_env})
         monkeypatch.setattr(tt, "_last_activity", {eid: 0.0})
         monkeypatch.setattr(tt, "_task_env_overrides", {})
         monkeypatch.setattr(tt, "_get_env_config", self._minimal_config)
-        if inside_gateway:
-            monkeypatch.setenv("_HERMES_GATEWAY", "1")
-        else:
-            monkeypatch.delenv("_HERMES_GATEWAY", raising=False)
+        monkeypatch.setattr(
+            process_registry, "_is_supervised_gateway_process",
+            lambda: inside_gateway,
+        )
 
     @pytest.mark.parametrize("cmd", [
         "systemctl restart hermes-gateway",
@@ -371,6 +375,39 @@ class TestTerminalToolGatewayLifecycleGuard:
 
         assert result["exit_code"] == 0
         assert calls == [command]
+
+    def test_cli_agent_session_not_blocked_by_inherited_env(
+        self, monkeypatch
+    ):
+        """#92560: CLI/TUI agent sessions inherit _HERMES_GATEWAY=1 from the
+        gateway but are NOT the gateway supervisor.  The env gate must not
+        fire for them — only for the actual gateway process (PID-file owner).
+        """
+        import tools.terminal_tool as tt
+
+        calls = []
+
+        class _FakeEnv:
+            env = {}
+
+            def execute(self, cmd, **kwargs):
+                calls.append(cmd)
+                return {"output": "", "returncode": 0}
+
+        # Simulate a CLI agent session: _HERMES_GATEWAY=1 is in the
+        # environment (inherited from the gateway), but
+        # _is_supervised_gateway_process() returns False because the
+        # process does not own the gateway PID file.
+        self._patch_env(monkeypatch, _FakeEnv(), inside_gateway=False)
+        monkeypatch.setenv("_HERMES_GATEWAY", "1")
+        monkeypatch.setattr(
+            tt, "_check_all_guards", lambda cmd, env, **kwargs: {"approved": True}
+        )
+
+        result = json.loads(tt.terminal_tool(command="hermes gateway restart"))
+
+        assert result["exit_code"] == 0
+        assert calls == ["hermes gateway restart"]
 
     def test_blocks_launchctl_submit_hidden_in_referenced_script(
         self, monkeypatch, tmp_path
@@ -493,6 +530,38 @@ class TestTerminalToolGatewayLifecycleGuard:
         result = json.loads(tt.terminal_tool(command=f"/bin/bash {fifo}"))
 
         assert result["exit_code"] == 1
+
+    def test_inline_python_directory_literal_is_not_a_script(
+        self, monkeypatch, tmp_path
+    ):
+        import tools.terminal_tool as tt
+
+        calls = []
+        repository = tmp_path / "repository"
+        repository.mkdir()
+
+        class _FakeEnv:
+            env = {}
+            cwd = str(tmp_path)
+
+            def execute(self, command, **kwargs):
+                calls.append(command)
+                return {"output": str(repository), "returncode": 0}
+
+        self._patch_env(monkeypatch, _FakeEnv(), inside_gateway=True)
+        monkeypatch.setattr(
+            tt, "_check_all_guards", lambda cmd, env, **kwargs: {"approved": True}
+        )
+        command = (
+            "python3 -c 'from pathlib import Path\n"
+            f'primary = Path("{repository}")\n'
+            "print(primary)'"
+        )
+
+        result = json.loads(tt.terminal_tool(command=command))
+
+        assert result["exit_code"] == 0
+        assert calls[-1] == command
 
     def test_quoted_launchctl_submit_text_is_not_blocked(self, monkeypatch):
         import tools.terminal_tool as tt
@@ -1029,15 +1098,16 @@ class TestTerminalToolGatewayLifecycleGuardRemote:
 
     def _patch_env(self, monkeypatch, fake_env, *, inside_gateway: bool):
         import tools.terminal_tool as tt
+        from tools import process_registry
         eid = "default"
         monkeypatch.setattr(tt, "_active_environments", {eid: fake_env})
         monkeypatch.setattr(tt, "_last_activity", {eid: 0.0})
         monkeypatch.setattr(tt, "_task_env_overrides", {})
         monkeypatch.setattr(tt, "_get_env_config", lambda: {"env_type": "local", "cwd": "/tmp", "timeout": 60, "lifetime_seconds": 3600})
-        if inside_gateway:
-            monkeypatch.setenv("_HERMES_GATEWAY", "1")
-        else:
-            monkeypatch.delenv("_HERMES_GATEWAY", raising=False)
+        monkeypatch.setattr(
+            process_registry, "_is_supervised_gateway_process",
+            lambda: inside_gateway,
+        )
 
     def test_remote_backend_script_read_uses_env_execute(self, monkeypatch, tmp_path):
         import tools.terminal_tool as tt
@@ -1204,10 +1274,10 @@ class TestLifecycleGuardNeverRaises:
         weird.write_bytes(b"\xff\xfe\x00\x01 not really a script")
         assert self._scan(f"bash {weird}") is False
 
-    def test_directory_and_dev_null_fail_closed_not_crash(self, tmp_path):
-        # Non-regular files are suspicious (fail closed = blocked), but the
-        # important contract is: verdict, not exception.
-        assert self._scan(f"bash {tmp_path}") is True
+    def test_directory_is_ignored_and_dev_null_fails_closed(self, tmp_path):
+        # A directory cannot be a script and is therefore nothing to scan.
+        # Other non-regular objects remain suspicious and fail closed.
+        assert self._scan(f"bash {tmp_path}") is False
         assert self._scan("bash /dev/null") is True
 
     def test_magic_prefix_binaries_skipped_without_full_read(self, tmp_path):
@@ -1236,8 +1306,12 @@ class TestLifecycleGuardNeverRaises:
         )
         binary = tmp_path / "prog"
         binary.write_bytes(b"\x7fELF" + bytes(128))
-        for value in ("nul\x00byte.sh", str(binary), "/nonexistent/x.sh"):
+        for value in (
+            "nul\x00byte.sh",
+            str(binary),
+            "/nonexistent/x.sh",
+            str(tmp_path),
+        ):
             check_gateway_lifecycle("clean prompt", value)  # must not raise
-        for value in ("/dev/null", str(tmp_path)):
-            with pytest.raises(GatewayLifecycleBlocked):
-                check_gateway_lifecycle("clean prompt", value)
+        with pytest.raises(GatewayLifecycleBlocked):
+            check_gateway_lifecycle("clean prompt", "/dev/null")

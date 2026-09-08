@@ -210,6 +210,21 @@ def test_returns_turn_context_with_user_message_appended():
     assert ctx.active_system_prompt == "SYSTEM"
 
 
+def test_affinity_registration_failure_is_not_swallowed(monkeypatch):
+    from hermes_cli.kanban_affinity import AffinityRegistrationError
+
+    agent = _FakeAgent()
+
+    def fail_registration():
+        raise AffinityRegistrationError("stale affinity lease")
+
+    agent._ensure_db_session = fail_registration
+    monkeypatch.setenv("HERMES_KANBAN_AFFINITY_TOKEN", "lease-token")
+
+    with pytest.raises(AffinityRegistrationError, match="stale affinity lease"):
+        _build(agent)
+
+
 def test_user_message_preserves_platform_event_timestamp():
     agent = _FakeAgent()
 

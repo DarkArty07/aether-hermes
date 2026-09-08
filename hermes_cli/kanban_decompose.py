@@ -48,6 +48,8 @@ from hermes_cli import profiles as profiles_mod
 
 logger = logging.getLogger(__name__)
 
+AUTO_DECOMPOSER_AUTHOR = "auto-decomposer"
+
 
 _SYSTEM_PROMPT = """You are the Kanban decomposer for the Hermes Agent board.
 
@@ -283,8 +285,15 @@ def decompose_task(
     """
     with kb.connect_closing() as conn:
         task = kb.get_task(conn, task_id)
+        escalated = task is not None and kb.is_block_loop_escalated(conn, task_id)
     if task is None:
         return DecomposeOutcome(task_id, False, "unknown task id")
+    if escalated and author == AUTO_DECOMPOSER_AUTHOR:
+        return DecomposeOutcome(
+            task_id,
+            False,
+            "refusing automated decomposition of an escalated triage task",
+        )
     if task.status != "triage":
         return DecomposeOutcome(
             task_id, False, f"task is not in triage (status={task.status!r})"
@@ -374,6 +383,14 @@ def decompose_task(
             return DecomposeOutcome(
                 task_id, False, "task moved out of triage before promotion",
             )
+        if escalated:
+            with kb.connect_closing() as conn:
+                if not kb.recover_escalated_triage_task(conn, task_id):
+                    logger.warning(
+                        "decompose: manual promotion succeeded but escalation "
+                        "was already recovered for %s",
+                        task_id,
+                    )
         return DecomposeOutcome(
             task_id, True, "single task (no fanout)",
             fanout=False, new_title=title_val,
@@ -450,6 +467,15 @@ def decompose_task(
             task_id, False, "task moved out of triage before decomposition",
         )
 
+    if escalated:
+        with kb.connect_closing() as conn:
+            if not kb.recover_escalated_triage_task(conn, task_id):
+                logger.warning(
+                    "decompose: manual fanout succeeded but escalation was "
+                    "already recovered for %s",
+                    task_id,
+                )
+
     return DecomposeOutcome(
         task_id, True, f"decomposed into {len(child_ids)} children",
         fanout=True, child_ids=child_ids,
@@ -457,12 +483,20 @@ def decompose_task(
 
 
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
-    """Return task ids currently in the triage column."""
+    """Return fresh, auto-decomposable task ids currently in triage.
+
+    Cards held in triage by an unrecovered block-loop escalation remain a
+    human-in-the-loop decision and are intentionally excluded.
+    """
     with kb.connect_closing() as conn:
-        rows = kb.list_tasks(
-            conn,
-            status="triage",
-            tenant=tenant,
-            limit=1000,
+        query = (
+            "SELECT id FROM tasks WHERE status = 'triage' "
+            "AND NOT (" + kb._BLOCK_LOOP_ESCALATED_SQL + ")"
         )
-    return [row.id for row in rows]
+        params: list[object] = []
+        if tenant is not None:
+            query += " AND tenant = ?"
+            params.append(tenant)
+        query += " ORDER BY priority DESC, created_at ASC LIMIT 1000"
+        rows = conn.execute(query, params).fetchall()
+    return [row["id"] for row in rows]

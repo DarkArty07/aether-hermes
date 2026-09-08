@@ -574,3 +574,162 @@ def test_unrecoverable_affinity_spawn_failure_routes_flow_terminal(tmp_path, mon
         assert any(event.kind == "flow_terminal" for event in kb.list_events(conn, task_id))
     finally:
         conn.close()
+
+
+def _blocked_flow_with_terminal_controller(conn, project_id, workspace):
+    root = kb.create_task(
+        conn,
+        title="decompose",
+        assignee="supervisor",
+        project_id=project_id,
+        session_id="origin-session",
+        workspace_kind="dir",
+        workspace_path=str(workspace),
+        session_affinity={"flow_id": "flow-7"},
+    )
+    assert kb.claim_task(conn, root) is not None
+    assert kb.complete_task(conn, root)
+    unit = kb.create_task(
+        conn,
+        title="implement",
+        assignee="implementer",
+        project_id=project_id,
+        parents=(root,),
+        session_id="origin-session",
+        workspace_kind="dir",
+        workspace_path=str(workspace),
+    )
+    controller = kb.create_task(
+        conn,
+        title="integrate",
+        assignee="supervisor",
+        project_id=project_id,
+        parents=(root, unit),
+        session_id="origin-session",
+        workspace_kind="dir",
+        workspace_path=str(workspace),
+        session_affinity={"flow_id": "flow-7", "terminal": True},
+    )
+    return unit, controller
+
+
+def test_blocked_unit_wakes_terminal_flow_controller(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban"))
+    project_id = _project(tmp_path)
+    conn = kb.connect()
+    try:
+        unit, controller = _blocked_flow_with_terminal_controller(
+            conn, project_id, tmp_path
+        )
+        assert kb.claim_task(conn, unit) is not None
+        assert kb.block_task(conn, unit, reason="local guard regression", kind="capability")
+        blocked = kb.get_task(conn, unit)
+        ready_controller = kb.get_task(conn, controller)
+        assert blocked is not None and blocked.status == "blocked"
+        assert ready_controller is not None and ready_controller.status == "ready"
+        attention = [
+            event for event in kb.list_events(conn, controller)
+            if event.kind == "flow_attention"
+        ]
+        assert len(attention) == 1
+        assert attention[0].payload is not None
+        assert attention[0].payload["blocked_task_id"] == unit
+        context = kb.build_worker_context(conn, controller)
+        assert "## Flow recovery attention" in context
+        assert f"Blocked task: `{unit}`" in context
+        assert "origin_signal=\"recovery\"" in context
+        assert kb.claim_task(conn, controller) is not None
+    finally:
+        conn.close()
+
+
+def test_controller_dependency_block_resolves_attention_and_retries_unit(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban"))
+    project_id = _project(tmp_path)
+    conn = kb.connect()
+    try:
+        unit, controller = _blocked_flow_with_terminal_controller(
+            conn, project_id, tmp_path
+        )
+        assert kb.claim_task(conn, unit) is not None
+        assert kb.block_task(conn, unit, reason="local guard regression", kind="capability")
+        assert kb.claim_task(conn, controller) is not None
+        assert kb.block_task(
+            conn,
+            controller,
+            reason="runtime recovered; resume implementation",
+            kind="dependency",
+        )
+        resumed = kb.get_task(conn, unit)
+        waiting_controller = kb.get_task(conn, controller)
+        assert resumed is not None and resumed.status == "ready"
+        assert waiting_controller is not None and waiting_controller.status == "todo"
+        assert any(
+            event.kind == "flow_attention_resolved"
+            and event.payload is not None
+            and event.payload["blocked_task_id"] == unit
+            for event in kb.list_events(conn, controller)
+        )
+    finally:
+        conn.close()
+
+
+def test_controller_can_escalate_recovery_to_origin(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban"))
+    project_id = _project(tmp_path)
+    conn = kb.connect()
+    try:
+        unit, controller = _blocked_flow_with_terminal_controller(
+            conn, project_id, tmp_path
+        )
+        kb.add_notify_sub(
+            conn, task_id=controller, platform="tui", chat_id="origin-session"
+        )
+        assert kb.claim_task(conn, unit) is not None
+        assert kb.block_task(conn, unit, reason="local guard regression", kind="capability")
+        assert kb.claim_task(conn, controller) is not None
+        assert kb.block_task(
+            conn,
+            controller,
+            reason="runtime recovery failed",
+            kind="capability",
+            origin_signal="recovery",
+        )
+        _, events = kb.unseen_events_for_sub(
+            conn,
+            task_id=controller,
+            platform="tui",
+            chat_id="origin-session",
+            kinds=("origin_signal", "flow_terminal"),
+        )
+        assert [event.kind for event in events] == ["origin_signal"]
+        assert events[0].payload is not None
+        assert events[0].payload["origin_signal"] == "recovery"
+        blocked = kb.get_task(conn, unit)
+        assert blocked is not None and blocked.status == "blocked"
+    finally:
+        conn.close()
+
+
+def test_controller_requeues_when_a_second_attention_is_pending(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban"))
+    project_id = _project(tmp_path)
+    conn = kb.connect()
+    try:
+        first, controller = _blocked_flow_with_terminal_controller(conn, project_id, tmp_path)
+        second = kb.create_task(conn, title="second implementer", assignee="implementer", project_id=project_id, workspace_kind="dir", workspace_path=str(tmp_path))
+        kb.link_tasks(conn, parent_id=second, child_id=controller)
+        assert kb.claim_task(conn, first) is not None
+        assert kb.claim_task(conn, second) is not None
+        assert kb.block_task(conn, first, reason="first", kind="capability")
+        assert kb.block_task(conn, second, reason="second", kind="capability")
+        assert kb.claim_task(conn, controller) is not None
+        assert kb.block_task(conn, controller, reason="first fixed", kind="dependency")
+        requeued = kb.get_task(conn, controller)
+        assert requeued is not None and requeued.status == "ready"
+        assert len(kb._pending_flow_attentions(conn, controller)) == 1
+        assert any(event.kind == "flow_attention_requeued" for event in kb.list_events(conn, controller))
+    finally:
+        conn.close()

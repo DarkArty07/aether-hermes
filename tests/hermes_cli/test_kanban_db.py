@@ -814,6 +814,10 @@ class TestSharedBoardPaths:
         sc.reset_session_vars()
         for key in sc._VAR_MAP:
             monkeypatch.setenv(key, "stale-routing-value")
+        monkeypatch.setenv("HERMES_KANBAN_AFFINITY_TOKEN", "stale-token")
+        monkeypatch.setenv("HERMES_KANBAN_AFFINITY_GENERATION", "stale-generation")
+        monkeypatch.setenv("HERMES_KANBAN_AFFINITY_FLOW_ID", "stale-flow")
+        monkeypatch.setenv("HERMES_KANBAN_AFFINITY_PROJECT_ID", "stale-project")
 
         captured = {}
 
@@ -859,6 +863,113 @@ class TestSharedBoardPaths:
                 assert env[key] == "kanban"
                 continue
             assert key not in env
+        for key in (
+            "HERMES_KANBAN_AFFINITY_TOKEN",
+            "HERMES_KANBAN_AFFINITY_GENERATION",
+            "HERMES_KANBAN_AFFINITY_FLOW_ID",
+            "HERMES_KANBAN_AFFINITY_PROJECT_ID",
+        ):
+            assert key not in env
+
+    @pytest.mark.parametrize("lane", ["ready", "review"])
+    def test_first_worktree_spawn_exports_newly_resolved_branch(
+        self, tmp_path, monkeypatch, lane
+    ):
+        """The first ready/review spawn sees the branch resolved after claim."""
+        default_home = tmp_path / ".hermes"
+        default_home.mkdir()
+        self._set_home(monkeypatch, tmp_path, default_home)
+        kb.init_db()
+
+        workspace = tmp_path / f"{lane}-worktree"
+        workspace.mkdir()
+        expected_branch = f"wt/t_{lane}_first_spawn"
+        captured = {}
+
+        class _FakePopen:
+            def __init__(self, cmd, **kwargs):
+                captured["cmd"] = cmd
+                captured["env"] = kwargs.get("env", {})
+                self.pid = 4242
+
+        monkeypatch.setattr("subprocess.Popen", _FakePopen)
+        monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _name: True)
+        monkeypatch.setattr(
+            kb,
+            "_resolve_worktree_workspace",
+            lambda task, board=None: (workspace, expected_branch),
+        )
+        monkeypatch.setattr(kb, "review_dispatch_enabled", lambda: lane == "review")
+        monkeypatch.delenv("HERMES_KANBAN_BRANCH", raising=False)
+
+        with kb.connect() as conn:
+            task_id = kb.create_task(
+                conn,
+                title=f"{lane} first spawn",
+                assignee="coder",
+                workspace_kind="worktree",
+                workspace_path=str(workspace),
+            )
+            if lane == "review":
+                conn.execute(
+                    "UPDATE tasks SET status = 'review' WHERE id = ?",
+                    (task_id,),
+                )
+                conn.commit()
+
+            result = kb._dispatch_once_locked(
+                conn,
+                max_spawn=1,
+                reconcile_orphans=False,
+            )
+            persisted = kb.get_task(conn, task_id)
+
+        assert result.spawned == [(task_id, "coder", str(workspace))]
+        assert captured["env"]["HERMES_KANBAN_BRANCH"] == expected_branch
+        assert persisted is not None
+        assert persisted.branch_name == expected_branch
+
+    def test_non_worktree_first_spawn_does_not_invent_branch(
+        self, tmp_path, monkeypatch
+    ):
+        """Directory workspaces keep branch identity absent."""
+        default_home = tmp_path / ".hermes"
+        default_home.mkdir()
+        self._set_home(monkeypatch, tmp_path, default_home)
+        kb.init_db()
+
+        workspace = tmp_path / "dir-workspace"
+        workspace.mkdir()
+        captured = {}
+
+        class _FakePopen:
+            def __init__(self, cmd, **kwargs):
+                captured["env"] = kwargs.get("env", {})
+                self.pid = 4242
+
+        monkeypatch.setattr("subprocess.Popen", _FakePopen)
+        monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _name: True)
+        monkeypatch.delenv("HERMES_KANBAN_BRANCH", raising=False)
+
+        with kb.connect() as conn:
+            task_id = kb.create_task(
+                conn,
+                title="dir first spawn",
+                assignee="coder",
+                workspace_kind="dir",
+                workspace_path=str(workspace),
+            )
+            result = kb._dispatch_once_locked(
+                conn,
+                max_spawn=1,
+                reconcile_orphans=False,
+            )
+            persisted = kb.get_task(conn, task_id)
+
+        assert result.spawned == [(task_id, "coder", str(workspace))]
+        assert "HERMES_KANBAN_BRANCH" not in captured["env"]
+        assert persisted is not None
+        assert persisted.branch_name is None
 
 
 # ---------------------------------------------------------------------------

@@ -661,6 +661,14 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         default=None,
         help="Optional reason/note — recorded as a comment before unblocking. Quote multi-word reasons.",
     )
+    p_unblock.add_argument(
+        "--recover-escalated",
+        action="store_true",
+        help=(
+            "Acknowledge an active escalation only after the task has been "
+            "explicitly routed out of triage; never resumes triage work by itself."
+        ),
+    )
     p_unblock.add_argument("task_ids", nargs="+")
 
     p_request_review = sub.add_parser(
@@ -2169,10 +2177,18 @@ def _cmd_attach(args: argparse.Namespace) -> int:
                 content_type=content_type,
                 uploaded_by=uploaded_by,
             )
+            attachment = kb.get_attachment(conn, att_id)
+            if attachment is None:
+                raise kb.AttachmentIntegrityError(
+                    "attachment integrity metadata missing after write"
+                )
     except kb.AttachmentTooLarge as exc:
         print(f"kanban: {exc}", file=sys.stderr)
         return 1
-    print(f"Attached {name} to {args.task_id} (attachment {att_id}, {len(data)} bytes)")
+    print(
+        f"Attached {name} to {args.task_id} "
+        f"(attachment {att_id}, {attachment.size} bytes, sha256={attachment.sha256})"
+    )
     return 0
 
 
@@ -2190,6 +2206,7 @@ def _cmd_attachments(args: argparse.Namespace) -> int:
                 "filename": a.filename,
                 "content_type": a.content_type,
                 "size": a.size,
+                "sha256": a.sha256,
                 "uploaded_by": a.uploaded_by,
                 "stored_path": a.stored_path,
                 "created_at": a.created_at,
@@ -2202,8 +2219,12 @@ def _cmd_attachments(args: argparse.Namespace) -> int:
         return 0
     print(f"Attachments on {args.task_id}:")
     for a in atts:
-        ct = a.content_type or "-"
-        print(f"  [{a.id}] {a.filename}  ({a.size} bytes, {ct}, by {a.uploaded_by or '-'})")
+        ctype = a.content_type or "-"
+        digest = a.sha256 or "unverified-legacy"
+        print(
+            f"  [{a.id}] {a.filename}  "
+            f"({a.size} bytes, {ctype}, sha256={digest}, by {a.uploaded_by or '-'})"
+        )
         print(f"        {a.stored_path}")
     return 0
 
@@ -2422,16 +2443,30 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
     if reason is not None:
         reason = reason.strip() or None
     author = _profile_author() if reason else None
+    recover_escalated = bool(getattr(args, "recover_escalated", False))
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
             if reason:
                 kb.add_comment(conn, tid, author, f"UNBLOCK: {reason}")
-            if not kb.unblock_task(conn, tid):
-                failed.append(tid)
-                print(f"cannot unblock {tid} (not blocked/scheduled?)", file=sys.stderr)
+            if recover_escalated:
+                ok = kb.recover_escalated_triage_task(conn, tid)
+                if not ok:
+                    failed.append(tid)
+                    print(
+                        f"cannot recover escalation for {tid}; "
+                        "route the task first (for example with kanban decompose), "
+                        "or verify that an active escalation exists",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(f"Recovered escalation for {tid}")
             else:
-                print(f"Unblocked {tid}" + (f": {reason}" if reason else ""))
+                if not kb.unblock_task(conn, tid):
+                    failed.append(tid)
+                    print(f"cannot unblock {tid} (not blocked/scheduled?)", file=sys.stderr)
+                else:
+                    print(f"Unblocked {tid}" + (f": {reason}" if reason else ""))
     return 0 if not failed else 1
 
 
@@ -2662,6 +2697,11 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         max_in_progress_per_profile = _coerce_positive_int(
             _kanban_cfg.get("max_in_progress_per_profile")
         )
+        max_in_progress_per_profile_overrides = (
+            kb.normalize_profile_cap_overrides(
+                _kanban_cfg.get("max_in_progress_per_profile_overrides")
+            )
+        )
         max_in_progress = _coerce_positive_int(_kanban_cfg.get("max_in_progress"))
         # CLI --max overrides config kanban.max_spawn when both are present;
         # CLI is the more explicit signal so it wins.
@@ -2672,6 +2712,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     except Exception:
         default_assignee = None
         max_in_progress_per_profile = None
+        max_in_progress_per_profile_overrides = {}
         max_in_progress = None
         max_spawn = getattr(args, "max", None)
     with kb.connect_closing() as conn:
@@ -2683,6 +2724,9 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            max_in_progress_per_profile_overrides=(
+                max_in_progress_per_profile_overrides
+            ),
         )
     if getattr(args, "json", False):
         print(json.dumps({

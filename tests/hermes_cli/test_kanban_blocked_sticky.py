@@ -48,6 +48,12 @@ def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return home
 
 
+def _task_status(conn, task_id: str) -> str:
+    task = kb.get_task(conn, task_id)
+    assert task is not None
+    return task.status
+
+
 # ---------------------------------------------------------------------------
 # Worker-initiated kanban_block must be sticky
 # ---------------------------------------------------------------------------
@@ -66,16 +72,96 @@ def test_worker_block_is_not_auto_promoted_by_recompute_ready(kanban_home: Path)
             reason="review-required: please verify ACL change",
             expected_run_id=kb.get_task(conn, tid).current_run_id,
         )
-        assert kb.get_task(conn, tid).status == "blocked"
+        assert _task_status(conn, tid) == "blocked"
 
         # Hammer the promotion code — exactly the dispatcher loop's
         # behaviour, just compressed in time.
         for _ in range(5):
             promoted = kb.recompute_ready(conn)
             assert promoted == 0, "worker-blocked task must not auto-promote"
-            assert kb.get_task(conn, tid).status == "blocked"
+            assert _task_status(conn, tid) == "blocked"
 
 
+def test_origin_signal_revision_block_is_sticky_until_explicit_unblock(
+    kanban_home: Path,
+) -> None:
+    """A revision signal is still a true block, not dependency-wait work."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="contract revision required")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        assert kb.block_task(
+            conn,
+            tid,
+            reason="revise the canonical contract before retrying",
+            kind="needs_input",
+            origin_signal="revision",
+            expected_run_id=claimed.current_run_id,
+        )
+        assert _task_status(conn, tid) == "blocked"
+        assert kb._has_sticky_block(conn, tid) is True
+
+        for _ in range(3):
+            assert kb.recompute_ready(conn) == 0
+            assert _task_status(conn, tid) == "blocked"
+
+        assert kb.unblock_task(conn, tid)
+        assert _task_status(conn, tid) == "ready"
+
+
+# ---------------------------------------------------------------------------
+# initial_status=blocked must be sticky from creation (#91178 / Aether #188)
+# ---------------------------------------------------------------------------
+
+
+def test_initial_status_blocked_survives_recompute_and_reconnect(
+    kanban_home: Path,
+) -> None:
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="gated on setup", initial_status="blocked")
+        assert _task_status(conn, tid) == "blocked"
+        assert kb._has_sticky_block(conn, tid) is True
+        for _ in range(5):
+            assert kb.recompute_ready(conn) == 0
+            assert _task_status(conn, tid) == "blocked"
+
+    with kb.connect() as conn:
+        assert kb.recompute_ready(conn) == 0
+        assert _task_status(conn, tid) == "blocked"
+
+
+def test_initial_status_blocked_survives_parent_completion(kanban_home: Path) -> None:
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="prerequisite")
+        child = kb.create_task(
+            conn,
+            title="human gated child",
+            parents=[parent],
+            initial_status="blocked",
+        )
+        assert _task_status(conn, child) == "blocked"
+
+        conn.execute(
+            "UPDATE tasks SET status='done', completed_at=? WHERE id=?",
+            (int(time.time()), parent),
+        )
+        conn.commit()
+        assert kb.recompute_ready(conn) == 0
+        assert _task_status(conn, child) == "blocked"
+
+
+def test_initial_status_blocked_unblock_promotes_explicitly(kanban_home: Path) -> None:
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="gated", initial_status="blocked")
+        assert kb.unblock_task(conn, tid)
+        assert _task_status(conn, tid) == "ready"
+
+
+def test_default_create_keeps_normal_promotion_semantics(kanban_home: Path) -> None:
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="plain work")
+        assert kb._has_sticky_block(conn, tid) is False
+        assert _task_status(conn, tid) == "ready"
 
 
 # ---------------------------------------------------------------------------
@@ -123,11 +209,11 @@ def test_protocol_violation_loop_is_broken(kanban_home: Path) -> None:
             reason="review-required: human eyes please",
             expected_run_id=kb.get_task(conn, tid).current_run_id,
         )
-        assert kb.get_task(conn, tid).status == "blocked"
+        assert _task_status(conn, tid) == "blocked"
 
         # First dispatcher tick — must NOT promote.
         assert kb.recompute_ready(conn) == 0
-        assert kb.get_task(conn, tid).status == "blocked"
+        assert _task_status(conn, tid) == "blocked"
 
         # Simulate the (hypothetical) protocol_violation + gave_up
         # entries that the dispatcher would have written if the bug
@@ -152,7 +238,92 @@ def test_protocol_violation_loop_is_broken(kanban_home: Path) -> None:
         for _ in range(3):
             promoted = kb.recompute_ready(conn)
             assert promoted == 0
-            assert kb.get_task(conn, tid).status == "blocked"
+            assert _task_status(conn, tid) == "blocked"
+
+
+# ---------------------------------------------------------------------------
+# Archiving a parent must not resurrect a blocked child (Aether #247)
+# ---------------------------------------------------------------------------
+
+
+def test_archived_parent_does_not_promote_legacy_blocked_child(
+    kanban_home: Path,
+) -> None:
+    """A ``blocked`` child whose block predates the ``initial:true`` event
+    (so ``_has_sticky_block`` cannot see it) must NOT be promoted when its
+    parent is archived.
+
+    Before the fix, ``archive_task`` → ``recompute_ready`` treated
+    ``archived`` as equivalent to ``done``, flipped the child to ``ready``
+    and the dispatcher spawned a worker for it — resurrecting work whose
+    blocking condition was never resolved, with no ``unblock`` anywhere.
+    """
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="prerequisite")
+        child = kb.create_task(
+            conn,
+            title="legacy blocked child",
+            parents=[parent],
+            initial_status="blocked",
+        )
+        # Model the pre-fix rows: status='blocked' on the row, but no
+        # 'blocked' event, so the sticky guard cannot see the block.
+        conn.execute(
+            "DELETE FROM task_events WHERE task_id = ? AND kind = 'blocked'",
+            (child,),
+        )
+        conn.commit()
+        assert _task_status(conn, child) == "blocked"
+        assert kb._has_sticky_block(conn, child) is False
+
+        kb.archive_task(conn, parent)
+
+        assert _task_status(conn, parent) == "archived"
+        assert _task_status(conn, child) == "blocked", (
+            "archiving a parent must not promote a blocked child"
+        )
+        for _ in range(3):
+            assert kb.recompute_ready(conn) == 0
+            assert _task_status(conn, child) == "blocked"
+
+
+def test_archived_parent_still_promotes_todo_child(kanban_home: Path) -> None:
+    """Ordinary parent-gated work is unaffected: a ``todo`` child is still
+    released when its parent is archived, so cleaning up a board does not
+    strand it."""
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="prerequisite")
+        child = kb.create_task(conn, title="gated child", parents=[parent])
+        assert _task_status(conn, child) == "todo"
+
+        kb.archive_task(conn, parent)
+        assert _task_status(conn, child) == "ready"
+
+
+def test_done_parent_still_recovers_circuit_breaker_block(kanban_home: Path) -> None:
+    """The fix must not break auto-recovery: a non-sticky blocked child
+    whose parent genuinely completes is still promoted."""
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="prerequisite")
+        child = kb.create_task(
+            conn,
+            title="breaker blocked child",
+            parents=[parent],
+            initial_status="blocked",
+        )
+        conn.execute(
+            "DELETE FROM task_events WHERE task_id = ? AND kind = 'blocked'",
+            (child,),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='done', completed_at=? WHERE id=?",
+            (int(time.time()), parent),
+        )
+        conn.commit()
+        assert kb._has_sticky_block(conn, child) is False
+
+        assert kb.recompute_ready(conn) == 1
+        assert _task_status(conn, child) == "ready"
 
 
 # ---------------------------------------------------------------------------

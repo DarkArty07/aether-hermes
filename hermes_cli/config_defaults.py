@@ -2488,6 +2488,9 @@ DEFAULT_CONFIG = {
         # otherwise saturate one profile's local model / API quota /
         # browser pool while leaving other profiles idle.
         "max_in_progress_per_profile": None,
+        # Optional per-profile overrides for the uniform cap above. Explicit
+        # entries win; unlisted profiles continue to use the uniform cap.
+        "max_in_progress_per_profile_overrides": {},
         # When true, the kanban dispatcher auto-runs the decomposer on
         # tasks that land in Triage (every dispatcher tick). When false,
         # decomposition is manual via `hermes kanban decompose <id>` or

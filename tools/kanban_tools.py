@@ -1156,6 +1156,29 @@ def _handle_attach(args: dict, **kw) -> str:
         data = base64.b64decode(str(content_b64), validate=True)
     except (binascii.Error, ValueError) as e:
         return tool_error(f"content_base64 is not valid base64: {e}")
+    expected_size = args.get("expected_size")
+    if (
+        isinstance(expected_size, bool)
+        or not isinstance(expected_size, int)
+        or expected_size < 0
+    ):
+        return tool_error("expected_size must be a non-negative integer")
+    expected_sha256 = str(args.get("expected_sha256") or "").strip().lower()
+    import hashlib
+    import re
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
+        return tool_error("expected_sha256 must be a 64-character lowercase SHA-256")
+    actual_size = len(data)
+    actual_sha256 = hashlib.sha256(data).hexdigest()
+    if actual_size != expected_size:
+        return tool_error(
+            f"expected size mismatch: expected {expected_size}, got {actual_size}"
+        )
+    if actual_sha256 != expected_sha256:
+        return tool_error(
+            "expected SHA-256 mismatch: "
+            f"expected {expected_sha256}, got {actual_sha256}"
+        )
     content_type = args.get("content_type")
     board = args.get("board")
     try:
@@ -1170,7 +1193,17 @@ def _handle_attach(args: dict, **kw) -> str:
                 uploaded_by="agent",
                 board=board,
             )
-            return _ok(task_id=tid, attachment_id=att_id, size=len(data))
+            attachment = kb.get_attachment(conn, att_id)
+            if attachment is None:
+                raise kb.AttachmentIntegrityError(
+                    "attachment integrity metadata missing after write"
+                )
+            return _ok(
+                task_id=tid,
+                attachment_id=att_id,
+                size=attachment.size,
+                sha256=attachment.sha256,
+            )
         finally:
             conn.close()
     except kb.AttachmentTooLarge as e:
@@ -1297,7 +1330,17 @@ def _handle_attach_url(args: dict, **kw) -> str:
                 uploaded_by="agent",
                 board=board,
             )
-            return _ok(task_id=tid, attachment_id=att_id, size=len(data))
+            attachment = kb.get_attachment(conn, att_id)
+            if attachment is None:
+                raise kb.AttachmentIntegrityError(
+                    "attachment integrity metadata missing after write"
+                )
+            return _ok(
+                task_id=tid,
+                attachment_id=att_id,
+                size=attachment.size,
+                sha256=attachment.sha256,
+            )
         finally:
             conn.close()
     except kb.AttachmentTooLarge as e:
@@ -1332,6 +1375,7 @@ def _handle_attachments(args: dict, **kw) -> str:
                         "filename": a.filename,
                         "content_type": a.content_type,
                         "size": a.size,
+                        "sha256": a.sha256,
                         "uploaded_by": a.uploaded_by,
                         "stored_path": a.stored_path,
                         "created_at": a.created_at,
@@ -1395,13 +1439,21 @@ def _handle_create(args: dict, **kw) -> str:
     workspace_path = args.get("workspace_path")
     project_id = args.get("project") or args.get("project_id")
     project_source_task_id = None
-    _inherit_project = workspace_kind is None and workspace_path is None
+    _inherit_project = workspace_path is None
     if workspace_kind is None:
         workspace_kind = "scratch"
     triage, bool_error = _parse_bool_arg(args, "triage")
     if bool_error:
         return tool_error(bool_error)
     idempotency_key = args.get("idempotency_key")
+    max_retries = args.get("max_retries")
+    if max_retries is not None:
+        if (
+            isinstance(max_retries, bool)
+            or not isinstance(max_retries, int)
+            or max_retries < 1
+        ):
+            return tool_error("max_retries must be an integer >= 1")
     max_runtime_seconds = args.get("max_runtime_seconds")
     initial_status = args.get("initial_status") or "running"
     skills = args.get("skills")
@@ -1527,6 +1579,7 @@ def _handle_create(args: dict, **kw) -> str:
                 project_source_task_id=project_source_task_id,
                 triage=triage,
                 idempotency_key=idempotency_key,
+                max_retries=max_retries,
                 max_runtime_seconds=(
                     int(max_runtime_seconds)
                     if max_runtime_seconds is not None else None
@@ -1616,7 +1669,7 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
         _task = _kb.get_task(conn, task_id)
         if _task and _task.session_affinity:
             _affinity = _kb.normalize_session_affinity(_task.session_affinity)
-            if not _affinity or not _affinity["terminal"]:
+            if not _affinity:
                 return False
     except Exception:
         # Subscription bookkeeping is best-effort, but a malformed affinity
@@ -1984,7 +2037,7 @@ KANBAN_BLOCK_SCHEMA = {
                 "type": "string",
                 "enum": [
                     "dependency", "needs_input", "capability", "transient",
-                    "input", "revision",
+                    "input", "revision", "recovery",
                 ],
                 "description": (
                     "Why you're blocked. 'dependency' waits in todo and "
@@ -1994,11 +2047,13 @@ KANBAN_BLOCK_SCHEMA = {
             },
             "origin_signal": {
                 "type": "string",
-                "enum": ["input", "revision"],
+                "enum": ["input", "revision", "recovery"],
                 "description": (
                     "Optional explicit signal for the trusted originating "
                     "subscription. Use 'input' when a human answer is needed "
-                    "or 'revision' when the work needs a changed spec. This "
+                    "or 'revision' when the work needs a changed spec; use "
+                    "'recovery' when the flow controller cannot repair a "
+                    "runtime/infrastructure blocker. This "
                     "is the only non-terminal worker event routed to the "
                     "origin; ordinary internal blockers stay internal."
                 ),
@@ -2170,13 +2225,31 @@ KANBAN_ATTACH_SCHEMA = {
                 "type": "string",
                 "description": "The file contents, base64-encoded. Max 25 MB decoded.",
             },
+            "expected_size": {
+                "type": "integer",
+                "minimum": 0,
+                "description": (
+                    "Exact byte size before base64 encoding; used to reject "
+                    "truncated tool transport before persistence."
+                ),
+            },
+            "expected_sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$",
+                "description": (
+                    "Lowercase SHA-256 of the original bytes before base64 "
+                    "encoding; used to verify transport and persisted readback."
+                ),
+            },
             "content_type": {
                 "type": "string",
                 "description": "Optional MIME type (e.g. 'application/pdf').",
             },
             "board": _board_schema_prop(),
         },
-        "required": ["filename", "content_base64"],
+        "required": [
+            "filename", "content_base64", "expected_size", "expected_sha256"
+        ],
     },
 }
 
@@ -2352,6 +2425,15 @@ KANBAN_CREATE_SCHEMA = {
                     "If a non-archived task with this key already "
                     "exists, return that task's id instead of creating "
                     "a duplicate. Useful for retry-safe automation."
+                ),
+            },
+            "max_retries": {
+                "type": "integer",
+                "minimum": 1,
+                "description": (
+                    "Maximum failed execution attempts before the task is "
+                    "auto-blocked. Optional; omission preserves the board's "
+                    "existing retry fallback."
                 ),
             },
             "max_runtime_seconds": {

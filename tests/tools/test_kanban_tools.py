@@ -416,6 +416,357 @@ def test_create_happy_path(worker_env):
         conn.close()
 
 
+def test_create_worktree_child_inherits_root_project(worker_env):
+    """An explicit worktree child keeps the worker task's canonical project."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import projects_db as pdb
+    from tools import kanban_tools as kt
+
+    repo = os.path.join(os.environ["HERMES_HOME"], "repo")
+    os.mkdir(repo)
+    with pdb.connect_closing() as project_conn:
+        project_id = pdb.create_project(
+            project_conn, name="Root project", primary_path=repo
+        )
+
+    conn = kb.connect()
+    try:
+        conn.execute(
+            "UPDATE tasks SET project_id=?, workspace_kind=? WHERE id=?",
+            (project_id, "worktree", worker_env),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    out = kt._handle_create({
+        "title": "child",
+        "assignee": "child-worker",
+        "parents": [worker_env],
+        "workspace_kind": "worktree",
+    })
+    created = json.loads(out)
+    assert created["project_id"] == project_id, out
+    assert created["workspace_kind"] == "worktree", out
+    assert created["workspace_path"], out
+
+
+def test_create_child_rejects_different_project_id(worker_env):
+    """A worker cannot silently switch a child to another project."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import projects_db as pdb
+    from tools import kanban_tools as kt
+
+    repo = os.path.join(os.environ["HERMES_HOME"], "repo")
+    os.mkdir(repo)
+    with pdb.connect_closing() as project_conn:
+        project_id = pdb.create_project(
+            project_conn, name="Root project", primary_path=repo
+        )
+
+    conn = kb.connect()
+    try:
+        conn.execute(
+            "UPDATE tasks SET project_id=? WHERE id=?",
+            (project_id, worker_env),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    out = kt._handle_create({
+        "title": "child",
+        "assignee": "child-worker",
+        "parents": [worker_env],
+        "workspace_kind": "worktree",
+        "project_id": "other-project",
+    })
+    created = json.loads(out)
+    assert "error" in created, out
+    assert "canonical project" in created["error"], out
+
+
+def test_create_cross_profile_project_children_keep_isolated_worktree_routing(
+    monkeypatch, tmp_path,
+):
+    """A shared-board worker need not duplicate the creator's projects.db."""
+    from pathlib import Path as _Path
+
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import projects_db as pdb
+    from tools import kanban_tools as kt
+
+    profile_a = tmp_path / "profiles" / "creator"
+    profile_b = tmp_path / "profiles" / "worker"
+    profile_a.mkdir(parents=True)
+    profile_b.mkdir(parents=True)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    shared_db = tmp_path / "shared-kanban.db"
+
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(shared_db))
+    monkeypatch.setenv("HERMES_HOME", str(profile_a))
+    monkeypatch.setenv("HERMES_PROFILE", "creator")
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    with pdb.connect_closing() as project_conn:
+        project_id = pdb.create_project(
+            project_conn, name="Cross Profile Project", folders=[str(repo)],
+        )
+    with kb.connect() as conn:
+        parent_id = kb.create_task(
+            conn,
+            title="parent implementation",
+            assignee="worker",
+            project_id=project_id,
+        )
+        kb.claim_task(conn, parent_id)
+        parent = kb.get_task(conn, parent_id)
+        assert parent is not None
+
+    monkeypatch.setenv("HERMES_HOME", str(profile_b))
+    monkeypatch.setenv("HERMES_PROFILE", "worker")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", parent_id)
+    assert not (profile_b / "projects.db").exists()
+
+    def create_child(index: int) -> dict:
+        return json.loads(kt._handle_create({
+            "title": f"parallel child {index}",
+            "assignee": "peer",
+            "parents": [parent_id],
+            "workspace_kind": "worktree",
+        }))
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        children = list(pool.map(create_child, range(2)))
+
+    assert all(result["ok"] is True for result in children)
+    child_ids = [result["task_id"] for result in children]
+    child_tasks = []
+    with kb.connect() as conn:
+        for task_id in child_ids:
+            task = kb.get_task(conn, task_id)
+            assert task is not None
+            child_tasks.append(task)
+    for task in child_tasks:
+        assert task.project_id == project_id
+        assert task.workspace_kind == "worktree"
+        assert task.workspace_path == str(repo / ".worktrees" / task.id)
+        assert task.workspace_path != parent.workspace_path
+        assert task.branch_name is not None
+        assert task.branch_name.startswith(f"cross-profile-project/{task.id}")
+    assert len({task.workspace_path for task in child_tasks}) == 2
+    assert len({task.branch_name for task in child_tasks}) == 2
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", child_ids[0])
+    grandchild_result = json.loads(kt._handle_create({
+        "title": "nested review",
+        "assignee": "reviewer",
+        "parents": [child_ids[0]],
+        "workspace_kind": "worktree",
+    }))
+    assert grandchild_result["ok"] is True
+    with kb.connect() as conn:
+        grandchild = kb.get_task(conn, grandchild_result["task_id"])
+    assert grandchild is not None
+    assert grandchild.project_id == project_id
+    assert grandchild.workspace_kind == "worktree"
+    assert grandchild.workspace_path == str(repo / ".worktrees" / grandchild.id)
+    assert grandchild.workspace_path not in {
+        parent.workspace_path,
+        *(task.workspace_path for task in child_tasks),
+    }
+    assert grandchild.branch_name is not None
+    assert grandchild.branch_name.startswith(
+        f"cross-profile-project/{grandchild.id}"
+    )
+
+
+def test_create_cross_profile_child_from_affinity_terminal_shared_workspace(
+    monkeypatch, tmp_path,
+):
+    """A terminal Supervisor's shared root worktree remains a canonical Project source."""
+    from pathlib import Path as _Path
+
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import projects_db as pdb
+    from tools import kanban_tools as kt
+
+    profile_a = tmp_path / "profiles" / "creator"
+    profile_b = tmp_path / "profiles" / "supervisor"
+    profile_a.mkdir(parents=True)
+    profile_b.mkdir(parents=True)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    shared_db = tmp_path / "shared-kanban.db"
+
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(shared_db))
+    monkeypatch.setenv("HERMES_HOME", str(profile_a))
+    monkeypatch.setenv("HERMES_PROFILE", "creator")
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    with pdb.connect_closing() as project_conn:
+        project_id = pdb.create_project(
+            project_conn, name="Affinity Project", folders=[str(repo)],
+        )
+    flow_id = "aether.flow.v1:" + "a" * 64
+    with kb.connect() as conn:
+        root_id = kb.create_task(
+            conn,
+            title="root supervisor",
+            assignee="supervisor",
+            project_id=project_id,
+            workspace_kind="worktree",
+            session_affinity={"flow_id": flow_id, "terminal": False},
+        )
+        root = kb.get_task(conn, root_id)
+        assert root is not None and root.workspace_path
+        terminal_id = kb.create_task(
+            conn,
+            title="terminal supervisor",
+            assignee="supervisor",
+            project_id=project_id,
+            workspace_kind="dir",
+            workspace_path=root.workspace_path,
+            session_affinity={"flow_id": flow_id, "terminal": True},
+        )
+
+    monkeypatch.setenv("HERMES_HOME", str(profile_b))
+    monkeypatch.setenv("HERMES_PROFILE", "supervisor")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", terminal_id)
+    assert not (profile_b / "projects.db").exists()
+
+    created = json.loads(kt._handle_create({
+        "title": "fresh implementer rework",
+        "assignee": "implementer",
+        "parents": [root_id],
+        "workspace_kind": "worktree",
+    }))
+
+    assert created["ok"] is True
+    with kb.connect() as conn:
+        child = kb.get_task(conn, created["task_id"])
+    assert child is not None
+    assert child.project_id == project_id
+    assert child.workspace_kind == "worktree"
+    assert child.workspace_path == str(repo / ".worktrees" / child.id)
+    assert child.branch_name is not None
+    assert child.branch_name.startswith(f"affinity-project/{child.id}")
+
+    # A same-Project ``dir`` outside the canonical .worktrees root must not
+    # become a source merely because it carries affinity metadata.
+    arbitrary = repo / "shared"
+    arbitrary.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(profile_a))
+    monkeypatch.setenv("HERMES_PROFILE", "creator")
+    with kb.connect() as conn:
+        arbitrary_id = kb.create_task(
+            conn,
+            title="noncanonical terminal",
+            assignee="supervisor",
+            project_id=project_id,
+            workspace_kind="dir",
+            workspace_path=str(arbitrary),
+            session_affinity={"flow_id": flow_id, "terminal": True},
+        )
+    monkeypatch.setenv("HERMES_HOME", str(profile_b))
+    monkeypatch.setenv("HERMES_PROFILE", "supervisor")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", arbitrary_id)
+    rejected_source = json.loads(kt._handle_create({
+        "title": "must stay unresolved",
+        "assignee": "implementer",
+        "parents": [root_id],
+        "workspace_kind": "worktree",
+    }))
+    with kb.connect() as conn:
+        unresolved = kb.get_task(conn, rejected_source["task_id"])
+    assert unresolved is not None
+    assert unresolved.project_id is None
+    assert unresolved.workspace_path is None
+
+
+def test_create_schema_exposes_optional_max_retries():
+    from tools import kanban_tools as kt
+
+    parameters = kt.KANBAN_CREATE_SCHEMA["parameters"]
+    max_retries = parameters["properties"]["max_retries"]
+    assert max_retries["type"] == "integer"
+    assert max_retries["minimum"] == 1
+    assert "max_retries" not in parameters["required"]
+
+
+def test_create_persists_max_retries(worker_env):
+    from tools import kanban_tools as kt
+
+    out = kt._handle_create({
+        "title": "bounded child",
+        "assignee": "peer",
+        "parents": [worker_env],
+        "max_retries": 3,
+    })
+    result = json.loads(out)
+    assert result["ok"] is True
+
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        child = kb.get_task(conn, result["task_id"])
+        assert child.max_retries == 3
+    finally:
+        conn.close()
+
+
+def test_create_omitted_max_retries_preserves_fallback(worker_env):
+    from tools import kanban_tools as kt
+
+    out = kt._handle_create({
+        "title": "fallback child",
+        "assignee": "peer",
+        "parents": [worker_env],
+    })
+    result = json.loads(out)
+    assert result["ok"] is True
+
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        child = kb.get_task(conn, result["task_id"])
+        assert child.max_retries is None
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("value", [0, -1, "3", 1.5, True])
+def test_create_rejects_invalid_max_retries_without_row(worker_env, value):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        before = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+    finally:
+        conn.close()
+
+    out = kt._handle_create({
+        "title": "invalid child",
+        "assignee": "peer",
+        "parents": [worker_env],
+        "max_retries": value,
+    })
+    result = json.loads(out)
+    assert "error" in result
+    assert "integer >= 1" in result["error"]
+
+    conn = kb.connect()
+    try:
+        after = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+    finally:
+        conn.close()
+    assert after == before
+
+
 def test_link_happy_path(worker_env):
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
@@ -901,6 +1252,46 @@ def test_create_subscribes_tui_session_via_session_key(monkeypatch, worker_env):
     assert subs[0]["delivery_mode"] == "notify"
 
 
+def test_nonterminal_affinity_root_keeps_silent_tui_origin_route(
+    monkeypatch, worker_env, tmp_path
+):
+    """A nonterminal flow root keeps provenance for later explicit signals.
+
+    Affinity notification filters still suppress ordinary root lifecycle
+    milestones; retaining the subscription only makes ``origin_signal`` and
+    ``flow_terminal`` deliverable.
+    """
+    from hermes_cli import projects_db
+    from tools import kanban_tools as kt
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
+    monkeypatch.setenv("HERMES_SESSION_KEY", "tui-origin-flow")
+    with projects_db.connect_closing() as project_conn:
+        project_id = projects_db.create_project(
+            project_conn, name="Flow project", primary_path=str(tmp_path)
+        )
+
+    out = kt._handle_create(
+        {
+            "title": "flow root",
+            "assignee": "supervisor",
+            "project": project_id,
+            "workspace_kind": "dir",
+            "workspace_path": str(tmp_path),
+            "session_affinity": {"flow_id": "flow-7", "terminal": False},
+        }
+    )
+    result = json.loads(out)
+    assert result["ok"] is True
+    assert result["subscribed"] is True
+    subs = _sub_index(_list_subs_for_task(result["task_id"]))
+    assert [(sub["platform"], sub["chat_id"]) for sub in subs] == [
+        ("tui", "tui-origin-flow")
+    ]
+
+
 def test_create_does_not_subscribe_in_cli_session(monkeypatch, worker_env):
     """CLI / cron / test sessions have no persistent delivery channel.
     _maybe_auto_subscribe returns False and no row is written."""
@@ -978,6 +1369,81 @@ def test_maybe_auto_subscribe_swallows_add_notify_sub_failure(monkeypatch, worke
 # ---------------------------------------------------------------------------
 # Attachments — kanban_attach / kanban_attach_url / kanban_attachments
 # ---------------------------------------------------------------------------
+
+
+def _qualification_tar_gz_payload() -> bytes:
+    import io
+    import random
+    import tarfile
+
+    body = random.Random(246).randbytes(12_000)
+    archive = io.BytesIO()
+    with tarfile.open(fileobj=archive, mode="w:gz") as bundle:
+        info = tarfile.TarInfo("qualification/evidence.bin")
+        info.size = len(body)
+        bundle.addfile(info, io.BytesIO(body))
+    return archive.getvalue()
+
+
+def test_attach_rejects_valid_base64_when_expected_bytes_were_truncated(worker_env):
+    import base64
+    import hashlib
+
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    complete = _qualification_tar_gz_payload()
+    truncated = complete[:-97]
+    out = kt._handle_attach({
+        "filename": "qualification-evidence.tar.gz",
+        "content_base64": base64.b64encode(truncated).decode("ascii"),
+        "expected_size": len(complete),
+        "expected_sha256": hashlib.sha256(complete).hexdigest(),
+        "content_type": "application/gzip",
+    })
+    result = json.loads(out)
+    assert "error" in result, out
+    assert "expected" in result["error"] and "mismatch" in result["error"]
+    with kb.connect() as conn:
+        assert kb.list_attachments(conn, worker_env) == []
+
+
+def test_attach_returns_verified_size_and_sha_for_intact_tar_gz(worker_env):
+    import base64
+    import hashlib
+    import tarfile
+    from pathlib import Path
+
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    complete = _qualification_tar_gz_payload()
+    digest = hashlib.sha256(complete).hexdigest()
+    out = kt._handle_attach({
+        "filename": "qualification-evidence.tar.gz",
+        "content_base64": base64.b64encode(complete).decode("ascii"),
+        "expected_size": len(complete),
+        "expected_sha256": digest,
+        "content_type": "application/gzip",
+    })
+    result = json.loads(out)
+    assert result["ok"] is True, out
+    assert result["size"] == len(complete)
+    assert result["sha256"] == digest
+    with kb.connect() as conn:
+        [attachment] = kb.list_attachments(conn, worker_env)
+    assert attachment.size == len(complete)
+    assert attachment.sha256 == digest
+    assert Path(attachment.stored_path).read_bytes() == complete
+    with tarfile.open(attachment.stored_path, mode="r:gz") as bundle:
+        assert bundle.getnames() == ["qualification/evidence.bin"]
+
+
+def test_attach_schema_requires_sender_integrity_claims():
+    from tools import kanban_tools as kt
+
+    required = set(kt.KANBAN_ATTACH_SCHEMA["parameters"]["required"])
+    assert {"expected_size", "expected_sha256"} <= required
 
 
 @pytest.fixture

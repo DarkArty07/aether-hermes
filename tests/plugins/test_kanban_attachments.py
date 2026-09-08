@@ -12,6 +12,7 @@ The plugin router is attached to a bare FastAPI app — same approach as
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import sys
 from pathlib import Path
@@ -242,11 +243,35 @@ def test_store_attachment_bytes_roundtrip(kanban_home):
         assert a is not None
         assert a.filename == "doc.txt"
         assert a.size == len(b"some bytes")
+        assert a.sha256 == hashlib.sha256(b"some bytes").hexdigest()
         assert a.uploaded_by == "tester"
         assert Path(a.stored_path).read_bytes() == b"some bytes"
         assert Path(a.stored_path).resolve().is_relative_to(
             kb.task_attachments_dir(task_id).resolve()
         )
+    finally:
+        conn.close()
+
+
+def test_store_attachment_bytes_rejects_partial_disk_write(
+    kanban_home, monkeypatch,
+):
+    original_write_bytes = Path.write_bytes
+
+    def partial_write(path: Path, data: bytes) -> int:
+        return original_write_bytes(path, data[:-3])
+
+    monkeypatch.setattr(Path, "write_bytes", partial_write)
+    conn = kb.connect()
+    try:
+        task_id = _make_task(conn)
+        with pytest.raises(ValueError, match="integrity"):
+            kb.store_attachment_bytes(
+                conn, task_id, "partial.bin", b"complete payload",
+                uploaded_by="tester",
+            )
+        assert kb.list_attachments(conn, task_id) == []
+        assert list(kb.task_attachments_dir(task_id).iterdir()) == []
     finally:
         conn.close()
 

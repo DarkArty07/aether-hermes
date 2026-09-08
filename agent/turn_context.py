@@ -25,6 +25,7 @@ move-and-name refactor with no semantic change.
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 import uuid
@@ -756,6 +757,8 @@ def build_turn_context(
             with persist_lock:
                 agent._ensure_db_session()
     except Exception:
+        if os.environ.get("HERMES_KANBAN_AFFINITY_TOKEN"):
+            raise
         logger.warning(
             "Turn-start session row creation failed for session=%s",
             agent.session_id or "none",
@@ -1370,6 +1373,8 @@ def build_turn_context(
             with persist_lock:
                 _ensure_and_persist()
     except Exception:
+        if os.environ.get("HERMES_KANBAN_AFFINITY_TOKEN"):
+            raise
         logger.warning(
             "Early turn-start session persistence failed for session=%s",
             agent.session_id or "none",

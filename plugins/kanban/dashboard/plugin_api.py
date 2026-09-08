@@ -36,6 +36,7 @@ the port.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import sqlite3
@@ -206,6 +207,7 @@ def _attachment_dict(a: kanban_db.Attachment) -> dict[str, Any]:
         "filename": a.filename,
         "content_type": a.content_type,
         "size": a.size,
+        "sha256": a.sha256,
         "uploaded_by": a.uploaded_by,
         "stored_path": a.stored_path,
         "created_at": a.created_at,
@@ -742,6 +744,7 @@ async def upload_task_attachment(
         candidate = dest_path.name
 
         total = 0
+        digest = hashlib.sha256()
         try:
             with open(dest_path, "wb") as out:
                 while True:
@@ -749,6 +752,7 @@ async def upload_task_attachment(
                     if not chunk:
                         break
                     total += len(chunk)
+                    digest.update(chunk)
                     if total > KANBAN_ATTACHMENT_MAX_BYTES:
                         out.close()
                         dest_path.unlink(missing_ok=True)
@@ -764,15 +768,20 @@ async def upload_task_attachment(
         except OSError as exc:
             raise HTTPException(status_code=500, detail=f"failed to store attachment: {exc}")
 
-        att_id = kanban_db.add_attachment(
-            conn,
-            task_id,
-            filename=candidate,
-            stored_path=str(dest_path.resolve()),
-            content_type=file.content_type,
-            size=total,
-            uploaded_by=(uploaded_by or "dashboard"),
-        )
+        try:
+            att_id = kanban_db.add_attachment(
+                conn,
+                task_id,
+                filename=candidate,
+                stored_path=str(dest_path.resolve()),
+                content_type=file.content_type,
+                size=total,
+                sha256=digest.hexdigest(),
+                uploaded_by=(uploaded_by or "dashboard"),
+            )
+        except Exception:
+            dest_path.unlink(missing_ok=True)
+            raise
         att = kanban_db.get_attachment(conn, att_id)
         return {"attachment": _attachment_dict(att) if att else None}
     except ValueError as e:

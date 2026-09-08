@@ -111,7 +111,7 @@ _log = logging.getLogger(__name__)
 
 VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
-VALID_ORIGIN_SIGNALS = {"input", "revision"}
+VALID_ORIGIN_SIGNALS = {"input", "revision", "recovery"}
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
 # worker (or human) means by "blocked", so each can be routed differently
@@ -144,6 +144,28 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 # not dispatcher spawn/crash/timeout failures.
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
+
+# A task is escalation-active only while its newest block-loop detection has
+# not been followed by a recovery acknowledgement.  Keep this event-derived
+# predicate in one place: ``block_kind``/``block_recurrences`` are mutable
+# operator-facing state and are not sufficient evidence of an active loop.
+_BLOCK_LOOP_ESCALATED_SQL = """
+EXISTS (
+    SELECT 1
+      FROM task_events detected
+     WHERE detected.task_id = tasks.id
+       AND detected.kind = 'block_loop_detected'
+       AND detected.id > COALESCE(
+           (
+               SELECT MAX(recovered.id)
+                 FROM task_events recovered
+                WHERE recovered.task_id = tasks.id
+                  AND recovered.kind = 'triage_escalation_recovered'
+           ),
+           0
+       )
+)
+"""
 
 
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
@@ -430,15 +452,8 @@ def _resolve_claim_ttl_seconds(ttl_seconds: Optional[int] = None) -> int:
 DEFAULT_CRASH_GRACE_SECONDS = 30
 
 
-# Sentinel exit code a kanban worker uses to signal "I bailed because the
-# provider rate-limited / exhausted quota, not because the task failed."
-# The dispatcher's reap classifier maps this to a ``rate_limited`` exit kind
-# so ``detect_crashed_workers`` can release the task back to ``ready``
-# WITHOUT counting a failure (the circuit breaker must never trip on a
-# transient throttle). 75 == BSD ``EX_TEMPFAIL`` (sysexits.h) — the
-# conventional "temporary failure, retry later" code, and well clear of the
-# 0/1/2 codes the worker uses for success / generic failure / usage error.
-KANBAN_RATE_LIMIT_EXIT_CODE = 75
+# Worker sentinel exit codes are imported from ``kanban_exit_codes`` so the
+# quiet CLI and this reap classifier share one source of truth.
 
 
 def _resolve_crash_grace_seconds() -> int:
@@ -1728,6 +1743,7 @@ class Attachment:
     stored_path: str
     content_type: Optional[str]
     size: int
+    sha256: Optional[str]
     uploaded_by: Optional[str]
     created_at: int
 
@@ -1930,6 +1946,7 @@ CREATE TABLE IF NOT EXISTS task_attachments (
     stored_path  TEXT NOT NULL,
     content_type TEXT,
     size         INTEGER NOT NULL DEFAULT 0,
+    sha256       TEXT,
     uploaded_by  TEXT,
     created_at   INTEGER NOT NULL
 );
@@ -3180,6 +3197,10 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_events_run "
         "ON task_events(run_id, id)"
     )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_events_task_kind "
+        "ON task_events(task_id, kind, id)"
+    )
 
     notify_table_exists = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='kanban_notify_subs'"
@@ -3761,24 +3782,57 @@ def create_task(
             # opening the creator profile's project store, and without reusing
             # the source task's literal worktree path.
             source_task = get_task(conn, str(project_source_task_id))
+            source_anchor = source_task
             if (
                 source_task is not None
                 and source_task.project_id == project_id
-                and source_task.workspace_kind == "worktree"
+                and source_task.workspace_kind == "dir"
                 and source_task.workspace_path
+                and source_task.session_affinity
             ):
-                source_path = Path(source_task.workspace_path)
+                # A terminal affinity Supervisor intentionally persists the
+                # shared root worktree as ``dir``. Resolve that root task as
+                # the canonical anchor rather than rejecting the Project
+                # merely because the terminal task id differs from the
+                # worktree leaf. Every field below must agree, so an arbitrary
+                # directory can never become a Project source.
+                shared_path = Path(source_task.workspace_path)
+                root_task = (
+                    get_task(conn, shared_path.name)
+                    if shared_path.is_absolute()
+                    and shared_path.parent.name == ".worktrees"
+                    else None
+                )
+                source_affinity = source_task.session_affinity
+                root_affinity = root_task.session_affinity if root_task else None
+                if (
+                    root_task is not None
+                    and root_task.project_id == project_id
+                    and root_task.assignee == source_task.assignee
+                    and root_task.workspace_kind == "worktree"
+                    and root_task.workspace_path == source_task.workspace_path
+                    and root_affinity
+                    and root_affinity.get("flow_id") == source_affinity.get("flow_id")
+                ):
+                    source_anchor = root_task
+            if (
+                source_anchor is not None
+                and source_anchor.project_id == project_id
+                and source_anchor.workspace_kind == "worktree"
+                and source_anchor.workspace_path
+            ):
+                source_path = Path(source_anchor.workspace_path)
                 if (
                     source_path.is_absolute()
-                    and source_path.name == source_task.id
+                    and source_path.name == source_anchor.id
                     and source_path.parent.name == ".worktrees"
                 ):
                     project_slug = None
-                    if source_task.branch_name:
-                        prefix, separator, leaf = source_task.branch_name.partition("/")
+                    if source_anchor.branch_name:
+                        prefix, separator, leaf = source_anchor.branch_name.partition("/")
                         if separator and (
-                            leaf == source_task.id
-                            or leaf.startswith(f"{source_task.id}-")
+                            leaf == source_anchor.id
+                            or leaf.startswith(f"{source_anchor.id}-")
                         ):
                             try:
                                 project_slug = _pdb.normalize_slug(prefix)
@@ -4065,6 +4119,23 @@ def create_task(
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
+                if initial_status == "blocked":
+                    # ``recompute_ready`` treats the latest blocked/unblocked
+                    # event as the durable activation gate. A task born blocked
+                    # must therefore record the transition atomically with its
+                    # creation instead of carrying status alone (#91178).
+                    _append_event(
+                        conn,
+                        task_id,
+                        "blocked",
+                        {
+                            "reason": None,
+                            "kind": None,
+                            "recurrences": 0,
+                            "source_status": "blocked",
+                            "initial": True,
+                        },
+                    )
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:
@@ -4242,22 +4313,49 @@ def _route_affinity_terminal(
     reason: str,
     outcome: str = "failed",
 ) -> bool:
-    """Emit one terminal flow event and route it to the origin subscription."""
-    task = get_task(conn, task_id)
-    if task is None or not task.session_affinity:
-        return False
-    with write_txn(conn):
-        _inherit_origin_signal_subs(conn, task_id)
-        _append_event(
-            conn,
-            task_id,
-            "flow_terminal",
-            {
-                "reason": str(reason)[:500],
-                "outcome": str(outcome),
-                "flow_id": task.session_affinity.get("flow_id"),
-            },
+    """Route an exhausted attempt once, inside its failure transaction.
+
+    A non-affinity Implementer is still a parent of the affinity controller.
+    Exhaustion must enter that existing recovery path rather than disappear.
+    """
+    with write_txn(conn, allow_nested=True):
+        task = get_task(conn, task_id)
+        if task is None:
+            return False
+        cause = conn.execute(
+            "SELECT id FROM task_events WHERE task_id = ? AND kind = 'gave_up' "
+            "ORDER BY id DESC LIMIT 1", (task_id,),
+        ).fetchone()
+        cause_id = int(cause["id"]) if cause else 0
+        # Check while holding the writer lock, not before it (two dispatchers).
+        for event in conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? "
+            "AND kind = 'flow_failure_routed'", (task_id,),
+        ):
+            if json.loads(event["payload"])["cause_event_id"] == cause_id:
+                return True
+        controller = _wake_terminal_flow_controller(
+            conn, task_id, reason=reason, kind="capability", origin_signal="recovery",
         )
+        signal = None
+        if controller is None and not task.session_affinity:
+            signal = _default_flow_block_signal(conn, task_id, "capability")
+            if signal is None:
+                return False  # Genuine non-flow task: preserve legacy routing.
+        _append_event(conn, task_id, "flow_failure_routed", {
+            "cause_event_id": cause_id, "flow_controller": controller,
+        })
+        if controller is None:
+            _inherit_origin_signal_subs(conn, task_id)
+            if task.session_affinity:
+                _append_event(conn, task_id, "flow_terminal", {
+                    "reason": str(reason)[:500], "outcome": str(outcome),
+                    "flow_id": task.session_affinity["flow_id"],
+                })
+            else:
+                _append_event(conn, task_id, "origin_signal", {
+                    "reason": str(reason)[:500], "origin_signal": signal,
+                })
     return True
 
 
@@ -4700,6 +4798,20 @@ class AttachmentTooLarge(ValueError):
     """
 
 
+class AttachmentIntegrityError(ValueError):
+    """Raised when claimed, written, and read-back attachment bytes differ."""
+
+
+def _attachment_file_identity(path: Path) -> tuple[int, str]:
+    digest = hashlib.sha256()
+    size = 0
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            size += len(chunk)
+            digest.update(chunk)
+    return size, digest.hexdigest()
+
+
 def _safe_attachment_name(raw: str) -> str:
     """Reduce a client-supplied filename to a safe basename.
 
@@ -4774,6 +4886,7 @@ def store_attachment_bytes(
     dest_dir = task_attachments_dir(task_id, board=board)
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest_path = _collision_free_path(dest_dir, safe_name)
+    expected_sha256 = hashlib.sha256(data).hexdigest()
     dest_path.write_bytes(data)
     try:
         return add_attachment(
@@ -4783,6 +4896,7 @@ def store_attachment_bytes(
             stored_path=str(dest_path.resolve()),
             content_type=content_type,
             size=len(data),
+            sha256=expected_sha256,
             uploaded_by=uploaded_by,
         )
     except Exception:
@@ -4802,19 +4916,29 @@ def add_attachment(
     filename: str,
     stored_path: str,
     content_type: Optional[str] = None,
-    size: int = 0,
+    size: Optional[int] = None,
+    sha256: Optional[str] = None,
     uploaded_by: Optional[str] = None,
 ) -> int:
-    """Record a file attachment for a task. Returns the new attachment id.
-
-    The caller is responsible for writing the blob to ``stored_path``
-    first (under :func:`task_attachments_dir`); this only persists the
-    metadata row and appends an ``attached`` event.
-    """
+    """Verify and record a file attachment. Returns the new attachment id."""
     if not filename or not filename.strip():
         raise ValueError("attachment filename is required")
     if not stored_path or not stored_path.strip():
         raise ValueError("attachment stored_path is required")
+    actual_size, actual_sha256 = _attachment_file_identity(Path(stored_path))
+    if size is not None and int(size) != actual_size:
+        raise AttachmentIntegrityError(
+            f"attachment integrity size mismatch: expected {int(size)}, got {actual_size}"
+        )
+    if sha256 is not None:
+        expected_sha256 = str(sha256).strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
+            raise AttachmentIntegrityError("attachment integrity SHA-256 is invalid")
+        if expected_sha256 != actual_sha256:
+            raise AttachmentIntegrityError(
+                "attachment integrity SHA-256 mismatch: "
+                f"expected {expected_sha256}, got {actual_sha256}"
+            )
     now = int(time.time())
     with write_txn(conn):
         if not conn.execute(
@@ -4823,14 +4947,15 @@ def add_attachment(
             raise ValueError(f"unknown task {task_id}")
         cur = conn.execute(
             "INSERT INTO task_attachments "
-            "(task_id, filename, stored_path, content_type, size, uploaded_by, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "(task_id, filename, stored_path, content_type, size, sha256, "
+            "uploaded_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 task_id,
                 filename.strip(),
                 stored_path,
                 content_type,
-                int(size),
+                actual_size,
+                actual_sha256,
                 uploaded_by,
                 now,
             ),
@@ -4839,7 +4964,12 @@ def add_attachment(
             conn,
             task_id,
             "attached",
-            {"filename": filename.strip(), "size": int(size), "by": uploaded_by},
+            {
+                "filename": filename.strip(),
+                "size": actual_size,
+                "sha256": actual_sha256,
+                "by": uploaded_by,
+            },
         )
         return int(cur.lastrowid or 0)
 
@@ -4857,6 +4987,7 @@ def list_attachments(conn: sqlite3.Connection, task_id: str) -> list[Attachment]
             stored_path=r["stored_path"],
             content_type=r["content_type"],
             size=r["size"] or 0,
+            sha256=r["sha256"] if "sha256" in r.keys() else None,
             uploaded_by=r["uploaded_by"],
             created_at=r["created_at"],
         )
@@ -4877,6 +5008,7 @@ def get_attachment(conn: sqlite3.Connection, attachment_id: int) -> Optional[Att
         stored_path=r["stored_path"],
         content_type=r["content_type"],
         size=r["size"] or 0,
+        sha256=r["sha256"] if "sha256" in r.keys() else None,
         uploaded_by=r["uploaded_by"],
         created_at=r["created_at"],
     )
@@ -4928,6 +5060,44 @@ def list_events(conn: sqlite3.Connection, task_id: str) -> list[Event]:
             )
         )
     return out
+
+
+def is_block_loop_escalated(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Return whether *task_id* has an unrecovered block-loop detection.
+
+    Escalation is derived solely from the append-only event stream.  The
+    latest ``block_loop_detected`` event is active until a later
+    ``triage_escalation_recovered`` event acknowledges it; mutable task
+    columns are deliberately not consulted.
+    """
+    row = conn.execute(
+        "SELECT 1 FROM tasks WHERE id = ? AND " + _BLOCK_LOOP_ESCALATED_SQL,
+        (task_id,),
+    ).fetchone()
+    return row is not None
+
+
+def recover_escalated_triage_task(
+    conn: sqlite3.Connection, task_id: str,
+) -> bool:
+    """Acknowledge an active escalation only after explicit routing.
+
+    The conditional update and recovery event share one immediate transaction,
+    so a recovery either clears ``block_kind``/``block_recurrences`` and
+    records its audit event together, or changes nothing. The task must already
+    have left ``triage`` through an explicit routing/decomposition action;
+    acknowledging the escalation alone must not expose it to auto-decompose.
+    """
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET block_kind = NULL, block_recurrences = 0 "
+            "WHERE id = ? AND status != 'triage' AND " + _BLOCK_LOOP_ESCALATED_SQL,
+            (task_id,),
+        )
+        if cur.rowcount != 1:
+            return False
+        _append_event(conn, task_id, "triage_escalation_recovered")
+        return True
 
 
 def _append_event(
@@ -5107,10 +5277,10 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
       finish, transient infra error clears).
 
     The cheapest signal that distinguishes the two is the most recent
-    ``"blocked"`` / ``"unblocked"`` event for the task.  If the most
-    recent one is ``"blocked"`` (or there is a ``"blocked"`` event and
-    no ``"unblocked"`` event has fired since), the task is sticky and
-    ``recompute_ready`` must *not* auto-promote it.
+    ``"blocked"`` / ``"origin_signal"`` / ``"unblocked"`` event for the
+    task.  ``origin_signal`` is emitted instead of ``blocked`` when a true
+    non-dependency block is also routed to the originating session, so both
+    kinds are sticky until an explicit ``unblocked`` event fires.
 
     Returns ``False`` when there is no such event at all (e.g. the task
     was set to ``status='blocked'`` by the circuit breaker or by direct
@@ -5123,7 +5293,7 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
         "ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
-    return bool(row) and row["kind"] == "blocked"
+    return bool(row) and row["kind"] in {"blocked", "origin_signal"}
 
 
 def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
@@ -5210,7 +5380,16 @@ def recompute_ready(
                 "WHERE l.child_id = ?",
                 (task_id,),
             ).fetchall()
-            if all(p["status"] in ("done", "archived") for p in parents):
+            # A discarded parent is not a completed parent.  ``archived``
+            # means "this work was thrown away", so it must never
+            # auto-recover a *blocked* child: nothing about discarding the
+            # parent resolves the condition that caused the block, and
+            # ``blocked`` is precisely the state that defers to a human.
+            # ``unblock_task`` stays the explicit exit.  ``todo`` keeps the
+            # historical gate so archiving a parent does not strand ordinary
+            # parent-gated work (Aether #247).
+            satisfied = ("done",) if cur_status == "blocked" else ("done", "archived")
+            if all(p["status"] in satisfied for p in parents):
                 resume_status = _resume_status_from_events(conn, task_id)
                 if cur_status == "blocked":
                     # Don't auto-recover tasks that have hit the
@@ -5262,6 +5441,222 @@ def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
     ).fetchone() is None
 
 
+def _default_flow_block_signal(
+    conn: sqlite3.Connection, task_id: str, kind: Optional[str],
+) -> Optional[str]:
+    """Fallback only for a proven affinity ancestry, never for legacy work.
+
+    Called in the block/failure transaction. Recover subscriptions from the
+    actual ancestor DAG, not a board-wide guess based on a nullable session.
+    """
+    rows = conn.execute(
+        "WITH RECURSIVE ancestors(id) AS (SELECT ? UNION "
+        "SELECT l.parent_id FROM task_links l JOIN ancestors a ON l.child_id=a.id) "
+        "SELECT t.id, t.project_id, t.session_affinity FROM tasks t "
+        "JOIN ancestors a ON a.id=t.id WHERE t.session_affinity IS NOT NULL",
+        (task_id,),
+    ).fetchall()
+    if not rows:
+        return None
+    task = conn.execute("SELECT project_id FROM tasks WHERE id=?", (task_id,)).fetchone()
+    flows = set()
+    for row in rows:
+        affinity = normalize_session_affinity(json.loads(row["session_affinity"]))
+        if not affinity or not row["project_id"] or row["project_id"] != task["project_id"]:
+            raise ValueError("invalid affinity ancestry for blocker")
+        flows.add(affinity["flow_id"])
+    if len(flows) != 1:
+        raise ValueError("ambiguous affinity ancestry for blocker")
+    cursor = conn.execute(
+        "SELECT COALESCE(MAX(id),0) FROM task_events WHERE task_id=?", (task_id,),
+    ).fetchone()[0]
+    for row in rows:
+        conn.execute(
+            "INSERT OR IGNORE INTO kanban_notify_subs "
+            "(task_id,platform,chat_id,thread_id,user_id,user_id_alt,chat_type,"
+            "notifier_profile,delivery_mode,delivery_metadata,created_at,last_event_id) "
+            "SELECT ?,platform,chat_id,thread_id,user_id,user_id_alt,chat_type,"
+            "notifier_profile,delivery_mode,delivery_metadata,?,? "
+            "FROM kanban_notify_subs WHERE task_id=?",
+            (task_id, int(time.time()), cursor, row["id"]),
+        )
+    return "input" if kind == "needs_input" else "recovery"
+
+
+def _escalate_expired_flow_attentions(conn: sqlite3.Connection) -> None:
+    """Bound an unresolved recovery attempt in the existing dispatcher tick.
+
+    A heartbeat proves liveness, not resolution. Do not kill or unclaim the
+    controller: deliver one durable recovery signal per unresolved attention.
+    """
+    now = int(time.time())
+    with write_txn(conn):
+        controllers = conn.execute(
+            "SELECT DISTINCT t.id FROM tasks t JOIN task_events e ON e.task_id=t.id "
+            "WHERE e.kind='flow_attention' AND t.session_affinity IS NOT NULL "
+            "AND t.status NOT IN ('done','archived')",
+        ).fetchall()
+        for controller in controllers:
+            tid = controller["id"]
+            for attention in _pending_flow_attentions(conn, tid):
+                if now - attention["created_at"] < 300:
+                    continue
+                # A prior explicit escalation in this cycle already reached origin.
+                if conn.execute(
+                    "SELECT 1 FROM task_events WHERE task_id=? AND id>? "
+                    "AND kind IN ('origin_signal','flow_terminal') LIMIT 1",
+                    (tid, attention["event_id"]),
+                ).fetchone():
+                    continue
+                blocked = get_task(conn, attention["blocked_task_id"])
+                if blocked is None or blocked.status not in ('blocked', 'triage'):
+                    continue
+                _default_flow_block_signal(conn, tid, "capability")
+                _append_event(conn, tid, "origin_signal", {
+                    "origin_signal": "recovery",
+                    "reason": "Flow recovery attention has remained unresolved for 300 seconds",
+                    "blocked_task_id": blocked.id,
+                    "attention_event_id": attention["event_id"],
+                })
+
+
+def _pending_flow_attentions(
+    conn: sqlite3.Connection, controller_id: str
+) -> list[dict[str, Any]]:
+    """Return unresolved blocker-attention payloads in causal order."""
+    pending: dict[str, dict[str, Any]] = {}
+    for row in conn.execute(
+        "SELECT id, kind, payload, created_at FROM task_events "
+        "WHERE task_id = ? AND kind IN ('flow_attention', 'flow_attention_resolved') "
+        "ORDER BY id",
+        (controller_id,),
+    ).fetchall():
+        try:
+            payload = json.loads(row["payload"]) if row["payload"] else {}
+        except (TypeError, json.JSONDecodeError):
+            continue
+        blocked_task_id = payload.get("blocked_task_id")
+        if not isinstance(blocked_task_id, str) or not blocked_task_id:
+            continue
+        if row["kind"] == "flow_attention":
+            pending[blocked_task_id] = {**payload, "event_id": int(row["id"]), "created_at": int(row["created_at"])}
+        else:
+            pending.pop(blocked_task_id, None)
+    return sorted(pending.values(), key=lambda item: item["event_id"])
+
+
+def _wake_terminal_flow_controller(
+    conn: sqlite3.Connection,
+    blocked_task_id: str,
+    *,
+    reason: Optional[str],
+    kind: Optional[str],
+    origin_signal: Optional[str],
+) -> Optional[str]:
+    """Wake one direct terminal-affinity child to handle a blocked parent.
+
+    The terminal child is the flow's existing Supervisor/controller card.  No
+    new task, session, table, or polling loop is introduced.  Ambiguous graphs
+    fail closed and preserve the legacy origin route.
+    """
+    blocked = conn.execute(
+        "SELECT project_id, session_affinity FROM tasks WHERE id = ?",
+        (blocked_task_id,),
+    ).fetchone()
+    if blocked is None or blocked["session_affinity"]:
+        return None
+    candidates = []
+    for row in conn.execute(
+        "SELECT child.id, child.project_id, child.status, child.session_affinity "
+        "FROM task_links link JOIN tasks child ON child.id = link.child_id "
+        "WHERE link.parent_id = ? AND child.status NOT IN ('done', 'archived')",
+        (blocked_task_id,),
+    ).fetchall():
+        if row["project_id"] != blocked["project_id"] or not row["session_affinity"]:
+            continue
+        try:
+            affinity = normalize_session_affinity(json.loads(row["session_affinity"]))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if affinity and affinity["terminal"]:
+            candidates.append(row)
+    if len(candidates) != 1:
+        return None
+    controller = candidates[0]
+    if controller["status"] in ("blocked", "triage"):
+        return None  # Not executable: do not suppress the origin escalation.
+    controller_id = str(controller["id"])
+    if any(
+        item["blocked_task_id"] == blocked_task_id
+        for item in _pending_flow_attentions(conn, controller_id)
+    ):
+        return controller_id
+    _append_event(
+        conn,
+        controller_id,
+        "flow_attention",
+        {
+            "blocked_task_id": blocked_task_id,
+            "kind": kind,
+            "reason": reason,
+            "requested_origin_signal": origin_signal,
+        },
+    )
+    if controller["status"] in ("todo", "scheduled"):
+        conn.execute(
+            "UPDATE tasks SET status = 'ready' "
+            "WHERE id = ? AND status IN ('todo','scheduled')",
+            (controller_id,),
+        )
+    return controller_id
+
+
+def _resolve_flow_attention(conn: sqlite3.Connection, controller_id: str) -> bool:
+    """Resume the oldest blocked parent after its controller resolves it."""
+    pending = _pending_flow_attentions(conn, controller_id)
+    if not pending:
+        return False
+    attention = pending[0]
+    blocked_task_id = attention["blocked_task_id"]
+    row = conn.execute(
+        "SELECT status FROM tasks WHERE id = ?", (blocked_task_id,)
+    ).fetchone()
+    if row is not None and row["status"] in ("blocked", "triage"):
+        prior_status = str(row["status"])
+        resume_status = _resume_status_from_events(conn, blocked_task_id)
+        landing_status = _landing_status_after_parents(conn, blocked_task_id)
+        new_status = (
+            "review"
+            if landing_status == "ready" and resume_status == "review"
+            else landing_status
+        )
+        conn.execute(
+            "UPDATE tasks SET status = ?, current_run_id = NULL, "
+            "consecutive_failures = 0, last_failure_error = NULL "
+            "WHERE id = ? AND status IN ('blocked', 'triage')",
+            (new_status, blocked_task_id),
+        )
+        _append_event(
+            conn,
+            blocked_task_id,
+            "unblocked",
+            {
+                "status": new_status,
+                "resume_status": resume_status,
+                "flow_controller": controller_id,
+            },
+        )
+        if prior_status == "triage":
+            _append_event(conn, blocked_task_id, "triage_escalation_recovered")
+    _append_event(
+        conn,
+        controller_id,
+        "flow_attention_resolved",
+        {"blocked_task_id": blocked_task_id},
+    )
+    return True
+
+
 def claim_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5292,7 +5687,7 @@ def claim_task(
             "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') LIMIT 1",
             (task_id,),
         ).fetchone()
-        if undone:
+        if undone and not _pending_flow_attentions(conn, task_id):
             conn.execute(
                 "UPDATE tasks SET status = 'todo' "
                 "WHERE id = ? AND status = 'ready'",
@@ -6968,6 +7363,13 @@ def block_task(
                 },
                 run_id=run_id,
             )
+            _resolve_flow_attention(conn, task_id)
+            if _pending_flow_attentions(conn, task_id):
+                conn.execute(
+                    "UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'todo'",
+                    (task_id,),
+                )
+                _append_event(conn, task_id, "flow_attention_requeued")
             _blocked_task = get_task(conn, task_id)
             _fire_kanban_lifecycle_hook(
                 "kanban_task_blocked",
@@ -7017,7 +7419,17 @@ def block_task(
                 run_id = _synthesize_ended_run(
                     conn, task_id, outcome="blocked", summary=reason,
                 )
-            if origin_signal:
+            controller_id = _wake_terminal_flow_controller(
+                conn,
+                task_id,
+                reason=reason,
+                kind=kind,
+                origin_signal=origin_signal,
+            )
+            effective_origin_signal = None if controller_id else (
+                origin_signal or _default_flow_block_signal(conn, task_id, kind)
+            )
+            if effective_origin_signal:
                 _inherit_origin_signal_subs(conn, task_id)
             _append_event(
                 conn, task_id, "block_loop_detected",
@@ -7027,10 +7439,16 @@ def block_task(
                     "recurrences": recurrences,
                     "limit": BLOCK_RECURRENCE_LIMIT,
                     "source_status": source_status,
-                    "origin_signal": origin_signal,
+                    "origin_signal": effective_origin_signal,
+                    "flow_controller": controller_id,
                 },
                 run_id=run_id,
             )
+            if effective_origin_signal:
+                _append_event(conn, task_id, "origin_signal", {
+                    "origin_signal": effective_origin_signal, "reason": reason,
+                    "kind": kind, "source_status": source_status,
+                }, run_id=run_id)
         else:
             if expected_run_id is None:
                 cur = conn.execute(
@@ -7078,16 +7496,29 @@ def block_task(
                     outcome="blocked",
                     summary=reason,
                 )
-            if origin_signal:
+            controller_id = _wake_terminal_flow_controller(
+                conn,
+                task_id,
+                reason=reason,
+                kind=kind,
+                origin_signal=origin_signal,
+            )
+            effective_origin_signal = None if controller_id else (
+                origin_signal or _default_flow_block_signal(conn, task_id, kind)
+            )
+            if effective_origin_signal:
                 _inherit_origin_signal_subs(conn, task_id)
             _append_event(
-                conn, task_id, "origin_signal" if origin_signal else "blocked",
+                conn,
+                task_id,
+                "origin_signal" if effective_origin_signal else "blocked",
                 {
                     "reason": reason,
                     "kind": kind,
                     "recurrences": recurrences,
                     "source_status": source_status,
-                    "origin_signal": origin_signal,
+                    "origin_signal": effective_origin_signal,
+                    "flow_controller": controller_id,
                 },
                 run_id=run_id,
             )
@@ -8635,11 +9066,18 @@ DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
 # Within this window a GitHub PR URL in a comment blocks re-spawn.
 _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
 
-# Pattern matching a GitHub PR URL in task comments.
+# Match the complete token; do not silently truncate an ambiguous PR suffix.
 _RESPAWN_GUARD_PR_URL_RE = re.compile(
-    r"https?://github\.com/[^/\s]+/[^/\s]+/pull/\d+",
+    r'''https?://github\.com/[^/\s]+/[^/\s]+/pull/\d+[^\s<>()\[\]{}"']*''',
     re.IGNORECASE,
 )
+_RESPAWN_GUARD_PR_URL_VALID_RE = re.compile(
+    r"https?://github\.com/[^/\s]+/[^/\s]+/pull/\d+"
+    r"(?:/[^\s?#]*)?(?:\?[^\s#]*)?(?:#[^\s]*)?",
+    re.IGNORECASE,
+)
+_RESPAWN_GUARD_PR_URL_TRAILING_PUNCTUATION = ".,;:!?"
+_RESPAWN_GUARD_PR_LOOKUP_TIMEOUT_SECONDS = 5
 
 
 @dataclass
@@ -8779,6 +9217,8 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
             code = os.WEXITSTATUS(raw)
             if code == 0:
                 return ("clean_exit", 0)
+            if code == KANBAN_PROTOCOL_EXIT_CODE:
+                return ("protocol_violation", code)
             if code == KANBAN_RATE_LIMIT_EXIT_CODE:
                 return ("rate_limited", code)
             return ("nonzero_exit", code)
@@ -9151,9 +9591,14 @@ def enforce_max_runtime(
         # emits a ``gave_up`` event on top of the ``timed_out`` we
         # already emitted.
         if cur.rowcount == 1:
-            _record_task_failure(
-                conn, tid,
-                error=f"elapsed {int(elapsed)}s > limit {int(row['max_runtime_seconds'])}s",
+            failure_error = (
+                f"elapsed {int(elapsed)}s > limit "
+                f"{int(row['max_runtime_seconds'])}s"
+            )
+            tripped = _record_task_failure(
+                conn,
+                tid,
+                error=failure_error,
                 outcome="timed_out",
                 release_claim=False,
                 end_run=False,
@@ -9460,10 +9905,10 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
         outcome = row["outcome"] or ""
         if outcome == "rate_limited":
             continue
-        if outcome == "crashed":
-            is_violation = False
+        if outcome in {"crashed", "protocol_violation"}:
+            is_violation = outcome == "protocol_violation"
             raw_meta = row["metadata"]
-            if raw_meta:
+            if raw_meta and not is_violation:
                 try:
                     is_violation = bool(
                         json.loads(raw_meta).get("protocol_violation")
@@ -9547,7 +9992,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             pid = int(row["worker_pid"])
             kind, code = _classify_worker_exit(pid)
             rate_limited_exit = False
-            if kind == "clean_exit":
+            if kind in {"clean_exit", "protocol_violation"}:
                 # Worker subprocess returned 0 but its task is still
                 # ``running`` in the DB — it exited without calling
                 # ``kanban_complete`` / ``kanban_block``. Overwhelmingly the
@@ -9556,19 +10001,25 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 # surfaced to the retry worker via the prior-attempt error in
                 # ``build_worker_context`` (guidance approach from #61817).
                 protocol_violation = True
-                error_text = (
-                    "worker exited cleanly (rc=0) without calling "
-                    "kanban_complete or kanban_block — protocol violation. "
-                    "If the prior run already did the work, verify it and "
-                    "report the result via kanban_complete; a run that ends "
-                    "without a terminal kanban call counts as failed no "
-                    "matter what it did."
-                )
+                if kind == "protocol_violation":
+                    error_text = (
+                        f"worker refused clean exit with rc={code}: terminal "
+                        "Kanban retry budget exhausted without exactly one "
+                        "successful durable handoff receipt — protocol violation."
+                    )
+                else:
+                    error_text = (
+                        "worker exited cleanly (rc=0) without exactly one "
+                        "successful durable terminal Kanban handoff — protocol "
+                        "violation. If the prior run already did the work, verify "
+                        "it and submit one successful lifecycle tool call."
+                    )
                 event_kind = "protocol_violation"
                 event_payload = {
                     "pid": pid,
                     "claimer": row["claim_lock"],
                     "exit_code": code,
+                    "exit_kind": kind,
                     # Durable marker for _protocol_violation_streak: _end_run
                     # copies this payload into the run metadata, which is how
                     # the violation-only retry budget is derived later.
@@ -9621,7 +10072,12 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 # Rate-limited requeues are a clean release, not a crash —
                 # record the run outcome as ``rate_limited`` so the board
                 # history doesn't show a phantom crash for a quota wall.
-                _run_outcome = "rate_limited" if rate_limited_exit else "crashed"
+                if rate_limited_exit:
+                    _run_outcome = "rate_limited"
+                elif protocol_violation:
+                    _run_outcome = "protocol_violation"
+                else:
+                    _run_outcome = "crashed"
                 run_id = _end_run(
                     conn, row["id"],
                     outcome=_run_outcome, status=_run_outcome,
@@ -9728,7 +10184,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 tripped = _record_task_failure(
                     conn, tid,
                     error=error_text,
-                    outcome="crashed",
+                    outcome="protocol_violation",
                     failure_limit=violation_limit,
                     force_trip=True,
                     release_claim=False,
@@ -9928,6 +10384,7 @@ def _record_task_failure(
             _append_event(
                 conn, task_id, "gave_up", payload, run_id=run_id,
             )
+            _route_affinity_terminal(conn, task_id, reason=error, outcome="failed")
             blocked = True
         else:
             # Below threshold.
@@ -10032,6 +10489,34 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
 _clear_spawn_failures = _clear_failure_counter
 
 
+def _github_pr_is_terminal(pr_url: str) -> Optional[bool]:
+    """Verify a closed/merged PR using existing gh access; unknown stays guarded."""
+    try:
+        result = subprocess.run(
+            ["gh", "pr", "view", pr_url, "--json", "state"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=_RESPAWN_GUARD_PR_LOOKUP_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        state = json.loads(result.stdout).get("state")
+    except (AttributeError, json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(state, str):
+        return None
+    normalized = state.upper()
+    if normalized == "OPEN":
+        return False
+    if normalized in {"CLOSED", "MERGED"}:
+        return True
+    return None
+
+
 def check_respawn_guard(
     conn: sqlite3.Connection, task_id: str, *, lane: str = "ready",
 ) -> Optional[str]:
@@ -10082,8 +10567,8 @@ def check_respawn_guard(
 
     ``"active_pr"``
         A GitHub PR URL appears in a recent task comment (within
-        ``_RESPAWN_GUARD_PR_WINDOW`` seconds).  A prior worker already
-        opened a PR; re-spawning risks a duplicate PR on the same task.
+        ``_RESPAWN_GUARD_PR_WINDOW`` seconds) and is open or unverifiable.
+        Verifiably closed/merged PR references do not block resumed work.
 
     Stale / dead claim locks are NOT a guard reason — they are handled
     by ``release_stale_claims`` and ``detect_crashed_workers`` which
@@ -10171,14 +10656,25 @@ def check_respawn_guard(
         if not requeued_after:
             return "recent_success"
 
-    # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
+    # 4. Open or unverifiable PRs guard against duplicate work; terminal PRs
+    #    no longer strand an authorized continuation. Memoize within this
+    #    check only, so repeated comments do not repeat the same network read.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
+    terminal_prs: dict[str, Optional[bool]] = {}
     for c in conn.execute(
         "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
         (task_id, pr_cutoff),
     ).fetchall():
-        if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
-            return "active_pr"
+        if not c["body"]:
+            continue
+        for match in _RESPAWN_GUARD_PR_URL_RE.finditer(c["body"]):
+            pr_url = match.group(0).rstrip(_RESPAWN_GUARD_PR_URL_TRAILING_PUNCTUATION)
+            if _RESPAWN_GUARD_PR_URL_VALID_RE.fullmatch(pr_url) is None:
+                return "active_pr"
+            if pr_url not in terminal_prs:
+                terminal_prs[pr_url] = _github_pr_is_terminal(pr_url)
+            if terminal_prs[pr_url] is not True:
+                return "active_pr"
 
     return None
 
@@ -10256,6 +10752,56 @@ def review_dispatch_enabled() -> bool:
         return True
 
 
+def normalize_profile_cap_overrides(raw: Any) -> dict[str, int]:
+    """Return valid ``{profile: positive_limit}`` concurrency overrides.
+
+    Gateway, CLI, and direct dispatcher callers share this parser so every
+    dispatch surface applies identical precedence and validation. Invalid
+    entries are ignored individually; one typo must not disable valid limits
+    for other profiles.
+    """
+    if raw is None:
+        return {}
+    if not isinstance(raw, Mapping):
+        _log.warning(
+            "kanban dispatcher: invalid "
+            "kanban.max_in_progress_per_profile_overrides=%r; expected a mapping",
+            raw,
+        )
+        return {}
+
+    normalized: dict[str, int] = {}
+    for raw_profile, raw_limit in raw.items():
+        if not isinstance(raw_profile, str) or not raw_profile.strip():
+            _log.warning(
+                "kanban dispatcher: invalid profile name %r in "
+                "kanban.max_in_progress_per_profile_overrides; ignoring",
+                raw_profile,
+            )
+            continue
+        profile = raw_profile.strip()
+        try:
+            limit = int(raw_limit)
+        except (TypeError, ValueError):
+            _log.warning(
+                "kanban dispatcher: invalid concurrency override for profile "
+                "%r: %r; ignoring",
+                profile,
+                raw_limit,
+            )
+            continue
+        if limit < 1:
+            _log.warning(
+                "kanban dispatcher: concurrency override for profile %r is "
+                "below 1: %r; ignoring",
+                profile,
+                raw_limit,
+            )
+            continue
+        normalized[profile] = limit
+    return normalized
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -10269,6 +10815,7 @@ def dispatch_once(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    max_in_progress_per_profile_overrides: Optional[Mapping[str, Any]] = None,
     reconcile_orphans: bool = True,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
@@ -10304,6 +10851,9 @@ def dispatch_once(
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            max_in_progress_per_profile_overrides=(
+                max_in_progress_per_profile_overrides
+            ),
             reconcile_orphans=reconcile_orphans,
         )
         _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
@@ -10324,6 +10874,9 @@ def dispatch_once(
                 board=board,
                 default_assignee=default_assignee,
                 max_in_progress_per_profile=max_in_progress_per_profile,
+                max_in_progress_per_profile_overrides=(
+                    max_in_progress_per_profile_overrides
+                ),
                 reconcile_orphans=reconcile_orphans,
             )
             # Still under the dispatch lock: run the periodic PASSIVE WAL
@@ -10351,6 +10904,7 @@ def _dispatch_once_locked(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    max_in_progress_per_profile_overrides: Optional[Mapping[str, Any]] = None,
     reconcile_orphans: bool = True,
 ) -> DispatchResult:
     """Run one dispatcher tick.
@@ -10416,6 +10970,7 @@ def _dispatch_once_locked(
     if _crash_rate_limited:
         result.rate_limited.extend(_crash_rate_limited)
     result.timed_out = enforce_max_runtime(conn)
+    _escalate_expired_flow_attentions(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
     # Both knobs are total in-flight caps. Collapse them before either lane
@@ -10459,8 +11014,18 @@ def _dispatch_once_locked(
         isinstance(max_in_progress_per_profile, int)
         and max_in_progress_per_profile > 0
     ) else None
+    _per_profile_overrides = normalize_profile_cap_overrides(
+        max_in_progress_per_profile_overrides
+    )
+    _profile_limits_enabled = (
+        _per_profile_cap is not None or bool(_per_profile_overrides)
+    )
+
+    def _profile_cap(profile: str) -> Optional[int]:
+        return _per_profile_overrides.get(profile, _per_profile_cap)
+
     _per_profile_running: dict[str, int] = {}
-    if _per_profile_cap is not None:
+    if _profile_limits_enabled:
         for prow in conn.execute(
             "SELECT assignee, COUNT(*) AS n FROM tasks "
             "WHERE status = 'running' AND assignee IS NOT NULL "
@@ -10559,9 +11124,10 @@ def _dispatch_once_locked(
         # quota / browser pool from being overwhelmed by a fan-out
         # while the global max_in_progress / max_spawn caps still allow
         # work on OTHER profiles.
-        if _per_profile_cap is not None:
+        profile_cap = _profile_cap(row_assignee)
+        if profile_cap is not None:
             current = _per_profile_running.get(row_assignee, 0)
-            if current >= _per_profile_cap:
+            if current >= profile_cap:
                 result.skipped_per_profile_capped.append(
                     (row["id"], row_assignee, current)
                 )
@@ -10594,7 +11160,7 @@ def _dispatch_once_locked(
             # check sees the would-be spawn on subsequent iterations.
             # Without this, dry_run reports every task as spawnable and
             # under-reports the capped subset (#21582).
-            if _per_profile_cap is not None and row_assignee:
+            if _profile_limits_enabled and row_assignee:
                 _per_profile_running[row_assignee] = (
                     _per_profile_running.get(row_assignee, 0) + 1
                 )
@@ -10742,9 +11308,10 @@ def _dispatch_once_locked(
         if profile_exists is not None and not profile_exists(row["assignee"]):
             result.skipped_nonspawnable.append(row["id"])
             continue
-        if _per_profile_cap is not None:
+        profile_cap = _profile_cap(row["assignee"])
+        if profile_cap is not None:
             current = _per_profile_running.get(row["assignee"], 0)
-            if current >= _per_profile_cap:
+            if current >= profile_cap:
                 result.skipped_per_profile_capped.append(
                     (row["id"], row["assignee"], current)
                 )
@@ -10762,7 +11329,7 @@ def _dispatch_once_locked(
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
             spawned += 1
-            if _per_profile_cap is not None:
+            if _profile_limits_enabled:
                 _per_profile_running[row["assignee"]] = (
                     _per_profile_running.get(row["assignee"], 0) + 1
                 )
@@ -11518,6 +12085,24 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     if task.tenant:
         lines.append(f"Tenant:   {task.tenant}")
     lines.append(f"Workspace: {task.workspace_kind} @ {task.workspace_path or '(unresolved)'}")
+    pending_attention = _pending_flow_attentions(conn, task.id)
+    if pending_attention:
+        blocked_task_id = pending_attention[0]["blocked_task_id"]
+        lines.append("")
+        lines.append("## Flow recovery attention")
+        lines.append(
+            f"Blocked task: `{blocked_task_id}`. Inspect and resolve this blocker "
+            "inside the existing contract before ordinary terminal integration."
+        )
+        lines.append(
+            "If resolved, call `kanban_block(kind=\"dependency\")` on this controller; "
+            "Hermes resumes the blocked task and returns this controller to dependency wait."
+        )
+        lines.append(
+            "If bounded runtime recovery cannot succeed, call "
+            "`kanban_block(kind=\"capability\", origin_signal=\"recovery\")` "
+            "so the originating agent resumes the flow."
+        )
     if task.max_runtime_seconds is not None:
         terminal_timeout = _worker_terminal_timeout_env(
             task.max_runtime_seconds,
@@ -11552,7 +12137,10 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
             size_kb = max(1, (att.size + 1023) // 1024) if att.size else 0
             size_str = f", {size_kb} KB" if size_kb else ""
             ctype = f", {att.content_type}" if att.content_type else ""
-            lines.append(f"- `{att.filename}`{ctype}{size_str} → `{att.stored_path}`")
+            digest = f", sha256={att.sha256}" if att.sha256 else ", unverified legacy bytes"
+            lines.append(
+                f"- `{att.filename}`{ctype}{size_str}{digest} → `{att.stored_path}`"
+            )
         lines.append("")
 
     # Prior attempts — show closed runs so a retrying worker sees the
