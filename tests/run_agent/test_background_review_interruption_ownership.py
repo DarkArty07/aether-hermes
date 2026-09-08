@@ -16,6 +16,7 @@ from __future__ import annotations
 import http.server
 import json
 import os
+import socketserver
 import sys
 import threading
 from typing import Any, Dict, List, Optional
@@ -117,10 +118,15 @@ class _EventControlledHttpHandler(http.server.BaseHTTPRequestHandler):
         pass
 
 
+class ThreadedHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    """Multi-threaded HTTP server so concurrent in-flight requests don't block the listen loop."""
+    daemon_threads = True
+
+
 @pytest.fixture()
 def mock_server():
     _EventControlledHttpHandler.reset_controls()
-    server = http.server.HTTPServer(("127.0.0.1", 0), _EventControlledHttpHandler)
+    server = ThreadedHTTPServer(("127.0.0.1", 0), _EventControlledHttpHandler)
     port = server.server_address[1]
     thread = threading.Thread(target=server.serve_forever, daemon=True, name="mock-http-server")
     thread.start()
@@ -309,69 +315,193 @@ def test_intentional_stop_propagates_to_review_agent(mock_server):
 def test_identity_qualified_cleanup_preserves_successor_review(mock_server):
     """Interleaving: Review completion racing the next review.
 
-    Asserts identity-qualified cleanup does not clear a successor review reference.
+    Asserts identity-qualified cleanup does not clear a successor review reference:
+    drives a real predecessor review through _run_review_in_thread, installs a
+    successor review while the predecessor is in-flight in HTTP, then allows the
+    predecessor to finish. Product _unregister_review_agent must keep the successor
+    in _background_review_agent and _active_children.
     """
-    base_url, _handler = mock_server
+    base_url, handler = mock_server
     parent = _build_test_agent(base_url)
 
-    review_1 = _build_test_agent(base_url, session_id=parent.session_id)
-    review_2 = _build_test_agent(base_url, session_id=parent.session_id)
+    # Spawn predecessor review via real spawn_background_review_thread / _run_review_in_thread
+    target_1, _ = spawn_background_review_thread(
+        parent,
+        messages_snapshot=[{"role": "user", "content": "turn 1"}],
+        review_memory=True,
+    )
+    t1 = threading.Thread(target=target_1, daemon=True, name="predecessor-review")
+    t1.start()
 
-    parent._background_review_agent = review_2
-    parent._active_children = [review_1, review_2]
+    # Wait until predecessor is in-flight blocked in HTTP
+    assert handler.review_request_started.wait(timeout=3.0)
+    predecessor_agent = parent._background_review_agent
+    assert predecessor_agent is not None
 
-    # Review 1 finishes and unregisters using the inline unregister logic from background_review
-    def _unregister_review_agent(agent_ref):
-        if agent_ref is None:
-            return
-        if hasattr(parent, "_background_review_agent"):
-            _br_lock = getattr(parent, "_background_review_lock", None)
-            if _br_lock is not None:
-                with _br_lock:
-                    if parent._background_review_agent is agent_ref:
-                        parent._background_review_agent = None
-            elif parent._background_review_agent is agent_ref:
-                parent._background_review_agent = None
-        if hasattr(parent, "_active_children"):
-            try:
-                _ac_lock = getattr(parent, "_active_children_lock", None)
-                if _ac_lock is not None:
-                    with _ac_lock:
-                        parent._active_children.remove(agent_ref)
-                else:
-                    parent._active_children.remove(agent_ref)
-            except (ValueError, AttributeError):
-                pass
+    # Successor review occupies _background_review_agent and _active_children
+    successor_agent = _build_test_agent(base_url, session_id=parent.session_id)
+    with parent._background_review_lock:
+        parent._background_review_agent = successor_agent
+    with parent._active_children_lock:
+        parent._active_children.append(successor_agent)
 
-    _unregister_review_agent(review_1)
+    # Now allow predecessor to finish its HTTP call and run product cleanup (_unregister_review_agent)
+    handler.allow_review_response.set()
+    t1.join(timeout=3.0)
 
-    assert parent._background_review_agent is review_2, "Successor review must not be cleared by predecessor"
-    assert parent._active_children == [review_2], "Successor review must remain in active_children"
+    # Product unregister was executed by _run_review_in_thread.
+    # Verify successor is preserved and predecessor was removed from active_children
+    assert parent._background_review_agent is successor_agent, "Successor review must not be cleared by predecessor"
+    assert successor_agent in parent._active_children, "Successor must remain in active_children"
+    assert predecessor_agent not in parent._active_children, "Predecessor must be removed from active_children"
 
 
 def test_pre_admission_cancellation_prevents_request(mock_server):
     """Interleaving: Cancel before admission prevents outbound request.
 
-    If review agent is marked interrupted before admission to the tool loop,
-    it must break immediately and make 0 outbound API calls.
+    Qualifies cancel-before-admission of the review lifecycle:
+    uses an event/barrier-controlled window after the review worker is created
+    and before it registers/admits on the parent. Parent cancels in that window.
+    Asserts no review chat request is sent to the provider.
     """
     base_url, handler = mock_server
     parent = _build_test_agent(base_url)
 
-    review = _build_test_agent(base_url, session_id=parent.session_id)
-    # Pre-admission interrupt (e.g. cancelled immediately upon spawn)
-    review._interrupt_requested = True
+    worker_ready_to_register = threading.Event()
+    allow_registration = threading.Event()
 
-    # Run conversation on the pre-interrupted review agent
-    _res = review.run_conversation("Review the conversation above and update skills.")
+    # Intercept registration on parent's background review lock to establish
+    # a deterministic barrier window after worker creation and before admission.
+    real_lock = parent._background_review_lock
 
-    assert review._api_call_count == 0, "No API calls should be initiated when interrupted before admission"
-    assert len(handler.chat_requests_received) == 0, "No chat HTTP request should be sent to the provider"
+    class BarrierLock:
+        def __init__(self, lock):
+            self._lock = lock
+            self._tripped = False
+
+        def __enter__(self):
+            if not self._tripped:
+                self._tripped = True
+                worker_ready_to_register.set()
+                allow_registration.wait(timeout=3.0)
+            return self._lock.__enter__()
+
+        def __exit__(self, *args):
+            return self._lock.__exit__(*args)
+
+        def acquire(self, *args, **kwargs):
+            if not self._tripped:
+                self._tripped = True
+                worker_ready_to_register.set()
+                allow_registration.wait(timeout=3.0)
+            return self._lock.acquire(*args, **kwargs)
+
+        def release(self):
+            return self._lock.release()
+
+    parent._background_review_lock = BarrierLock(real_lock)
+
+    # Spawn background review
+    target, _prompt = spawn_background_review_thread(
+        parent,
+        messages_snapshot=[{"role": "user", "content": "turn 1"}],
+        review_memory=True,
+    )
+    t = threading.Thread(target=target, daemon=True, name="pre-admission-worker")
+    t.start()
+
+    # Wait for the review worker to be created and reach registration barrier
+    assert worker_ready_to_register.wait(timeout=3.0), "Worker must reach registration barrier"
+
+    # Parent cancel happens in this pre-admission window
+    parent.interrupt("user cancel before admission", hard_cancel=True)
+
+    # Release barrier to let worker proceed with admission attempt
+    allow_registration.set()
+    t.join(timeout=3.0)
+
+    # Assert no review chat request was sent to the mock server
+    assert len(handler.chat_requests_received) == 0, (
+        "No chat HTTP request should be sent when cancelled before admission"
+    )
+    assert not handler.review_request_started.is_set(), (
+        "Review request should not have started"
+    )
+
+
+def test_pre_admission_superseding_turn_prevents_request(mock_server):
+    """Interleaving: New foreground turn during pre-admission window prevents review request.
+
+    When a new live foreground turn begins before the review worker is admitted,
+    conversation_loop cancels the pending review token. The worker must be denied
+    admission and make zero outbound chat requests.
+    """
+    base_url, handler = mock_server
+    parent = _build_test_agent(base_url)
+
+    worker_ready_to_register = threading.Event()
+    allow_registration = threading.Event()
+
+    real_lock = parent._background_review_lock
+
+    class BarrierLock:
+        def __init__(self, lock):
+            self._lock = lock
+            self._tripped = False
+
+        def __enter__(self):
+            if not self._tripped:
+                self._tripped = True
+                worker_ready_to_register.set()
+                allow_registration.wait(timeout=3.0)
+            return self._lock.__enter__()
+
+        def __exit__(self, *args):
+            return self._lock.__exit__(*args)
+
+        def acquire(self, *args, **kwargs):
+            if not self._tripped:
+                self._tripped = True
+                worker_ready_to_register.set()
+                allow_registration.wait(timeout=3.0)
+            return self._lock.acquire(*args, **kwargs)
+
+        def release(self):
+            return self._lock.release()
+
+    parent._background_review_lock = BarrierLock(real_lock)
+
+    target, _prompt = spawn_background_review_thread(
+        parent,
+        messages_snapshot=[{"role": "user", "content": "turn 1"}],
+        review_memory=True,
+    )
+    t = threading.Thread(target=target, daemon=True, name="pre-admission-superseded")
+    t.start()
+
+    assert worker_ready_to_register.wait(timeout=3.0)
+
+    # New live turn arrives: conversation_loop cancels the pending review at line 1687
+    res = parent.run_conversation("User turn 2 (superseding before review admission)")
+    assert res.get("completed") is True
+    assert "Foreground turn response" in res.get("final_response", "")
+
+    allow_registration.set()
+    t.join(timeout=3.0)
+
+    # Only the foreground turn's request should have been sent; review must not send any
+    review_requests = [
+        req for req in handler.chat_requests_received
+        if any("memory" in str(m.get("content", "")).lower() or "skill" in str(m.get("content", "")).lower()
+               for m in req.get("messages", []))
+    ]
+    assert len(review_requests) == 0, "No review chat request should be sent when superseded before admission"
+    assert not handler.review_request_started.is_set()
 
 
 def test_cache_parity_and_session_isolation_invariants(mock_server):
     """Preservation of cache prefix parity and session store isolation invariants."""
-    base_url, _handler = mock_server
+    base_url, handler = mock_server
     parent = _build_test_agent(base_url)
     parent._cached_system_prompt = "VERBATIM-PARENT-SYSTEM-PROMPT"
     parent.session_id = "parent-sess-uuid"
@@ -382,33 +512,24 @@ def test_cache_parity_and_session_isolation_invariants(mock_server):
         review_memory=True,
     )
 
-    seen = {}
-
-    def _spy_target():
-        # Inspect review_agent when registered
-        review = parent._background_review_agent
-        if review is not None:
-            seen["cached_prompt"] = getattr(review, "_cached_system_prompt", None)
-            seen["session_id"] = getattr(review, "session_id", None)
-            seen["persist_disabled"] = getattr(review, "_persist_disabled", None)
-            seen["end_session_on_close"] = getattr(review, "_end_session_on_close", None)
-
-    # Run target inline or via thread while spying
     t = threading.Thread(target=target, daemon=True)
     t.start()
 
-    # Wait briefly for registration
-    for _ in range(50):
-        if parent._background_review_agent is not None:
-            _spy_target()
-            break
-        threading.Event().wait(0.02)
+    # Wait for review to reach HTTP request start via Event (no poll loop)
+    assert handler.review_request_started.wait(timeout=3.0)
+    review = parent._background_review_agent
+    assert review is not None
+
+    seen_cached_prompt = getattr(review, "_cached_system_prompt", None)
+    seen_session_id = getattr(review, "session_id", None)
+    seen_persist_disabled = getattr(review, "_persist_disabled", None)
+    seen_end_session_on_close = getattr(review, "_end_session_on_close", None)
 
     # Let review finish
-    _EventControlledHttpHandler.allow_review_response.set()
+    handler.allow_review_response.set()
     t.join(timeout=3.0)
 
-    assert seen.get("cached_prompt") == "VERBATIM-PARENT-SYSTEM-PROMPT", "Cache prefix system prompt must be inherited"
-    assert seen.get("session_id") == "parent-sess-uuid", "Session ID must match parent for cache warmth"
-    assert seen.get("persist_disabled") is True, "Persistence must be disabled to isolate user session"
-    assert seen.get("end_session_on_close") is False, "Session finalization must not occur on review close"
+    assert seen_cached_prompt == "VERBATIM-PARENT-SYSTEM-PROMPT", "Cache prefix system prompt must be inherited"
+    assert seen_session_id == "parent-sess-uuid", "Session ID must match parent for cache warmth"
+    assert seen_persist_disabled is True, "Persistence must be disabled to isolate user session"
+    assert seen_end_session_on_close is False, "Session finalization must not occur on review close"
