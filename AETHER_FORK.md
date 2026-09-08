@@ -70,6 +70,20 @@ Aether laboratory isolation for #267 is in `DarkArty07/Aether-Agents`, not this 
 
 Rollback of a single behavior is the corresponding unit commit revert. Do not restore whole files that also contain unrelated downstream hunks. Retirement follows the Aether ledger entries in `HERMES_LOCAL_PATCHES.md`.
 
+## Execute-code helper contract and search_files JSON framing (Aether #313/#353)
+
+These changes land on `aether-main` from independently reviewed unit commits for Objective Contract `oc_fd2332ffe34aa5f7@v1`. They do not activate the live TUI/gateway. Inherited GitHub Actions remain disabled and are not claimed green. Local runner evidence is in Aether `specs/execute-code-helper-search-framing/evidence/`.
+
+| Issue | Disposition | Inspectable commit | Scope |
+| --- | --- | --- | --- |
+| [#313](https://github.com/DarkArty07/Aether-Agents/issues/313) | reproduced-and-fixed | `2d89a331f6378f42fc26f7a439e8591101289ca6` | `tools/code_execution_tool.py`, `hermes_cli/tips.py` |
+| [#353](https://github.com/DarkArty07/Aether-Agents/issues/353) | reproduced-and-fixed | `8a23d40eb93319ff6ea94e27c68e5643cc6d8852` | `tools/file_tools.py` (`search_tool` truncation path) |
+
+- **#313 behavior:** Schema and CLI tip require `from hermes_tools import json_parse, shell_quote, retry`. NameError hints prescribe that import. Helper ImportError hints report stale generated-module / sys.path skew. Helpers remain generated `hermes_tools.py` exports; they are not injected into globals or builtins. Upstream adaptation: `NousResearch/hermes-agent@65f033a1a20e847b7a150fe6168cd345385c7d07` / PR `#83772`.
+- **#353 behavior:** Truncated `search_tool` output stays one JSON document by placing the pagination hint in `result_dict["_hint"]` with next offset `offset + limit` before a single `json.dumps`. No trailing plain-text suffix. No generic RPC JSON-suffix tolerance. Upstream adaptation: PR `#104472` / `NousResearch/hermes-agent@7a6c3b41c33a61601132c6bbf737735bd4a07207`.
+- **Rollback:** revert the corresponding unit commit. Do not restore whole files that also contain unrelated downstream hunks.
+- **Retirement:** #313 retires when an adopted Hermes release requires the explicit-import contract and `tests/tools/test_execute_helper_contract.py` passes without this patch. #353 retires when an adopted Hermes release contains PR `#104472` equivalent producer framing.
+
 ## Current blocking incident
 
 [Aether #305](https://github.com/DarkArty07/Aether-Agents/issues/305) tracks spontaneous TUI turn cancellation under session-store contention. The inherited HLP-305 patch bounds retry of a transient lease-refresh lock but does not establish which transaction held the original lock. Its full root-cause and reload/canary status remain tracked there; do not call the incident fully fixed merely because this baseline was preserved. The runtime-reliability corrections above do not close #305.
