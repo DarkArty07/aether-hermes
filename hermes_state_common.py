@@ -619,6 +619,17 @@ FTS_CJK_STALE_KEY = "fts_cjk_stale"
 FTS_STALE_KEY = "fts_stale"
 
 
+# Aether #305: adapt the bounded tool-content idea from upstream 57162d0
+# (fangliquanflq), restricted to legacy inline FTS. Historical rows retain
+# their original index content; canonical messages are never truncated.
+FTS_TOOL_CONTENT_PREFIX_CHARS = 8192
+FTS_TOOL_FULL_CONTENT_HIGH_WATER_KEY = "aether_legacy_fts_tool_full_content_high_water"
+_LEGACY_NEW_CONTENT = f"""CASE WHEN new.role = 'tool' AND new.id >
+    (SELECT CAST(value AS INTEGER) FROM state_meta
+     WHERE key = '{FTS_TOOL_FULL_CONTENT_HIGH_WATER_KEY}')
+    THEN substr(COALESCE(new.content, ''), 1, {FTS_TOOL_CONTENT_PREFIX_CHARS})
+    ELSE new.content END"""
+
 # ── Legacy (v22 / inline-content) FTS DDL ──────────────────────────────
 # Used ONLY to keep an existing pre-v23 install's search working and its
 # triggers repairable UNTIL the user opts into `hermes db optimize`. This is
@@ -630,7 +641,7 @@ FTS_STALE_KEY = "fts_stale"
 # (which would create the external-content trigram source VIEW and leave the
 # DB in a mixed, broken state). `optimize_fts_storage()` is what migrates a
 # legacy DB to the v23 shape.
-LEGACY_FTS_SQL = """
+LEGACY_FTS_SQL = f"""
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
     content
 );
@@ -638,7 +649,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
 CREATE TRIGGER IF NOT EXISTS messages_fts_insert AFTER INSERT ON messages BEGIN
     INSERT INTO messages_fts(rowid, content) VALUES (
         new.id,
-        COALESCE(new.content, '') || ' ' || COALESCE(new.tool_name, '') || ' ' || COALESCE(new.tool_calls, '')
+        COALESCE({_LEGACY_NEW_CONTENT}, '') || ' ' || COALESCE(new.tool_name, '') || ' ' || COALESCE(new.tool_calls, '')
     );
 END;
 
@@ -647,17 +658,17 @@ CREATE TRIGGER IF NOT EXISTS messages_fts_delete AFTER DELETE ON messages BEGIN
 END;
 
 CREATE TRIGGER IF NOT EXISTS messages_fts_update
-AFTER UPDATE OF content, tool_name, tool_calls ON messages BEGIN
+AFTER UPDATE OF content, tool_name, tool_calls, role ON messages BEGIN
     DELETE FROM messages_fts WHERE rowid = old.id;
     INSERT INTO messages_fts(rowid, content) VALUES (
         new.id,
-        COALESCE(new.content, '') || ' ' || COALESCE(new.tool_name, '') || ' ' || COALESCE(new.tool_calls, '')
+        COALESCE({_LEGACY_NEW_CONTENT}, '') || ' ' || COALESCE(new.tool_name, '') || ' ' || COALESCE(new.tool_calls, '')
     );
 END;
 """
 
 
-LEGACY_FTS_TRIGRAM_SQL = """
+LEGACY_FTS_TRIGRAM_SQL = f"""
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts_trigram USING fts5(
     content,
     tokenize='trigram'
@@ -666,7 +677,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts_trigram USING fts5(
 CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_insert AFTER INSERT ON messages BEGIN
     INSERT INTO messages_fts_trigram(rowid, content) VALUES (
         new.id,
-        COALESCE(new.content, '') || ' ' || COALESCE(new.tool_name, '') || ' ' || COALESCE(new.tool_calls, '')
+        COALESCE({_LEGACY_NEW_CONTENT}, '') || ' ' || COALESCE(new.tool_name, '') || ' ' || COALESCE(new.tool_calls, '')
     );
 END;
 
@@ -675,11 +686,11 @@ CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_delete AFTER DELETE ON message
 END;
 
 CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_update
-AFTER UPDATE OF content, tool_name, tool_calls ON messages BEGIN
+AFTER UPDATE OF content, tool_name, tool_calls, role ON messages BEGIN
     DELETE FROM messages_fts_trigram WHERE rowid = old.id;
     INSERT INTO messages_fts_trigram(rowid, content) VALUES (
         new.id,
-        COALESCE(new.content, '') || ' ' || COALESCE(new.tool_name, '') || ' ' || COALESCE(new.tool_calls, '')
+        COALESCE({_LEGACY_NEW_CONTENT}, '') || ' ' || COALESCE(new.tool_name, '') || ' ' || COALESCE(new.tool_calls, '')
     );
 END;
 """

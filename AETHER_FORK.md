@@ -30,6 +30,21 @@ This is a source-preservation baseline, **not** a clean-install, full-suite, cro
 
 Inherited GitHub Actions are disabled for initial import: they include upstream-specific scheduled installation, review and publication operations. Disabled Actions are not passing CI. Local test evidence above is the applicable baseline evidence; an Aether-specific CI/release setup must be explicitly qualified before a release.
 
+## HLP-305 legacy FTS holder repair
+
+The legacy FTS repair addresses the writer side of Aether #305, in addition to the preserved lease-waiter fix. It adapts the bounded-prefix/high-water idea from [upstream 57162d0cc1875ef6307aebe6cb599b5a1d052dd2](https://github.com/NousResearch/hermes-agent/commit/57162d0cc1875ef6307aebe6cb599b5a1d052dd2), authored by fangliquanflq, without fetching or upgrading upstream.
+
+Scope is existing legacy inline FTS only. Atomic trigger replacement records the historical maximum message ID, leaves prior indexed content untouched and limits newly indexed tool-result bodies to 8192 characters. Canonical messages remain complete. Explicit tool-role searches use the existing canonical-message fallback so terms beyond the prefix remain searchable. Unfiltered FTS searches inspect the prefix for those new tool rows; callers needing complete tool content must request `role_filter=['tool']`. Fresh external-content/CJK layouts are not migrated by this repair. Failed DDL rolls back the marker and trigger changes together.
+
+Evidence:
+
+- Unchanged baseline: 3 failing regression assertions, 1 passing preservation control; final focused suite: 6 passed, including transactional rollback and fresh-layout controls.
+- Existing FTS/lease compatibility suite: 73 passed before the two additional controls; independent reviewer found no blockers in this bounded scope.
+- Expanded persistence/TUI suite: 867 passed, 1 pre-existing failure reproduced unchanged on baseline, tracked in [Aether #349](https://github.com/DarkArty07/Aether-Agents/issues/349). No test was weakened or skipped to hide it.
+- Reproduce: `PYTHONPATH=. <Hermes-python> scripts/qualify_legacy_fts_contention.py "$PWD" 384`. Disposable storage, 384 synthetic tool rows (204471936 bytes), real batch writer and a separate real lease refresher. Before: insert critical section 27.576s, lock timeout after 20.397s. After: insert 2.078s, refresh succeeds after 2.159s; all complete rows survive. This reproduces the mechanism, not the unknown exact payload of the original incident.
+
+Activation is separate from source publication: the active database requires a verified backup and scoped schema transition. Never restore an older database snapshot over newer conversations. After new prefix-indexed rows exist, reverting search code alone is not a complete index rollback; retain the tool-search fallback until any deliberate index reconstruction is qualified. No full-index rebuild or canonical-message rewrite is part of activation.
+
 ## Maintenance rules
 
 1. Develop from `aether-main` using short-lived branches and inspectable commits. Never use the historical upstream-copy branch as an update target.

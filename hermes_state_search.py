@@ -1758,7 +1758,19 @@ class SessionSearchMixin:
             return []
 
         self._refresh_fts_stale_state()
-        if self._fts_stale:
+        from hermes_state_common import FTS_TOOL_FULL_CONTENT_HIGH_WATER_KEY
+
+        # New legacy tool-body indexes contain only a prefix. Explicit tool
+        # queries must search complete canonical messages, including mixed-role
+        # filters, rather than silently missing terms beyond that prefix.
+        legacy_tool_query = False
+        if role_filter and 'tool' in role_filter:
+            with self._read_ctx() as conn:
+                legacy_tool_query = conn.execute(
+                    'SELECT 1 FROM state_meta WHERE key=?',
+                    (FTS_TOOL_FULL_CONTENT_HIGH_WATER_KEY,),
+                ).fetchone() is not None and self._db_has_legacy_inline_fts(conn)
+        if self._fts_stale or legacy_tool_query:
             matches = self._search_messages_like_fallback(
                 query,
                 source_filter=source_filter,

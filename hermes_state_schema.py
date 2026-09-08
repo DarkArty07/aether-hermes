@@ -234,6 +234,47 @@ class SessionSchemaMixin:
         )
         return len(to_drop)
 
+    def _migrate_legacy_tool_fts_bounds(self) -> None:
+        """Atomically replace only legacy tool-write triggers, without reindexing.
+
+        Adapted from upstream 57162d0's historical high-water design. Inline
+        indexes delete by rowid, so no external-content token-stream migration
+        is needed. Missing/modern FTS is outside this recovery's scope.
+        """
+        from hermes_state_common import FTS_TOOL_FULL_CONTENT_HIGH_WATER_KEY as key
+
+        def migrate(conn):
+            if not self._db_has_legacy_inline_fts(conn):
+                return
+            rows = conn.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type='trigger' "
+                "AND name IN ('messages_fts_insert', 'messages_fts_update', "
+                "'messages_fts_trigram_insert', 'messages_fts_trigram_update')"
+            ).fetchall()
+            replace = [row[0] for row in rows if key not in (row[1] or '')]
+            conn.execute(
+                "INSERT OR IGNORE INTO state_meta(key,value) "
+                "SELECT ?, CAST(COALESCE(MAX(id),0) AS TEXT) FROM messages", (key,)
+            )
+            if not replace:
+                return
+            for name in replace:
+                conn.execute(f"DROP TRIGGER {name}")
+            # executescript implicitly commits; execute complete DDL statements
+            # individually to keep marker + trigger replacement one transaction.
+            for ddl in (LEGACY_FTS_SQL, LEGACY_FTS_TRIGRAM_SQL):
+                if 'trigram' in ddl and not getattr(self, '_trigram_available', False):
+                    continue
+                statement = ''
+                for line in ddl.splitlines(keepends=True):
+                    statement += line
+                    if sqlite3.complete_statement(statement):
+                        conn.execute(statement)
+                        statement = ''
+            logger.info('Bound legacy FTS tool writes without rebuilding history')
+
+        self._execute_write(migrate)
+
     def _cjk_update_trigger_is_narrowed(self, cursor: sqlite3.Cursor) -> bool:
         """True when messages_fts_cjk_update exists with AFTER UPDATE OF."""
         row = cursor.execute(
@@ -1269,6 +1310,8 @@ class SessionSchemaMixin:
                 self._migrate_broad_fts_update_triggers(cursor)
 
         self._conn.commit()
+        if fts5_available and getattr(self, '_fts_enabled', False) and legacy_fts:
+            self._migrate_legacy_tool_fts_bounds()
 
     def _backfill_gateway_metadata_from_sessions_json(
         self, cursor: sqlite3.Cursor
