@@ -1322,6 +1322,17 @@ def _classify_by_status(
                 retryable=True,
                 should_compress=True,
             )
+        # Explicit exhausted-pool 503/529 (e.g. "no available Codex accounts").
+        # Classify as non-retryable server_error with should_fallback=True so
+        # the caller activates the already configured fallback without
+        # exhausting same-route retries, while generic 503/529 continues
+        # through transient overload backoff.
+        if "no available codex accounts" in error_msg:
+            return result_fn(
+                FailoverReason.server_error,
+                retryable=False,
+                should_fallback=True,
+            )
         return result_fn(FailoverReason.overloaded, retryable=True)
 
     # 408 Request Timeout — a transient timing failure the server itself flags
