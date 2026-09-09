@@ -134,10 +134,12 @@ def test_async_chat_only_directive_uses_same_compatible_path(auxiliary_server):
     sync_adapter = _CodexCompletionsAdapter(raw_client, "chat-only-model")
     async_adapter = _AsyncCodexCompletionsAdapter(sync_adapter)
 
-    response = asyncio.run(async_adapter.create(
-        model="chat-only-model",
-        messages=[{"role": "user", "content": "hello async"}],
-    ))
+    response = asyncio.run(
+        async_adapter.create(
+            model="chat-only-model",
+            messages=[{"role": "user", "content": "hello async"}],
+        )
+    )
 
     assert response.choices[0].message.content == "chat-only-ok"
     assert [
