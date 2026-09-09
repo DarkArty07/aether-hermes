@@ -730,7 +730,7 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
 # case-sensitive filesystems most loaders probe common case variants too,
 # so the stricter behavior is kept uniform.
 _PROTECTED_INSTRUCTION_BASENAMES = frozenset({
-    "agents.md", "claude.md", "soul.md", ".cursorrules",
+    "agents.md", "claude.md", ".cursorrules",
 })
 
 _real_hermes_home_cached: str | None = None
@@ -738,20 +738,77 @@ _real_hermes_home_loaded = False
 
 
 def _get_real_hermes_home() -> str | None:
-    """Return the realpath of the authoritative Hermes home (cached)."""
-    global _real_hermes_home_cached, _real_hermes_home_loaded
-    if _real_hermes_home_loaded:
-        return _real_hermes_home_cached
-    _real_hermes_home_loaded = True
+    """Return the realpath of the authoritative Hermes home."""
     try:
         from hermes_constants import get_hermes_home
-        _real_hermes_home_cached = os.path.realpath(str(get_hermes_home()))
+        return os.path.realpath(str(get_hermes_home()))
     except Exception:
         try:
-            _real_hermes_home_cached = os.path.realpath(_expand_tilde("~/.hermes"))
+            return os.path.realpath(_expand_tilde("~/.hermes"))
         except Exception:
-            _real_hermes_home_cached = None
-    return _real_hermes_home_cached
+            return None
+
+
+def _get_real_hermes_root() -> str | None:
+    """Return the realpath of the shared Hermes root."""
+    try:
+        from hermes_constants import get_default_hermes_root
+        return os.path.realpath(str(get_default_hermes_root()))
+    except Exception:
+        try:
+            return os.path.realpath(_expand_tilde("~/.hermes"))
+        except Exception:
+            return None
+
+
+def _is_installed_profile_soul(resolved: str, normalized: str) -> bool:
+    """Return True when the target path is an installed Hermes profile's SOUL.md.
+
+    Installed profile SOUL files steer future agent behavior and live at:
+      - <HERMES_HOME>/SOUL.md (active profile)
+      - <HERMES_ROOT>/SOUL.md (default profile)
+      - <HERMES_ROOT>/profiles/<name>/SOUL.md (named profiles)
+
+    Ordinary tracked package sources or project files named SOUL.md (e.g.
+    `src/aether_agents/resources/profiles/supervisor/SOUL.md` in a worktree)
+    are not installed profiles — Hermes never probes or loads SOUL.md from
+    project/cwd trees (unlike AGENTS.md / CLAUDE.md / .cursorrules).
+    """
+    base_res = os.path.basename(resolved).lower()
+    base_norm = os.path.basename(normalized).lower()
+    if base_res != "soul.md" and base_norm != "soul.md":
+        return False
+
+    real_home = _get_real_hermes_home()
+    if real_home:
+        try:
+            home_soul = os.path.realpath(os.path.join(real_home, "SOUL.md"))
+            home_soul_norm = os.path.normpath(os.path.join(real_home, "SOUL.md"))
+            if resolved == home_soul or normalized == home_soul_norm:
+                return True
+        except Exception:
+            pass
+
+    real_root = _get_real_hermes_root()
+    if real_root:
+        try:
+            root_soul = os.path.realpath(os.path.join(real_root, "SOUL.md"))
+            root_soul_norm = os.path.normpath(os.path.join(real_root, "SOUL.md"))
+            if resolved == root_soul or normalized == root_soul_norm:
+                return True
+        except Exception:
+            pass
+
+        for target in (resolved, normalized):
+            try:
+                rel = os.path.relpath(target, real_root)
+                parts = Path(rel).parts
+                if len(parts) == 3 and parts[0] == "profiles" and parts[2].lower() == "soul.md":
+                    return True
+            except Exception:
+                pass
+
+    return False
 
 
 def _protected_instruction_config() -> tuple[bool, list[str]]:
@@ -804,6 +861,14 @@ def _protected_instruction_reason(filepath: str, task_id: str = "default",
         resolved = os.path.realpath(str(_resolve_path_for_task(filepath, task_id)))
     except (OSError, ValueError, RuntimeError):
         resolved = os.path.realpath(normalized)
+
+    # Installed Hermes profile SOUL.md files steer future agent behavior
+    # across sessions and must always require human approval.
+    # Tracked package sources or project-local files named SOUL.md do NOT
+    # steer agent behavior (Hermes only loads SOUL.md from HERMES_HOME) and
+    # are ordinary reversible edits.
+    if _is_installed_profile_soul(resolved, normalized):
+        return "SOUL.md"
 
     # The authoritative ~/.hermes home is governed by its own guards
     # (config.yaml hard-block, cross-profile guard, write_approval); this

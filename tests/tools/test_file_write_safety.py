@@ -425,7 +425,7 @@ class TestProtectedInstructionFiles:
     # ---- core behavior -------------------------------------------------
 
     @pytest.mark.parametrize(
-        "name", ["AGENTS.md", "CLAUDE.md", "SOUL.md", ".cursorrules"]
+        "name", ["AGENTS.md", "CLAUDE.md", ".cursorrules"]
     )
     def test_deny_blocks_write(self, tmp_path, approvals, name):
         target = tmp_path / name
@@ -435,6 +435,29 @@ class TestProtectedInstructionFiles:
         assert "BLOCKED" in res["error"]
         assert not target.exists()
         assert len(approvals["calls"]) == 1
+
+    def test_live_profile_soul_deny_blocks_write(self, tmp_path, approvals, monkeypatch):
+        import tools.file_tools as ft
+        fake_home = tmp_path / ".hermes"
+        fake_home.mkdir(parents=True)
+        monkeypatch.setattr(ft, "_get_real_hermes_home", lambda: str(fake_home.resolve()))
+        monkeypatch.setattr(ft, "_get_real_hermes_root", lambda: str(fake_home.resolve()))
+        target = fake_home / "SOUL.md"
+        approvals["answer"] = "deny"
+        res = self._write(target)
+        assert res.get("error"), res
+        assert "BLOCKED" in res["error"]
+        assert not target.exists()
+        assert len(approvals["calls"]) == 1
+
+    def test_tracked_package_soul_write_proceeds_without_approval(self, tmp_path, approvals):
+        target = tmp_path / "src" / "resources" / "profiles" / "supervisor" / "SOUL.md"
+        target.parent.mkdir(parents=True)
+        approvals["answer"] = "deny"
+        res = self._write(target, "persona v1")
+        assert not res.get("error"), res
+        assert target.read_text(encoding="utf-8") == "persona v1"
+        assert approvals["calls"] == []
 
     def test_approve_once_allows_write(self, tmp_path, approvals):
         target = tmp_path / "AGENTS.md"
@@ -563,7 +586,7 @@ class TestProtectedInstructionFiles:
     def test_patch_replace_mode_is_gated(self, tmp_path, approvals):
         from tools.file_tools import patch_tool
         import json
-        target = tmp_path / "SOUL.md"
+        target = tmp_path / "AGENTS.md"
         target.write_text("be kind\n", encoding="utf-8")
         approvals["answer"] = "deny"
         res = json.loads(patch_tool(
