@@ -674,6 +674,11 @@ def _auth_headers(api_key: str = "") -> Dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
 
+def _is_lmstudio_models_payload(payload: Any) -> bool:
+    """Return whether *payload* has LM Studio's native model-list shape."""
+    return isinstance(payload, dict) and isinstance(payload.get("models"), list)
+
+
 def _is_openrouter_base_url(base_url: str) -> bool:
     return base_url_host_matches(base_url, "openrouter.ai")
 
@@ -1286,7 +1291,8 @@ def fetch_endpoint_model_metadata(
                 response.raise_for_status()
                 payload = response.json()
                 cache: Dict[str, Dict[str, Any]] = {}
-                for model in payload.get("models", []):
+                models = payload.get("models", []) if _is_lmstudio_models_payload(payload) else []
+                for model in models:
                     if not isinstance(model, dict):
                         continue
                     model_id = model.get("key") or model.get("id")
@@ -1319,9 +1325,12 @@ def fetch_endpoint_model_metadata(
                     if isinstance(alt_id, str) and alt_id and alt_id != model_id:
                         _add_model_aliases(cache, alt_id, entry)
 
-                _endpoint_model_metadata_cache[normalized] = cache
-                _endpoint_model_metadata_cache_time[normalized] = time.time()
-                return cache
+                # A stale detector verdict or an empty/malformed native list
+                # must not discard a valid generic /v1/models reply.
+                if cache:
+                    _endpoint_model_metadata_cache[normalized] = cache
+                    _endpoint_model_metadata_cache_time[normalized] = time.time()
+                    return cache
         except Exception as exc:
             last_error = exc
             if _is_connect_timeout(exc):
