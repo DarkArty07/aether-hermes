@@ -84,6 +84,20 @@ These changes land on `aether-main` from independently reviewed unit commits for
 - **Rollback:** revert the corresponding unit commit. Do not restore whole files that also contain unrelated downstream hunks.
 - **Retirement:** #313 retires when an adopted Hermes release requires the explicit-import contract and `tests/tools/test_execute_helper_contract.py` passes without this patch. #353 retires when an adopted Hermes release contains PR `#104472` equivalent producer framing.
 
+## Delegated-child snapshot identity and Kanban worktree base ref (Aether #310/#354)
+
+These changes land on `aether-main` from independently reviewed unit commits for Objective Contract `oc_0084270d940c98d9@v1`. They do not activate the live TUI/gateway. Inherited GitHub Actions remain disabled and are not claimed green. Local runner evidence is in Aether `specs/fix-310-341-345-354/evidence/`.
+
+| Issue | Disposition | Inspectable commit | Scope |
+| --- | --- | --- | --- |
+| [#310](https://github.com/DarkArty07/Aether-Agents/issues/310) | reproduced-and-fixed | `25cabeb25327199a03aa3cf1613ed2f815f646cb` | `tools/environments/base.py` |
+| [#354](https://github.com/DarkArty07/Aether-Agents/issues/354) | reproduced-and-fixed | `7d3173e1f3dba107f9a389d4e35c95f215775ee1` | `hermes_cli/kanban_db.py` (worktree materialization and metadata read/write path) |
+
+- **#310 behavior:** bash session snapshot dumps (`_export_dump_excluding_session_vars`) unset `${!HERMES_KANBAN_*}` and `HERMES_DELEGATED_CHILD_CONTEXT` prior to `export -p`. Child mutation-denial markers and dispatcher-owned Kanban variables remain transient per-command identity and do not persist into reusable snapshots. Existing ContextVar/process propagation and fail-closed Kanban DB denial stay intact. No global `os.environ` clear.
+- **#354 behavior:** when board metadata carries a valid `worktree_base_ref` (lowercase 40-character SHA-1 matching `^[0-9a-f]{40}$`), newly materialized linked git worktrees for new branches start at that commit instead of incidental primary `HEAD`. Invalid present refs fail closed with `ValueError`. Absent refs retain standard `HEAD` behavior for non-Aether boards. Occupied-path fallback and linked-worktree reuse remain intact. Native `default_workdir` stays the registered primary path.
+- **Rollback:** revert the corresponding unit commit. Do not restore whole files that also contain unrelated downstream hunks.
+- **Retirement:** #310 retires when an adopted Hermes release excludes `HERMES_DELEGATED_CHILD_CONTEXT` and `HERMES_KANBAN_*` from terminal session snapshots. #354 retires when upstream Hermes adopts board-level worktree base ref configuration with equivalent validation and fail-closed semantics.
+
 ## Current blocking incident
 
 [Aether #305](https://github.com/DarkArty07/Aether-Agents/issues/305) tracks spontaneous TUI turn cancellation under session-store contention. The inherited HLP-305 patch bounds retry of a transient lease-refresh lock but does not establish which transaction held the original lock. Its full root-cause and reload/canary status remain tracked there; do not call the incident fully fixed merely because this baseline was preserved. The runtime-reliability corrections above do not close #305.
