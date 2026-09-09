@@ -82,8 +82,9 @@ def test_tracked_package_soul_patch_proceeds_without_approval(tmp_path, approval
     assert approvals["calls"] == []
 
 
+@pytest.mark.parametrize("filename", ["SOUL.md", "soul.md", "Soul.MD"])
 def test_live_active_profile_soul_write_requires_approval_and_deny_blocks(
-    tmp_path, approvals, monkeypatch
+    tmp_path, approvals, monkeypatch, filename
 ):
     """Writing to active profile SOUL.md in HERMES_HOME requires approval and blocks on deny."""
     fake_home = tmp_path / "active_profile"
@@ -94,13 +95,38 @@ def test_live_active_profile_soul_write_requires_approval_and_deny_blocks(
     if hasattr(ft, "_get_real_hermes_root"):
         monkeypatch.setattr(ft, "_get_real_hermes_root", lambda: str(fake_home.resolve()))
 
-    live_soul = fake_home / "SOUL.md"
+    live_soul = fake_home / filename
     approvals["answer"] = "deny"
 
     res = _write(live_soul, "injected persona")
     assert res.get("error") and "BLOCKED" in res["error"]
     assert "SOUL.md" in res["error"]
     assert not live_soul.exists()
+    assert len(approvals["calls"]) == 1
+
+
+@pytest.mark.parametrize("filename", ["SOUL.md", "soul.md", "Soul.MD"])
+def test_live_default_root_soul_requires_approval_and_deny_blocks(
+    tmp_path, approvals, monkeypatch, filename
+):
+    """Writing to default root SOUL.md in HERMES_ROOT requires approval and blocks on deny."""
+    fake_root = tmp_path / "hermes_root"
+    fake_root.mkdir(parents=True)
+    fake_home = tmp_path / "custom_home"
+    fake_home.mkdir(parents=True)
+    monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: fake_home)
+    monkeypatch.setattr(hermes_constants, "get_default_hermes_root", lambda: fake_root)
+    monkeypatch.setattr(ft, "_get_real_hermes_home", lambda: str(fake_home.resolve()))
+    if hasattr(ft, "_get_real_hermes_root"):
+        monkeypatch.setattr(ft, "_get_real_hermes_root", lambda: str(fake_root.resolve()))
+
+    root_soul = fake_root / filename
+    approvals["answer"] = "deny"
+
+    res = _write(root_soul, "injected root persona")
+    assert res.get("error") and "BLOCKED" in res["error"]
+    assert "SOUL.md" in res["error"]
+    assert not root_soul.exists()
     assert len(approvals["calls"]) == 1
 
 
@@ -121,16 +147,25 @@ def test_live_active_profile_soul_no_human_fails_closed(tmp_path, monkeypatch):
     assert not live_soul.exists()
 
 
-def test_live_named_profile_soul_requires_approval(tmp_path, approvals, monkeypatch):
+@pytest.mark.parametrize(
+    "rel_path",
+    [
+        "profiles/coder/SOUL.md",
+        "profiles/coder/soul.md",
+        "Profiles/coder/SOUL.md",
+        "PROFILES/coder/soul.md",
+        "profiles/coder/Soul.MD",
+    ],
+)
+def test_live_named_profile_soul_requires_approval(tmp_path, approvals, monkeypatch, rel_path):
     """Writing to named profile SOUL.md under HERMES_ROOT/profiles/<name>/ requires approval."""
     fake_root = tmp_path / "hermes_root"
-    named_profile_dir = fake_root / "profiles" / "coder"
-    named_profile_dir.mkdir(parents=True)
+    named_soul = fake_root / rel_path
+    named_soul.parent.mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr(hermes_constants, "get_default_hermes_root", lambda: fake_root)
     if hasattr(ft, "_get_real_hermes_root"):
         monkeypatch.setattr(ft, "_get_real_hermes_root", lambda: str(fake_root.resolve()))
 
-    named_soul = named_profile_dir / "SOUL.md"
     approvals["answer"] = "deny"
 
     res = _write(named_soul, "injected coder persona")

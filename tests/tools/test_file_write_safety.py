@@ -436,13 +436,14 @@ class TestProtectedInstructionFiles:
         assert not target.exists()
         assert len(approvals["calls"]) == 1
 
-    def test_live_profile_soul_deny_blocks_write(self, tmp_path, approvals, monkeypatch):
+    @pytest.mark.parametrize("name", ["SOUL.md", "soul.md", "Soul.md"])
+    def test_live_profile_soul_deny_blocks_write(self, tmp_path, approvals, monkeypatch, name):
         import tools.file_tools as ft
         fake_home = tmp_path / ".hermes"
         fake_home.mkdir(parents=True)
         monkeypatch.setattr(ft, "_get_real_hermes_home", lambda: str(fake_home.resolve()))
         monkeypatch.setattr(ft, "_get_real_hermes_root", lambda: str(fake_home.resolve()))
-        target = fake_home / "SOUL.md"
+        target = fake_home / name
         approvals["answer"] = "deny"
         res = self._write(target)
         assert res.get("error"), res

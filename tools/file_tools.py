@@ -761,6 +761,20 @@ def _get_real_hermes_root() -> str | None:
             return None
 
 
+def _is_same_dir(dir1: str | None, dir2: str | None) -> bool:
+    """Return True if dir1 and dir2 represent the same directory."""
+    if not dir1 or not dir2:
+        return False
+    d1 = os.path.abspath(dir1)
+    d2 = os.path.abspath(dir2)
+    if d1 == d2 or d1.lower() == d2.lower():
+        return True
+    try:
+        return os.path.samefile(d1, d2)
+    except (OSError, ValueError):
+        return False
+
+
 def _is_installed_profile_soul(resolved: str, normalized: str) -> bool:
     """Return True when the target path is an installed Hermes profile's SOUL.md.
 
@@ -773,6 +787,9 @@ def _is_installed_profile_soul(resolved: str, normalized: str) -> bool:
     `src/aether_agents/resources/profiles/supervisor/SOUL.md` in a worktree)
     are not installed profiles — Hermes never probes or loads SOUL.md from
     project/cwd trees (unlike AGENTS.md / CLAUDE.md / .cursorrules).
+
+    Recognition is case-insensitive for supported case-insensitive
+    filesystems (Windows/macOS) and case-variant path probes.
     """
     base_res = os.path.basename(resolved).lower()
     base_norm = os.path.basename(normalized).lower()
@@ -780,30 +797,59 @@ def _is_installed_profile_soul(resolved: str, normalized: str) -> bool:
         return False
 
     real_home = _get_real_hermes_home()
-    if real_home:
-        try:
-            home_soul = os.path.realpath(os.path.join(real_home, "SOUL.md"))
-            home_soul_norm = os.path.normpath(os.path.join(real_home, "SOUL.md"))
-            if resolved == home_soul or normalized == home_soul_norm:
-                return True
-        except Exception:
-            pass
-
     real_root = _get_real_hermes_root()
-    if real_root:
-        try:
-            root_soul = os.path.realpath(os.path.join(real_root, "SOUL.md"))
-            root_soul_norm = os.path.normpath(os.path.join(real_root, "SOUL.md"))
-            if resolved == root_soul or normalized == root_soul_norm:
-                return True
-        except Exception:
-            pass
 
-        for target in (resolved, normalized):
+    for target in (resolved, normalized):
+        if not target:
+            continue
+        target_base = os.path.basename(target).lower()
+        if target_base != "soul.md":
+            continue
+
+        target_dir = os.path.dirname(target)
+
+        # 1. Active profile SOUL (<HERMES_HOME>/SOUL.md)
+        if real_home:
+            if _is_same_dir(target_dir, real_home):
+                return True
+            try:
+                rel = os.path.relpath(target, real_home)
+                parts = Path(rel).parts
+                if len(parts) == 1 and parts[0].lower() == "soul.md":
+                    return True
+            except Exception:
+                pass
+
+        # 2. Default profile SOUL (<HERMES_ROOT>/SOUL.md)
+        if real_root:
+            if _is_same_dir(target_dir, real_root):
+                return True
             try:
                 rel = os.path.relpath(target, real_root)
                 parts = Path(rel).parts
-                if len(parts) == 3 and parts[0] == "profiles" and parts[2].lower() == "soul.md":
+                if len(parts) == 1 and parts[0].lower() == "soul.md":
+                    return True
+            except Exception:
+                pass
+
+        # 3. Named profile SOUL (<HERMES_ROOT>/profiles/<name>/SOUL.md)
+        if real_root:
+            profile_name = os.path.basename(target_dir)
+            profiles_dir = os.path.dirname(target_dir)
+            if profile_name and os.path.basename(profiles_dir).lower() == "profiles":
+                root_dir = os.path.dirname(profiles_dir)
+                if _is_same_dir(root_dir, real_root):
+                    return True
+
+            try:
+                rel = os.path.relpath(target, real_root)
+                parts = Path(rel).parts
+                if (
+                    len(parts) == 3
+                    and parts[0].lower() == "profiles"
+                    and parts[1]
+                    and parts[2].lower() == "soul.md"
+                ):
                     return True
             except Exception:
                 pass
