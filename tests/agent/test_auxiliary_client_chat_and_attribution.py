@@ -127,18 +127,17 @@ def test_chat_only_directive_retries_existing_chat_path(auxiliary_server):
     ] == ["/v1/responses", "/v1/chat/completions"]
 
 
-@pytest.mark.asyncio
-async def test_async_chat_only_directive_uses_same_compatible_path(auxiliary_server):
+def test_async_chat_only_directive_uses_same_compatible_path(auxiliary_server):
     raw_client = openai.OpenAI(
         base_url=auxiliary_server, api_key="synth-destination-key"
     )
     sync_adapter = _CodexCompletionsAdapter(raw_client, "chat-only-model")
     async_adapter = _AsyncCodexCompletionsAdapter(sync_adapter)
 
-    response = await async_adapter.create(
+    response = asyncio.run(async_adapter.create(
         model="chat-only-model",
         messages=[{"role": "user", "content": "hello async"}],
-    )
+    ))
 
     assert response.choices[0].message.content == "chat-only-ok"
     assert [
