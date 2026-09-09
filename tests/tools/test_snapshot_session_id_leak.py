@@ -40,6 +40,10 @@ def test_regex_matches_bridged_session_vars():
         line = f'declare -x {name}="whatever"'
         assert rx.search(line), f"{name} should be excluded from the snapshot"
 
+    for name in ("HERMES_DELEGATED_CHILD_CONTEXT", "HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID", "HERMES_KANBAN_DB"):
+        line = f'declare -x {name}="whatever"'
+        assert rx.search(line), f"{name} should be excluded from the snapshot"
+
 
 def test_export_snippet_shape():
     snippet = _export_dump_excluding_session_vars('"$__hermes_snap_tmp"')
@@ -49,6 +53,8 @@ def test_export_snippet_shape():
     assert "unset" in snippet
     assert "${!HERMES_SESSION_*}" in snippet
     assert "${!HERMES_CRON_AUTO_DELIVER_*}" in snippet
+    assert "${!HERMES_KANBAN_*}" in snippet
+    assert "HERMES_DELEGATED_CHILD_CONTEXT" in snippet
     assert "HERMES_UI_SESSION_ID" in snippet
     assert "grep -vE" not in snippet
     assert '"$__hermes_snap_tmp"' in snippet
@@ -106,3 +112,23 @@ def test_shared_snapshot_no_cross_session_leak(tmp_path):
                 assert "HERMES_SESSION_ID" not in f.read()
     finally:
         env.cleanup()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX bash snapshot path")
+def test_snapshot_dump_excludes_delegated_and_kanban_vars(tmp_path):
+    import subprocess
+    dump_file = tmp_path / "dump.sh"
+    snippet = _export_dump_excluding_session_vars(str(dump_file))
+    script = (
+        'export HERMES_DELEGATED_CHILD_CONTEXT="1"\n'
+        'export HERMES_KANBAN_TASK="t_123"\n'
+        'export HERMES_KANBAN_RUN_ID="99"\n'
+        'export HERMES_KANBAN_WORKSPACE="/tmp/ws"\n'
+        'export USER_CUSTOM_VAR="kept_val"\n'
+        f'{snippet}\n'
+    )
+    subprocess.run(["bash", "-c", script], check=True)
+    content = dump_file.read_text()
+    assert "USER_CUSTOM_VAR" in content
+    assert "HERMES_DELEGATED_CHILD_CONTEXT" not in content
+    assert "HERMES_KANBAN_" not in content

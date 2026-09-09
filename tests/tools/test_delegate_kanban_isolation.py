@@ -296,3 +296,103 @@ def test_child_attempting_default_complete_does_not_finish_parent_or_delete_work
     assert task.status == "running"
     assert run.status == "running"
     assert workspace.is_dir()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX bash snapshot path")
+def test_delegated_child_terminal_snapshot_does_not_leak_to_parent(monkeypatch, tmp_path):
+    """AC-310: Child runs terminal command with marker & denial; snapshot excludes marker/kanban; parent clean."""
+    kb, tid, _workspace, _attachments_root = _make_running_kanban_task(monkeypatch, tmp_path)
+    from agent.delegation_context import delegated_child_context
+    from tools.environments.local import LocalEnvironment
+
+    env = LocalEnvironment(cwd=str(tmp_path), timeout=30)
+    env.init_session()
+    try:
+        # Child scope: disposable terminal command with HERMES_DELEGATED_CHILD_CONTEXT
+        with delegated_child_context():
+            child_res = env.execute('echo "child_marker=[$HERMES_DELEGATED_CHILD_CONTEXT]"')
+            assert "child_marker=[1]" in child_res.get("output", "")
+
+            # Genuine child Kanban mutation denial intact
+            denial_res = env.execute(
+                _python_with_repo_path(
+                    "from hermes_cli import kanban; "
+                    "import argparse; "
+                    "p=argparse.ArgumentParser(); "
+                    "sub=p.add_subparsers(dest='cmd'); "
+                    "kanban.build_parser(sub); "
+                    "args=p.parse_args(['kanban','boards','rm','victim','--delete']); "
+                    "raise SystemExit(kanban.kanban_command(args))"
+                )
+            )
+            assert denial_res["returncode"] == 1
+            assert "delegate_task child contexts cannot mutate Kanban tasks" in denial_res["output"]
+
+        # Outside child scope: verify snapshot file on disk
+        snap_path = Path(env._snapshot_path)
+        if snap_path.exists():
+            snap_text = snap_path.read_text()
+            assert "HERMES_DELEGATED_CHILD_CONTEXT" not in snap_text
+            assert "HERMES_KANBAN_" not in snap_text
+
+        # Parent later command: must NOT observe marker or stale child kanban vars
+        parent_res = env.execute(
+            'echo "parent_marker=[$HERMES_DELEGATED_CHILD_CONTEXT]" '
+            '"parent_task=[$HERMES_KANBAN_TASK]"'
+        )
+        out = parent_res.get("output", "")
+        assert "parent_marker=[]" in out
+        assert "parent_marker=[1]" not in out
+
+        # Global os.environ is not cleared
+        assert os.environ.get("HERMES_KANBAN_TASK") == tid
+    finally:
+        env.cleanup()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX bash snapshot path")
+def test_delegated_child_failed_and_concurrent_snapshot_isolation(tmp_path):
+    """Concurrent and failed/truncated child commands do not leak marker into snapshot."""
+    import threading
+    from agent.delegation_context import delegated_child_context
+    from tools.environments.local import LocalEnvironment
+
+    env = LocalEnvironment(cwd=str(tmp_path), timeout=30)
+    env.init_session()
+    try:
+        # Failed child command (exit 42)
+        with delegated_child_context():
+            res = env.execute('echo "failing_child=$HERMES_DELEGATED_CHILD_CONTEXT"; exit 42')
+            assert res.get("returncode") == 42
+            assert "failing_child=1" in res.get("output", "")
+
+        snap_path = Path(env._snapshot_path)
+        if snap_path.exists():
+            assert "HERMES_DELEGATED_CHILD_CONTEXT" not in snap_path.read_text()
+
+        parent_after_fail = env.execute('echo "marker=[$HERMES_DELEGATED_CHILD_CONTEXT]"')
+        assert "marker=[]" in parent_after_fail.get("output", "")
+
+        # Concurrent parent and child commands
+        results = {}
+
+        def run_child():
+            with delegated_child_context():
+                results["child"] = env.execute('echo "c=[$HERMES_DELEGATED_CHILD_CONTEXT]"')
+
+        def run_parent():
+            results["parent"] = env.execute('echo "p=[$HERMES_DELEGATED_CHILD_CONTEXT]"')
+
+        t1 = threading.Thread(target=run_child)
+        t2 = threading.Thread(target=run_parent)
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+
+        assert "c=[1]" in results["child"].get("output", "")
+        assert "p=[]" in results["parent"].get("output", "")
+        if snap_path.exists():
+            assert "HERMES_DELEGATED_CHILD_CONTEXT" not in snap_path.read_text()
+    finally:
+        env.cleanup()
