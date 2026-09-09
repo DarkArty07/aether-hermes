@@ -524,12 +524,13 @@ def _cwd_marker(session_id: str) -> str:
 # should only carry the user's own shell state (PATH, functions, exports they
 # set), not Hermes' per-turn session identity.
 #
-# Kept in sync with gateway.session_context._VAR_MAP: every bridged name starts
-# with one of these prefixes (or is HERMES_UI_SESSION_ID). Used by unit tests
-# as the Python-side contract for the exclusion set; the dump path unsets by
-# name/prefix instead of grepping declare lines (see below / issue #71296).
+# Kept in sync with gateway.session_context._VAR_MAP, delegation markers, and
+# dispatcher Kanban identity: every excluded name starts with one of these
+# prefixes (or is HERMES_UI_SESSION_ID / HERMES_DELEGATED_CHILD_CONTEXT).
+# Used by unit tests as the Python-side contract for the exclusion set; the dump
+# path unsets by name/prefix instead of grepping declare lines (see below / issue #71296).
 _SNAPSHOT_EXCLUDED_ENV_REGEX = (
-    "^declare -x (HERMES_SESSION_|HERMES_UI_SESSION_ID|HERMES_CRON_AUTO_DELIVER_|HERMES_CRON_SESSION)"
+    "^declare -x (HERMES_SESSION_|HERMES_UI_SESSION_ID|HERMES_CRON_AUTO_DELIVER_|HERMES_CRON_SESSION|HERMES_DELEGATED_CHILD_CONTEXT|HERMES_KANBAN_)"
 )
 _SHELL_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -572,14 +573,16 @@ def _export_dump_excluding_session_vars(
         extra_unset = f" {extra_unset}"
     return (
         "{ ( "
-        "unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} "
+        "unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} ${!HERMES_KANBAN_*} "
         # AI_AGENT / HERMES_AGENT are per-command attribution markers
         # (re-exported by every _wrap_command with outer-harness-preserving
         # ${VAR:-default} semantics).  Persisting them into the snapshot
         # would make the FIRST command's value override a later outer
         # harness value arriving via the process env, exactly like the
         # session-var leak this dump already guards against.
-        "AI_AGENT HERMES_AGENT "
+        # HERMES_DELEGATED_CHILD_CONTEXT and HERMES_KANBAN_* are transient
+        # per-command delegation and dispatcher-owned task identity.
+        "AI_AGENT HERMES_AGENT HERMES_DELEGATED_CHILD_CONTEXT "
         f"HERMES_UI_SESSION_ID{extra_unset} 2>/dev/null; "
         "export -p; "
         ") || true; } "
