@@ -1447,6 +1447,22 @@ def _scoped_key_env(name: str) -> str:
     return (os.getenv(name) or "").strip()
 
 
+def _is_chat_completions_directive(exc: Exception) -> bool:
+    """Detect directive 400 error indicating a model requires Chat Completions surface."""
+    err_str = str(exc or "").lower()
+    status_code = getattr(exc, "status_code", None)
+    if status_code is not None and status_code != 400:
+        return False
+    return any(
+        phrase in err_str
+        for phrase in (
+            "/chat/completions",
+            "chat completions surface",
+            "chat completions only",
+        )
+    )
+
+
 # ── Codex Responses → chat.completions adapter ─────────────────────────────
 # All auxiliary consumers call client.chat.completions.create(**kwargs) and
 # read response.choices[0].message.content. This adapter translates those
@@ -1524,6 +1540,12 @@ class _CodexCompletionsAdapter:
         extra_headers = kwargs.get("extra_headers")
         if isinstance(extra_headers, dict) and extra_headers:
             resp_kwargs["extra_headers"] = dict(extra_headers)
+        extra_query = kwargs.get("extra_query")
+        if isinstance(extra_query, dict) and extra_query:
+            # Keep request-scoped attribution explicit even when a resolver
+            # rebuilt the destination client from a named provider and lost
+            # query parameters from the configured fallback URL (#303).
+            resp_kwargs["extra_query"] = dict(extra_query)
 
         # Preserve the chat.completions timeout contract. This adapter is used
         # by auxiliary calls such as context compression; if the timeout is not
@@ -1787,7 +1809,46 @@ class _CodexCompletionsAdapter:
                 _notify_aux_progress()
                 _check_cancelled()
 
-            event_stream = self._client.responses.create(**stream_kwargs)
+            try:
+                event_stream = self._client.responses.create(**stream_kwargs)
+            except Exception as response_error:
+                # OpenCode-style gateways can serve different models on
+                # different API surfaces.  The existing auxiliary contract is
+                # Chat Completions, so a clear 400 directive is a negotiated
+                # surface mismatch rather than a provider-wide failure.  Use
+                # the same raw OpenAI client for the compatible Chat path;
+                # Responses-native models keep the normal path untouched.
+                if not _is_chat_completions_directive(response_error):
+                    raise
+                logger.info(
+                    "Codex auxiliary: %s requires Chat Completions; "
+                    "retrying the existing compatible request path",
+                    model,
+                )
+                chat_kwargs = {
+                    key: value
+                    for key, value in kwargs.items()
+                    if not str(key).startswith("_")
+                }
+                if chat_kwargs.get("stream") is not True:
+                    # ``stream_options`` is only valid with a streamed Chat
+                    # request.  The normal auxiliary call is non-streaming.
+                    chat_kwargs.pop("stream_options", None)
+                chat_response = self._client.chat.completions.create(**chat_kwargs)
+                if chat_kwargs.get("stream") is not True or hasattr(
+                    chat_response, "choices"
+                ):
+                    return chat_response
+                # The Responses adapter returns a completed response even
+                # when its internal request streams. Preserve that shape for
+                # a caller that explicitly requested a streamed Chat request.
+                return _aggregate_chat_stream(
+                    chat_response,
+                    model=str(chat_kwargs.get("model") or model),
+                    total_ceiling=_aux_stream_total_ceiling(
+                        chat_kwargs.get("timeout")
+                    ),
+                )
             with attempt_stream_lock:
                 attempt_stream.append(event_stream)
             # The timer can fire while responses.create() is blocked. If the
@@ -4930,6 +4991,37 @@ class _FallbackDestination(NamedTuple):
     base_url: str
     api_mode: Optional[str]
     model: Optional[str]
+    extra_query: Optional[Dict[str, str]] = None
+
+
+_AUXILIARY_ATTRIBUTION_QUERY_KEYS = frozenset({
+    "aether_service",
+    "aether_operation",
+})
+
+
+def _safe_request_extra_query(base_url: Optional[str]) -> Optional[Dict[str, str]]:
+    """Extract only supported attribution query values from a destination URL.
+
+    Fallback clients may be rebuilt from a named provider, which can lose
+    query parameters that were present on the configured entry URL.  Carry
+    only the two non-secret attribution keys at request scope; arbitrary query
+    values could contain destination credentials or affect routing.
+    """
+    if not base_url:
+        return None
+    try:
+        _clean_base, query = _extract_url_query_params(str(base_url))
+    except Exception:
+        return None
+    if not isinstance(query, dict):
+        return None
+    safe = {
+        key: str(value)
+        for key, value in query.items()
+        if key in _AUXILIARY_ATTRIBUTION_QUERY_KEYS and str(value)
+    }
+    return safe or None
 
 
 def _complete_fallback_destination(
@@ -4953,7 +5045,13 @@ def _complete_fallback_destination(
                 api_mode = str(runtime.get("api_mode") or "").strip() or None
             except Exception:
                 pass
-    return _FallbackDestination(provider, base_url, api_mode, model)
+    return _FallbackDestination(
+        provider,
+        base_url,
+        api_mode,
+        model,
+        _safe_request_extra_query(base_url),
+    )
 
 
 def _fallback_destination_from_entry(
@@ -4962,8 +5060,9 @@ def _fallback_destination_from_entry(
     fb_model: Optional[str],
 ) -> _FallbackDestination:
     provider = str(entry.get("provider") or "").strip()
-    base_url = str(
-        entry.get("base_url") or getattr(fb_client, "base_url", "") or ""
+    configured_base_url = str(entry.get("base_url") or "").strip()
+    base_url = configured_base_url or str(
+        getattr(fb_client, "base_url", "") or ""
     ).strip()
     api_mode = str(
         entry.get("api_mode") or entry.get("transport") or ""
@@ -5110,6 +5209,8 @@ def _call_fallback_candidate_sync(
         tools=fallback_tools, timeout=effective_timeout,
         extra_body=effective_extra_body, reasoning_config=reasoning_config,
         base_url=destination.base_url, task=task)
+    if destination.extra_query:
+        fb_kwargs["extra_query"] = dict(destination.extra_query)
     safe_fb_headers = _safe_request_extra_headers(extra_headers)
     if safe_fb_headers:
         fb_kwargs["extra_headers"] = dict(safe_fb_headers)
@@ -5143,6 +5244,7 @@ def _call_fallback_candidate_sync(
                     or str(getattr(retry_client, "base_url", "") or ""),
                     destination.api_mode,
                     retry_model or destination.model,
+                    destination.extra_query,
                 )
                 retry_messages, retry_tools = _replan_synchronous_cache_sections(
                     messages,
@@ -5158,6 +5260,8 @@ def _call_fallback_candidate_sync(
                     extra_body=effective_extra_body,
                     reasoning_config=reasoning_config,
                     base_url=retry_destination.base_url, task=task)
+                if retry_destination.extra_query:
+                    retry_kwargs["extra_query"] = dict(retry_destination.extra_query)
                 if safe_fb_headers:
                     retry_kwargs["extra_headers"] = dict(safe_fb_headers)
                 try:
@@ -5222,6 +5326,8 @@ async def _call_fallback_candidate_async(
         tools=fallback_tools, timeout=effective_timeout,
         extra_body=effective_extra_body, reasoning_config=reasoning_config,
         base_url=destination.base_url, task=task)
+    if destination.extra_query:
+        fb_kwargs["extra_query"] = dict(destination.extra_query)
     safe_fb_headers = _safe_request_extra_headers(extra_headers)
     if safe_fb_headers:
         fb_kwargs["extra_headers"] = dict(safe_fb_headers)
@@ -5256,6 +5362,7 @@ async def _call_fallback_candidate_async(
                     or str(getattr(retry_client, "base_url", "") or ""),
                     destination.api_mode,
                     retry_model or destination.model,
+                    destination.extra_query,
                 )
                 retry_messages, retry_tools = _replan_synchronous_cache_sections(
                     messages,
@@ -5271,6 +5378,8 @@ async def _call_fallback_candidate_async(
                     extra_body=effective_extra_body,
                     reasoning_config=reasoning_config,
                     base_url=retry_destination.base_url, task=task)
+                if retry_destination.extra_query:
+                    retry_kwargs["extra_query"] = dict(retry_destination.extra_query)
                 if safe_fb_headers:
                     retry_kwargs["extra_headers"] = dict(safe_fb_headers)
                 try:
