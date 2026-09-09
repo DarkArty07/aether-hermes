@@ -904,6 +904,7 @@ def write_board_metadata(
     archived: Optional[bool] = None,
     default_workdir: Optional[str] = None,
     project_id: Optional[str] = None,
+    worktree_base_ref: Optional[str] = None,
 ) -> dict:
     """Create / update ``board.json`` for ``board``.
 
@@ -934,6 +935,8 @@ def write_board_metadata(
         meta["default_workdir"] = str(default_workdir) if default_workdir else None
     if project_id is not None:
         meta["project_id"] = str(project_id) if project_id else None
+    if worktree_base_ref is not None:
+        meta["worktree_base_ref"] = str(worktree_base_ref)
     if not meta.get("created_at"):
         meta["created_at"] = int(time.time())
     path = board_metadata_path(slug)
@@ -8770,8 +8773,47 @@ def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
         current = current.parent
 
 
-def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
+_WORKTREE_BASE_REF_PATTERN = re.compile(r"^[0-9a-f]{40}$")
+
+
+def _resolve_worktree_base_ref(
+    board: Optional[str] = None, *, base_ref: Optional[str] = None
+) -> str:
+    """Resolve the git ref to branch new worktrees from.
+
+    Returns the valid 40-character lowercase hex SHA-1 if present in board
+    metadata (or explicitly passed), or 'HEAD' if absent. Fails closed
+    (raises ValueError) if present but invalid.
+    """
+    if base_ref is not None:
+        candidate = base_ref
+        source_label = "explicit argument"
+    else:
+        board_slug = board if board else get_current_board()
+        meta = read_board_metadata(board_slug)
+        if "worktree_base_ref" not in meta:
+            return "HEAD"
+        candidate = meta["worktree_base_ref"]
+        source_label = f"board {board_slug!r}"
+
+    if not isinstance(candidate, str) or not _WORKTREE_BASE_REF_PATTERN.match(candidate):
+        raise ValueError(
+            f"Invalid worktree_base_ref in {source_label}: {candidate!r}; "
+            "expected lowercase 40-character SHA-1 (^[0-9a-f]{40}$)"
+        )
+    return candidate
+
+
+def _ensure_git_worktree(
+    repo_root: Path,
+    target: Path,
+    branch_name: str,
+    *,
+    board: Optional[str] = None,
+    base_ref: Optional[str] = None,
+) -> None:
     """Materialize ``target`` as a linked git worktree under ``repo_root``."""
+    target_ref = _resolve_worktree_base_ref(board=board, base_ref=base_ref)
     target = target.expanduser()
     repo_common = _git_common_dir(repo_root)
     if target.exists() and repo_common is not None:
@@ -8784,7 +8826,7 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
     else:
         cmd = [
             "git", "-C", str(repo_root), "worktree", "add", "-b", branch_name,
-            str(target), "HEAD",
+            str(target), target_ref,
         ]
     result = subprocess.run(
         cmd,
@@ -8814,11 +8856,11 @@ def _resolve_worktree_workspace(
     anywhere, we fail loudly rather than guess.
     """
     branch_name = (task.branch_name or "").strip() or f"wt/{task.id}"
+    board_slug = board if board else get_current_board()
     if not task.workspace_path:
         # Anchor on the board's configured default_workdir, not Path.cwd().
         # The dispatcher's CWD is incidental (gateway launch dir) and using it
         # scatters worktrees under whatever repo the gateway started in.
-        board_slug = board if board else get_current_board()
         board_default = (read_board_metadata(board_slug).get("default_workdir") or "").strip()
         if not board_default:
             raise ValueError(
@@ -8840,7 +8882,7 @@ def _resolve_worktree_workspace(
                 f"{board_slug!r} default_workdir {board_default!r} is not inside a git repo"
             )
         target = repo_root / ".worktrees" / task.id
-        _ensure_git_worktree(repo_root, target, branch_name)
+        _ensure_git_worktree(repo_root, target, branch_name, board=board_slug)
         return target, branch_name
 
     requested = Path(task.workspace_path).expanduser()
@@ -8866,7 +8908,7 @@ def _resolve_worktree_workspace(
         if fallback_root is not None:
             fallback = fallback_root / ".worktrees" / task.id
             if fallback.resolve(strict=False) != requested_resolved:
-                _ensure_git_worktree(fallback_root, fallback, branch_name)
+                _ensure_git_worktree(fallback_root, fallback, branch_name, board=board_slug)
                 return fallback.resolve(strict=False), branch_name
         # No repo to anchor a fallback on (or the occupied path IS this
         # task's own canonical worktree): keep the legacy reuse rather
@@ -8876,7 +8918,7 @@ def _resolve_worktree_workspace(
     repo_root = _git_toplevel(requested)
     if repo_root is not None and requested_resolved == repo_root:
         target = repo_root / ".worktrees" / task.id
-        _ensure_git_worktree(repo_root, target, branch_name)
+        _ensure_git_worktree(repo_root, target, branch_name, board=board_slug)
         return target, branch_name
 
     repo_root = _repo_root_for_worktree_target(requested.parent)
@@ -8885,7 +8927,7 @@ def _resolve_worktree_workspace(
             f"task {task.id} worktree path {task.workspace_path!r} is not inside a git repo "
             "and does not point at a git repo root"
         )
-    _ensure_git_worktree(repo_root, requested, branch_name)
+    _ensure_git_worktree(repo_root, requested, branch_name, board=board_slug)
     return requested, branch_name
 
 
