@@ -5836,6 +5836,39 @@ def claim_review_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        # A legacy or externally-created review row may still carry a
+        # ``review_requested`` event with no independent reviewer.  Do not
+        # let the implementing profile reclaim that run; leave it parked for
+        # an explicit reassignment instead.  Rows without review provenance
+        # retain the existing manual/dashboard behavior.
+        review_event = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'review_requested' "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if review_event is not None:
+            try:
+                review_payload = (
+                    json.loads(review_event["payload"])
+                    if review_event["payload"]
+                    else {}
+                )
+            except (json.JSONDecodeError, TypeError):
+                review_payload = None
+            if isinstance(review_payload, dict):
+                reviewer = review_payload.get("reviewer")
+                implementer = review_payload.get("implementer")
+                if (
+                    not isinstance(reviewer, str)
+                    or not reviewer.strip()
+                    or (
+                        isinstance(implementer, str)
+                        and _canonical_assignee(reviewer)
+                        == _canonical_assignee(implementer)
+                    )
+                ):
+                    return None
         if not _parents_satisfied(conn, task_id):
             demoted = conn.execute(
                 "UPDATE tasks SET status = 'todo' "
@@ -7571,7 +7604,9 @@ def request_review(
     the event so an autonomous reviewer can route requested changes back to the
     right profile.  Supplying ``reviewer`` reassigns the task before it is
     exposed to the review dispatcher.  On re-review, omitting it reuses the
-    reviewer provenance persisted by the latest ``changes_requested`` event.
+    reviewer provenance persisted by the latest ``changes_requested`` event;
+    an initial request without an independent reviewer fails closed.  A
+    reviewer that is the implementing profile is rejected as self-review.
 
     When the task is ``running`` under a live claim, a caller that supplies no
     ``expected_run_id`` must pass ``force=True`` (explicit human/CLI override)
@@ -7613,6 +7648,7 @@ def request_review(
                 "override) instead of clearing the live run's claim",
             )
         implementer = trow["assignee"]
+        implementer_identity = _canonical_assignee(implementer)
         if reviewer is None:
             changes_run = conn.execute(
                 "SELECT id FROM task_runs "
@@ -7651,8 +7687,22 @@ def request_review(
                         "malformed); pass reviewer= explicitly",
                     )
                 reviewer = prior_reviewer
+        if reviewer is not None and not str(reviewer).strip():
+            reviewer = None
         reviewer = _canonical_assignee(reviewer) if reviewer is not None else None
-        assignee_sql = ", assignee = ?" if reviewer is not None else ""
+        if reviewer is None:
+            return _ret(
+                False,
+                "an initial review requires an explicit independent reviewer; "
+                "pass reviewer= (re-review may reuse durable reviewer provenance)",
+            )
+        if implementer_identity is not None and reviewer == implementer_identity:
+            return _ret(
+                False,
+                "reviewer must be independent from the implementing profile; "
+                "pass a different reviewer=",
+            )
+        assignee_sql = ", assignee = ?"
         params: tuple[Any, ...]
         if expected_run_id is None:
             params = (reviewer, task_id) if reviewer is not None else (task_id,)
