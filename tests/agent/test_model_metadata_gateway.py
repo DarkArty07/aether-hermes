@@ -123,7 +123,6 @@ def test_empty_lmstudio_models_falls_through_to_generic_data():
 
     routes = {
         "/api/v1/models": (200, {"models": [], **_generic_models_payload()}),
-        "/v1/models": (200, _generic_models_payload()),
     }
     with _synthetic_gateway(routes) as base_url:
         with patch(
