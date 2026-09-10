@@ -674,6 +674,11 @@ def _auth_headers(api_key: str = "") -> Dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
 
+def _is_lmstudio_models_payload(payload: Any) -> bool:
+    """Return whether *payload* has LM Studio's native model-list shape."""
+    return isinstance(payload, dict) and isinstance(payload.get("models"), list)
+
+
 def _is_openrouter_base_url(base_url: str) -> bool:
     return base_url_host_matches(base_url, "openrouter.ai")
 
@@ -1174,6 +1179,32 @@ def _add_model_aliases(cache: Dict[str, Dict[str, Any]], model_id: str, entry: D
         cache.setdefault(bare_model, entry)
 
 
+def _parse_openai_models_payload(payload: Any) -> Dict[str, Dict[str, Any]]:
+    """Parse a generic OpenAI-compatible model-list response."""
+    if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+        return {}
+
+    cache: Dict[str, Dict[str, Any]] = {}
+    for model in payload["data"]:
+        if not isinstance(model, dict):
+            continue
+        model_id = model.get("id")
+        if not model_id:
+            continue
+        entry: Dict[str, Any] = {"name": model.get("name", model_id)}
+        context_length = _extract_context_length(model)
+        if context_length is not None:
+            entry["context_length"] = context_length
+        max_completion_tokens = _extract_max_completion_tokens(model)
+        if max_completion_tokens is not None:
+            entry["max_completion_tokens"] = max_completion_tokens
+        pricing = _extract_pricing(model)
+        if pricing:
+            entry["pricing"] = pricing
+        _add_model_aliases(cache, model_id, entry)
+    return cache
+
+
 def fetch_model_metadata(force_refresh: bool = False) -> Dict[str, Dict[str, Any]]:
     """Fetch model metadata from OpenRouter (cached for 1 hour)."""
     global _model_metadata_cache, _model_metadata_cache_time
@@ -1286,7 +1317,8 @@ def fetch_endpoint_model_metadata(
                 response.raise_for_status()
                 payload = response.json()
                 cache: Dict[str, Dict[str, Any]] = {}
-                for model in payload.get("models", []):
+                models = payload.get("models", []) if _is_lmstudio_models_payload(payload) else []
+                for model in models:
                     if not isinstance(model, dict):
                         continue
                     model_id = model.get("key") or model.get("id")
@@ -1319,9 +1351,17 @@ def fetch_endpoint_model_metadata(
                     if isinstance(alt_id, str) and alt_id and alt_id != model_id:
                         _add_model_aliases(cache, alt_id, entry)
 
-                _endpoint_model_metadata_cache[normalized] = cache
-                _endpoint_model_metadata_cache_time[normalized] = time.time()
-                return cache
+                # A stale detector verdict or an empty/malformed native list
+                # must not discard a valid generic model-list reply.
+                if cache:
+                    _endpoint_model_metadata_cache[normalized] = cache
+                    _endpoint_model_metadata_cache_time[normalized] = time.time()
+                    return cache
+                if isinstance(payload, dict) and isinstance(payload.get("data"), list):
+                    cache = _parse_openai_models_payload(payload)
+                    _endpoint_model_metadata_cache[normalized] = cache
+                    _endpoint_model_metadata_cache_time[normalized] = time.time()
+                    return cache
         except Exception as exc:
             last_error = exc
             if _is_connect_timeout(exc):
@@ -1356,24 +1396,7 @@ def fetch_endpoint_model_metadata(
                 break
             response.raise_for_status()
             payload = response.json()
-            cache: Dict[str, Dict[str, Any]] = {}
-            for model in payload.get("data", []):
-                if not isinstance(model, dict):
-                    continue
-                model_id = model.get("id")
-                if not model_id:
-                    continue
-                entry: Dict[str, Any] = {"name": model.get("name", model_id)}
-                context_length = _extract_context_length(model)
-                if context_length is not None:
-                    entry["context_length"] = context_length
-                max_completion_tokens = _extract_max_completion_tokens(model)
-                if max_completion_tokens is not None:
-                    entry["max_completion_tokens"] = max_completion_tokens
-                pricing = _extract_pricing(model)
-                if pricing:
-                    entry["pricing"] = pricing
-                _add_model_aliases(cache, model_id, entry)
+            cache = _parse_openai_models_payload(payload)
 
             # If this is a llama.cpp server, query /props for actual allocated context
             is_llamacpp = any(
