@@ -1649,6 +1649,11 @@ def _handle_create(args: dict, **kw) -> str:
                         )
                     project_id = _self_task.project_id
                     project_source_task_id = _self_task.id
+            # Carry the exact board selection into native creation: the board
+            # metadata read for Project/repository recovery must be the board
+            # this task is actually written to, not whichever board happens to
+            # be active for the process.
+            target_board = str(board).strip() if board else kb.get_current_board()
             new_tid = kb.create_task(
                 conn,
                 title=str(title).strip(),
@@ -1661,6 +1666,7 @@ def _handle_create(args: dict, **kw) -> str:
                 workspace_path=workspace_path,
                 project_id=project_id,
                 project_source_task_id=project_source_task_id,
+                board=target_board,
                 triage=triage,
                 idempotency_key=idempotency_key,
                 max_retries=max_retries,
