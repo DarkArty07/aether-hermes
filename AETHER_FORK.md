@@ -173,3 +173,54 @@ that also carry other Aether corrections. Retirement requires an adopted exact H
 release to pass complete-to-review readiness, incomplete rejection, independent
 review/re-review, whole-objective completion, exact recovery-origin delivery, and
 arbitrary-block negative controls without these commits.
+
+## Cross-board Project recovery for a shared worktree (Aether #226)
+
+This correction was developed from maintained-fork baseline
+`415056fee527c5a2302370bd6dba56f84b9a4202` for Objective Contract
+`oc_644c0b407d13366a@v1`. It does not activate the live TUI, gateway, profiles, or
+installation. Inherited GitHub Actions remain disabled and are therefore NOT RUN,
+not green. Portable Aether evidence is in
+`specs/hlp-226-cross-board-project-inheritance/evidence/HLP-226C.md`.
+
+Inspectable commits:
+
+- `d962b73e3d5c73aa21c500c6e1c51026dfb0d686` — recovers Project/repository identity
+  from the current board's own `project_id` + `default_workdir` binding when a
+  project/affinity `dir` source shares `<repo>/.worktrees/<prior-board-leaf>`, and
+  carries the exact board selection from `kanban_create` into native creation.
+- `3f981f10924774afd4b9a72d81f525fafe64fd5c` — covers the recurrence, the
+  terminal-to-Implementer E2E with real worktree materialization, and the complete
+  fail-closed matrix.
+- `7980bbf1f9f75efdcbee2196ae910bb77138541d` — pins the explicit
+  `kanban_create(board=<target>)` selection against a conflicting process-current
+  decoy board, so the board metadata read for recovery can only be the target board's.
+
+When no worker profile registers the Project, a current-board project/affinity root
+whose shared worktree leaf names no task in this board keeps its Project: recovery
+requires the exact source Project and affinity, board metadata binding the same
+Project to the repository that contains the shared path, and exactly one opaque leaf
+under `<default_workdir>/.worktrees/`. The leaf is never looked up or trusted, no
+other profile registry is read or copied, there is no cross-board task query, and
+every mismatch keeps the existing native fail-closed error. Direct worktree
+inheritance (HLP-226), same-board shared terminals (HLP-226b), scratch and
+non-affinity behavior are unchanged.
+
+Candidate evidence: the identical test bytes failed `3` of `21` on the unchanged
+baseline with `kanban_create: session-affinity tasks require a canonical project_id`
+and passed `21` on the candidate; reverting only the tool-side board propagation
+leaves `20 passed / 1 failed` (the explicit-board regression); the minimum affected
+run passed `132` tests with `1` Windows-only skip; the documented full fork suite
+reported `31020 passed, 2392 failed, 262 skipped` against the recorded baseline
+`31002 passed, 2392 failed, 262 skipped`, with the recorded failing-file set
+unchanged apart from one parallel-run pytest teardown crash whose 3 tests passed
+in-process and which passed 3/3 on a clean re-run. Ruff check, compileall and
+`git diff --check` passed on touched scope; the pre-existing `ruff format` debt on
+the two production files was preserved rather than reformatted.
+
+Rollback reverts the three commits above in reverse order without restoring whole
+files that also carry other Aether corrections. Retirement requires an adopted exact
+Hermes release to perform the same conjunctive board-bound recovery — or to reject
+the prior-board leaf with an equivalent safe alternative — and to pass the
+recurrence, the E2E, the fail-closed matrix and the explicit-board regression without
+these commits.
