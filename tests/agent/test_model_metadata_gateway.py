@@ -80,9 +80,11 @@ def test_generic_data_shape_is_parsed_even_when_detector_reports_lmstudio():
         get_model_context_length,
     )
 
+    # The generic gateway shape is exposed only at LM Studio's probe path.
+    # Alternate model-list paths are deliberately unavailable so this proves
+    # the already-received payload is parsed rather than re-probed elsewhere.
     routes = {
         "/api/v1/models": (200, _generic_models_payload()),
-        "/v1/models": (200, _generic_models_payload()),
     }
     with _synthetic_gateway(routes) as base_url:
         with patch(
@@ -105,7 +107,6 @@ def test_generic_data_shape_revalidates_stale_disk_lmstudio_verdict():
 
     routes = {
         "/api/v1/models": (200, _generic_models_payload()),
-        "/v1/models": (200, _generic_models_payload()),
     }
     with _synthetic_gateway(routes) as base_url:
         with patch(
@@ -122,23 +123,6 @@ def test_empty_lmstudio_models_falls_through_to_generic_data():
 
     routes = {
         "/api/v1/models": (200, {"models": [], **_generic_models_payload()}),
-        "/v1/models": (200, _generic_models_payload()),
-    }
-    with _synthetic_gateway(routes) as base_url:
-        with patch(
-            "agent.model_metadata.detect_local_server_type", return_value="lm-studio"
-        ):
-            metadata = fetch_endpoint_model_metadata(base_url, force_refresh=True)
-
-    assert metadata["synthetic/gateway-context-model"]["context_length"] == 872000
-
-
-def test_generic_data_shape_falls_through_a_stale_lmstudio_verdict():
-    """A cached/legacy LM Studio verdict cannot discard generic metadata."""
-    from agent.model_metadata import fetch_endpoint_model_metadata
-
-    routes = {
-        "/api/v1/models": (200, _generic_models_payload()),
         "/v1/models": (200, _generic_models_payload()),
     }
     with _synthetic_gateway(routes) as base_url:
