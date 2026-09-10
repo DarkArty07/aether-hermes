@@ -317,7 +317,7 @@ def test_reopening_parent_retracts_review_and_blocks_approval(client):
         child_id = kb.create_task(
             conn,
             title="child in review",
-            assignee="reviewer",
+            assignee="builder",
             parents=[parent_id],
         )
         grandchild_id = kb.create_task(
@@ -332,6 +332,7 @@ def test_reopening_parent_retracts_review_and_blocks_approval(client):
             conn,
             child_id,
             summary="ready",
+            reviewer="reviewer",
             expected_run_id=implementation.current_run_id,
         )
         active_review = kb.claim_review_task(conn, child_id)
@@ -430,13 +431,14 @@ def test_reopening_parent_recursively_retracts_done_and_running_descendants(clie
 
 def test_dashboard_reclaim_of_active_review_preserves_review_phase(client):
     with kb.connect() as conn:
-        task_id = kb.create_task(conn, title="active review", assignee="reviewer")
+        task_id = kb.create_task(conn, title="active review", assignee="builder")
         implementation = kb.claim_task(conn, task_id)
         assert implementation is not None
         assert kb.request_review(
             conn,
             task_id,
             summary="ready",
+            reviewer="reviewer",
             expected_run_id=implementation.current_run_id,
         )
         review = kb.claim_review_task(conn, task_id)
