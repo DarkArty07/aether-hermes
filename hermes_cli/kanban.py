@@ -2285,6 +2285,82 @@ def _goal_mode_completion_rejection(task: Optional[kb.Task], evidence: str) -> O
     return reason if verdict != "done" else None
 
 
+_REVIEW_READINESS_INCOMPLETE_MARKERS = (
+    "not implemented",
+    "unimplemented",
+    "incomplete",
+    "unfinished",
+    "not ready",
+    "not verified",
+    "unverified",
+    "tests not run",
+    "test not run",
+    "checks not run",
+    "verification not run",
+    "work remains",
+    "still working",
+    "plan only",
+    "needs input",
+    "cannot proceed",
+    "not done",
+)
+
+
+def _review_handoff_evidence(summary: str, metadata: Optional[dict[str, Any]]) -> str:
+    """Render the worker's truthful review evidence for the readiness phase."""
+    evidence = [f"Summary:\n{summary.strip()}"]
+    if metadata is not None:
+        evidence.append(
+            "Structured verification metadata:\n"
+            + json.dumps(metadata, sort_keys=True, default=str)
+        )
+    return "\n\n".join(evidence)
+
+
+def _goal_mode_review_rejection(
+    task: Optional[kb.Task],
+    summary: str,
+    metadata: Optional[dict[str, Any]],
+) -> Optional[str]:
+    """Return a rejection when a goal-mode review handoff is not ready."""
+    if task is None or not task.goal_mode:
+        return None
+    summary_text = summary.strip()
+    explicit_incomplete = any(
+        marker in summary_text.casefold()
+        for marker in _REVIEW_READINESS_INCOMPLETE_MARKERS
+    )
+    try:
+        from agent.auxiliary_client import get_text_auxiliary_client
+
+        client, model = get_text_auxiliary_client("goal_judge")
+    except Exception:
+        client, model = None, None
+    if client is not None and model:
+        from hermes_cli.goals import judge_goal
+
+        try:
+            verdict, reason, _, _, _ = judge_goal(
+                goal=f"{task.title}\n\n{task.body or ''}".strip(),
+                last_response=_review_handoff_evidence(summary_text, metadata),
+                phase="review_readiness",
+            )
+        except Exception as judge_exc:
+            import logging as _logging
+
+            _logging.getLogger(__name__).warning(
+                "review readiness judge failed, allowing lifecycle handoff: %s",
+                judge_exc,
+                exc_info=True,
+            )
+        else:
+            if verdict != "done":
+                return reason or "review readiness evidence was rejected"
+    if explicit_incomplete:
+        return "review readiness requires a completed implementation and verification evidence"
+    return None
+
+
 def _cmd_complete(args: argparse.Namespace) -> int:
     """Mark one or more tasks done. Supports a single id or a list."""
     ids = list(args.task_ids or [])
@@ -2506,6 +2582,19 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
             return 2
     reviewer = getattr(args, "reviewer", None)
     with kb.connect_closing() as conn:
+        rejection = _goal_mode_review_rejection(
+            kb.get_task(conn, tid),
+            summary or "",
+            metadata,
+        )
+        if rejection is not None:
+            print(
+                f"kanban: goal review handoff of {tid} rejected by readiness judge: "
+                f"{rejection}. Provide a truthful implementation summary and "
+                "structured verification evidence.",
+                file=sys.stderr,
+            )
+            return 1
         ok, reason = kb.request_review(
             conn,
             tid,

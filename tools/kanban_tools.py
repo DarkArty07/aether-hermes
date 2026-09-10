@@ -273,6 +273,82 @@ def _goal_mode_completion_rejection(task, evidence: str) -> Optional[str]:
     return reason if verdict != "done" else None
 
 
+_REVIEW_READINESS_INCOMPLETE_MARKERS = (
+    "not implemented",
+    "unimplemented",
+    "incomplete",
+    "unfinished",
+    "not ready",
+    "not verified",
+    "unverified",
+    "tests not run",
+    "test not run",
+    "checks not run",
+    "verification not run",
+    "work remains",
+    "still working",
+    "plan only",
+    "needs input",
+    "cannot proceed",
+    "not done",
+)
+
+
+def _review_handoff_evidence(summary: str, metadata: Optional[dict]) -> str:
+    """Render the worker's truthful review evidence for the readiness phase."""
+    evidence = [f"Summary:\n{summary.strip()}"]
+    if metadata is not None:
+        evidence.append(
+            "Structured verification metadata:\n"
+            + json.dumps(metadata, sort_keys=True, default=str)
+        )
+    return "\n\n".join(evidence)
+
+
+def _goal_mode_review_rejection(
+    task,
+    summary: str,
+    metadata: Optional[dict],
+) -> Optional[str]:
+    """Return a rejection when a goal-mode review handoff is not ready.
+
+    Review entry has its own judge phase.  It evaluates the implementation's
+    summary and structured evidence, not the independent reviewer's future
+    verdict.  The deterministic marker check keeps an explicitly incomplete
+    handoff rejected even when no auxiliary judge is configured; configured
+    judges then perform the richer readiness assessment.
+    """
+    if not task or not task.goal_mode:
+        return None
+    summary_text = summary.strip()
+    lowered = summary_text.casefold()
+    explicit_incomplete = any(
+        marker in lowered for marker in _REVIEW_READINESS_INCOMPLETE_MARKERS
+    )
+    if _goal_judge_available():
+        try:
+            verdict, reason, _, _, _ = judge_goal(
+                goal=f"{task.title}\n\n{task.body or ''}".strip(),
+                last_response=_review_handoff_evidence(summary_text, metadata),
+                phase="review_readiness",
+            )
+        except Exception as judge_exc:
+            # Keep the established fail-open behavior for an unavailable or
+            # broken auxiliary service. The explicit negative marker check
+            # below still protects the obvious incomplete handoff path.
+            logger.warning(
+                "review readiness judge failed, allowing lifecycle handoff: %s",
+                judge_exc,
+                exc_info=True,
+            )
+        else:
+            if verdict != "done":
+                return reason or "review readiness evidence was rejected"
+    if explicit_incomplete:
+        return "review readiness requires a completed implementation and verification evidence"
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Runtime-activity → board-heartbeat bridge (#31752)
 # ---------------------------------------------------------------------------
@@ -952,10 +1028,14 @@ def _handle_request_review(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
-            # Review is a distinct phase from completion. The reviewer will
-            # evaluate the implementation summary/metadata; requiring the
-            # completion judge here would require the verdict this transition
-            # exists to obtain.
+            task = kb.get_task(conn, tid)
+            rejection = _goal_mode_review_rejection(task, summary, metadata)
+            if rejection is not None:
+                return tool_error(
+                    f"Goal review readiness rejected: {rejection}. "
+                    "Provide a truthful implementation summary and structured "
+                    "verification evidence before requesting review."
+                )
             ok, fail_reason = kb.request_review(
                 conn, tid,
                 summary=summary,

@@ -378,13 +378,26 @@ def test_goal_mode_review_handoff_uses_readiness_not_completion_judge(
 
     from tools import kanban_tools as tools
     from hermes_cli import goals
+    import agent.auxiliary_client as auxiliary_client
 
-    def no_completion_judge(*args, **kwargs):
-        pytest.fail("request-review must not require the completion judge")
+    readiness_calls = []
 
-    monkeypatch.setattr(tools, "_goal_judge_available", no_completion_judge)
-    monkeypatch.setattr(tools, "judge_goal", no_completion_judge)
-    monkeypatch.setattr(goals, "judge_goal", no_completion_judge)
+    def readiness_judge(*args, **kwargs):
+        readiness_calls.append((args, kwargs))
+        assert kwargs["phase"] == "review_readiness"
+        assert "tests_run" in kwargs["last_response"]
+        if "Not implemented" in kwargs["last_response"]:
+            return "continue", "implementation is incomplete", False, None, False
+        return "done", "handoff is ready", False, None, False
+
+    monkeypatch.setattr(tools, "_goal_judge_available", lambda: True)
+    monkeypatch.setattr(tools, "judge_goal", readiness_judge)
+    monkeypatch.setattr(goals, "judge_goal", readiness_judge)
+    monkeypatch.setattr(
+        auxiliary_client,
+        "get_text_auxiliary_client",
+        lambda purpose: (object(), "judge-model"),
+    )
 
     with kb.connect() as conn:
         tool_task = kb.create_task(
@@ -461,6 +474,54 @@ def test_goal_mode_review_handoff_uses_readiness_not_completion_judge(
         assert cli_after is not None
         assert cli_after.status == "review"
         assert cli_after.assignee == "reviewer"
+    with kb.connect() as conn:
+        incomplete_tool = kb.create_task(
+            conn,
+            title="Goal-mode incomplete tool review",
+            assignee="builder",
+            goal_mode=True,
+        )
+        incomplete_tool_run = kb.claim_task(conn, incomplete_tool, claimer="builder:4")
+        assert incomplete_tool_run is not None
+    monkeypatch.setenv("HERMES_KANBAN_TASK", incomplete_tool)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(incomplete_tool_run.current_run_id))
+    rejected_tool = json.loads(
+        tools._handle_request_review(
+            {
+                "summary": "Not implemented; tests not run.",
+                "metadata": {"tests_run": 0},
+                "reviewer": "reviewer",
+            }
+        )
+    )
+    assert "error" in rejected_tool
+    assert "readiness" in rejected_tool["error"]
+    with kb.connect() as conn:
+        incomplete_tool_after = kb.get_task(conn, incomplete_tool)
+        assert incomplete_tool_after is not None
+        assert incomplete_tool_after.status == "running"
+
+    with kb.connect() as conn:
+        incomplete_cli = kb.create_task(
+            conn,
+            title="Goal-mode incomplete CLI review",
+            assignee="builder",
+            goal_mode=True,
+        )
+        incomplete_cli_run = kb.claim_task(conn, incomplete_cli, claimer="builder:5")
+        assert incomplete_cli_run is not None
+    monkeypatch.setenv("HERMES_KANBAN_TASK", incomplete_cli)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(incomplete_cli_run.current_run_id))
+    rejected_cli = kc.run_slash(
+        f"request-review {incomplete_cli} --summary 'Not implemented; tests not run.' "
+        "--reviewer reviewer --metadata '{\"tests_run\": 0}'"
+    )
+    assert "readiness" in rejected_cli
+    with kb.connect() as conn:
+        incomplete_cli_after = kb.get_task(conn, incomplete_cli)
+        assert incomplete_cli_after is not None
+        assert incomplete_cli_after.status == "running"
+    assert len(readiness_calls) == 5
 
 
 def test_goal_loop_stops_after_reviewer_requests_changes(
