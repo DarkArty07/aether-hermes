@@ -4,6 +4,7 @@ import asyncio
 import http.server
 import json
 import threading
+from types import SimpleNamespace
 from urllib.parse import parse_qs, urlsplit
 from unittest.mock import patch
 
@@ -18,6 +19,31 @@ from agent.auxiliary_client import (
     _call_fallback_candidate_sync,
     _fallback_destination_from_entry,
 )
+
+
+class _StatusError(Exception):
+    def __init__(self, message, status_code=None):
+        super().__init__(message)
+        if status_code is not None:
+            self.status_code = status_code
+
+
+class _ErrorResponses:
+    def __init__(self, error):
+        self.error = error
+
+    def create(self, **kwargs):
+        del kwargs
+        raise self.error
+
+
+class _RecordingChatCompletions:
+    def __init__(self):
+        self.calls = []
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        return object()
 
 
 class _AuxiliaryGatewayHandler(http.server.BaseHTTPRequestHandler):
@@ -146,6 +172,37 @@ def test_async_chat_only_directive_uses_same_compatible_path(auxiliary_server):
         request["path"].split("?", 1)[0]
         for request in _AuxiliaryGatewayHandler.requests
     ] == ["/v1/responses", "/v1/chat/completions"]
+
+
+@pytest.mark.parametrize(
+    ("status_code", "message"),
+    [
+        (400, "unsupported response surface"),
+        (500, "server says call /v1/chat/completions"),
+        (None, "call /v1/chat/completions"),
+    ],
+    ids=["400-unrelated", "non-400-directive", "statusless-directive"],
+)
+def test_non_400_or_unrelated_directives_are_reraised_without_chat_request(
+    status_code, message
+):
+    error = _StatusError(message, status_code)
+    chat_completions = _RecordingChatCompletions()
+    client = SimpleNamespace(
+        base_url="http://127.0.0.1:1/v1",
+        responses=_ErrorResponses(error),
+        chat=SimpleNamespace(completions=chat_completions),
+    )
+    adapter = _CodexCompletionsAdapter(client, "model")
+
+    with pytest.raises(_StatusError) as raised:
+        adapter.create(
+            model="model",
+            messages=[{"role": "user", "content": "hello"}],
+        )
+
+    assert raised.value is error
+    assert chat_completions.calls == []
 
 
 def test_responses_native_model_keeps_responses_path_only(auxiliary_server):

@@ -1448,11 +1448,10 @@ def _scoped_key_env(name: str) -> str:
 
 
 def _is_chat_completions_directive(exc: Exception) -> bool:
-    """Detect directive 400 error indicating a model requires Chat Completions surface."""
-    err_str = str(exc or "").lower()
-    status_code = getattr(exc, "status_code", None)
-    if status_code is not None and status_code != 400:
+    """Detect a verified HTTP 400 directive for Chat Completions surface."""
+    if getattr(exc, "status_code", None) != 400:
         return False
+    err_str = str(exc or "").lower()
     return any(
         phrase in err_str
         for phrase in (
