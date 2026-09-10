@@ -187,6 +187,40 @@ JUDGE_SYSTEM_PROMPT = (
 )
 
 
+# Review requests are a separate goal phase.  The implementation handoff is
+# ready when it gives a truthful completion claim plus concrete verification
+# evidence; the independent reviewer has not rendered a verdict yet and must
+# never be part of this decision.  Keep this prompt separate from
+# ``JUDGE_SYSTEM_PROMPT`` because that prompt intentionally treats an
+# unachievable/blocked *whole goal* as terminal, while a blocked implementation
+# is not ready for review.
+REVIEW_READINESS_SYSTEM_PROMPT = (
+    "You are a strict implementation-readiness judge. You receive a task goal "
+    "and an implementer's review handoff containing a summary and optional "
+    "structured verification metadata. Decide whether the implementation is "
+    "ready to enter independent review.\n\n"
+    "READY — the handoff truthfully states that the implementation is complete "
+    "and includes concrete verification evidence such as commands, tests, "
+    "checks, changed artifacts, or observed results. Do not require or infer "
+    "an independent reviewer's approval; that verdict comes later.\n\n"
+    "NOT READY — the handoff says the implementation is incomplete, not "
+    "implemented, unverified, tests/checks were not run or failed, is only a "
+    "plan, or is blocked and needs more work/input.\n\n"
+    "Reply ONLY with a single JSON object on one line using one of these shapes:\n"
+    '{"verdict": "done", "reason": "<one sentence>"}\n'
+    '{"verdict": "continue", "reason": "<one sentence>"}\n'
+    'The legacy shape {"done": <true|false>, "reason": "..."} is still accepted (true=ready, false=not ready).'
+)
+
+REVIEW_READINESS_USER_PROMPT_TEMPLATE = (
+    "Task goal:\n{goal}\n\n"
+    "Implementer's review handoff:\n{evidence}\n\n"
+    "Is this implementation handoff ready for an independent reviewer? "
+    "Judge only implementation readiness from the supplied summary and "
+    "structured metadata; do not supply the reviewer's later verdict."
+)
+
+
 # Rendered into the judge prompt when the agent has background processes
 # running. Gives the judge the context it needs to decide WAIT vs CONTINUE
 # (and which pid to wait on) without it having to probe anything itself.
@@ -1011,6 +1045,7 @@ def judge_goal(
     subgoals: Optional[List[str]] = None,
     background_processes: Optional[List[Dict[str, Any]]] = None,
     contract: Optional[GoalContract] = None,
+    phase: str = "completion",
 ) -> Tuple[str, str, bool, Optional[Dict[str, Any]], bool]:
     """Ask the auxiliary model whether the goal is satisfied.
 
@@ -1043,6 +1078,12 @@ def judge_goal(
     judge prompt; when none are set, behavior is identical to the original
     free-form judge.
 
+    ``phase`` is ``"completion"`` for the standing whole-goal loop (the
+    default) or ``"review_readiness"`` for an implementation handoff. The
+    latter uses a separate prompt: it checks only whether the summary and
+    structured metadata are ready for an independent reviewer and never asks
+    the judge to provide that reviewer's verdict.
+
     This is deliberately fail-open: transport errors return ``("continue", ..., ..., None, True)``
     — the ``transport_failed=True`` flag lets callers track and auto-pause after
     N consecutive transport failures (see
@@ -1061,47 +1102,58 @@ def judge_goal(
         logger.debug("goal judge: auxiliary client import failed: %s", exc)
         return "continue", "auxiliary client unavailable", False, None, False
 
-    # Build the prompt. Priority: contract > subgoals > plain. When both a
-    # contract and subgoals exist, the subgoals are appended into the
-    # contract block as extra criteria so the judge sees a single source of
-    # truth.
-    clean_subgoals = [s.strip() for s in (subgoals or []) if s and s.strip()]
-    background_block = _render_background_block(background_processes)
-    current_time = datetime.now(tz=timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
-
-    if contract is not None and not contract.is_empty():
-        contract_block = contract.render_block()
-        if clean_subgoals:
-            extra = "\n".join(
-                f"- Extra criterion {i}: {text}"
-                for i, text in enumerate(clean_subgoals, start=1)
-            )
-            contract_block = f"{contract_block}\n{extra}"
-        prompt = JUDGE_USER_PROMPT_WITH_CONTRACT_TEMPLATE.format(
+    # Review readiness is deliberately phase-aware. It must not reuse the
+    # completion prompt because completion treats a blocked whole goal as a
+    # terminal outcome, while a blocked implementation cannot enter review.
+    if phase == "review_readiness":
+        prompt = REVIEW_READINESS_USER_PROMPT_TEMPLATE.format(
             goal=_truncate(goal, 2000),
-            contract_block=_truncate(contract_block, 2500),
-            response=_truncate(last_response, _JUDGE_RESPONSE_SNIPPET_CHARS),
-            background_block=background_block,
-            current_time=current_time,
+            evidence=_truncate(last_response, _JUDGE_RESPONSE_SNIPPET_CHARS),
         )
-    elif clean_subgoals:
-        subgoals_block = "\n".join(
-            f"- {i}. {text}" for i, text in enumerate(clean_subgoals, start=1)
-        )
-        prompt = JUDGE_USER_PROMPT_WITH_SUBGOALS_TEMPLATE.format(
-            goal=_truncate(goal, 2000),
-            subgoals_block=_truncate(subgoals_block, 2000),
-            response=_truncate(last_response, _JUDGE_RESPONSE_SNIPPET_CHARS),
-            background_block=background_block,
-            current_time=current_time,
-        )
+        system_prompt = REVIEW_READINESS_SYSTEM_PROMPT
     else:
-        prompt = JUDGE_USER_PROMPT_TEMPLATE.format(
-            goal=_truncate(goal, 2000),
-            response=_truncate(last_response, _JUDGE_RESPONSE_SNIPPET_CHARS),
-            background_block=background_block,
-            current_time=current_time,
-        )
+        # Build the completion prompt. Priority: contract > subgoals > plain.
+        # When both a contract and subgoals exist, the subgoals are appended
+        # into the contract block as extra criteria so the judge sees a single
+        # source of truth.
+        clean_subgoals = [s.strip() for s in (subgoals or []) if s and s.strip()]
+        background_block = _render_background_block(background_processes)
+        current_time = datetime.now(tz=timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+
+        if contract is not None and not contract.is_empty():
+            contract_block = contract.render_block()
+            if clean_subgoals:
+                extra = "\n".join(
+                    f"- Extra criterion {i}: {text}"
+                    for i, text in enumerate(clean_subgoals, start=1)
+                )
+                contract_block = f"{contract_block}\n{extra}"
+            prompt = JUDGE_USER_PROMPT_WITH_CONTRACT_TEMPLATE.format(
+                goal=_truncate(goal, 2000),
+                contract_block=_truncate(contract_block, 2500),
+                response=_truncate(last_response, _JUDGE_RESPONSE_SNIPPET_CHARS),
+                background_block=background_block,
+                current_time=current_time,
+            )
+        elif clean_subgoals:
+            subgoals_block = "\n".join(
+                f"- {i}. {text}" for i, text in enumerate(clean_subgoals, start=1)
+            )
+            prompt = JUDGE_USER_PROMPT_WITH_SUBGOALS_TEMPLATE.format(
+                goal=_truncate(goal, 2000),
+                subgoals_block=_truncate(subgoals_block, 2000),
+                response=_truncate(last_response, _JUDGE_RESPONSE_SNIPPET_CHARS),
+                background_block=background_block,
+                current_time=current_time,
+            )
+        else:
+            prompt = JUDGE_USER_PROMPT_TEMPLATE.format(
+                goal=_truncate(goal, 2000),
+                response=_truncate(last_response, _JUDGE_RESPONSE_SNIPPET_CHARS),
+                background_block=background_block,
+                current_time=current_time,
+            )
+        system_prompt = JUDGE_SYSTEM_PROMPT
 
     try:
         # Route through call_llm so auxiliary.goal_judge.* config
@@ -1110,7 +1162,7 @@ def judge_goal(
         resp = call_llm(
             task="goal_judge",
             messages=[
-                {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": prompt},
             ],
             temperature=0,

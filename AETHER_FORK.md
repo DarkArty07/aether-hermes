@@ -131,3 +131,45 @@ The LM Studio branch now requires a top-level `models` list and a non-empty nati
 Only a clear HTTP 400 model-surface directive selects the already-existing Chat Completions path for a configured auxiliary; Responses success and non-directive, non-400, or statusless failures retain existing behavior. Configured title-generation fallback attribution remains request-scoped, and destination authentication is not copied from the primary request. No provider, protocol, or live profile was added or changed. Evidence: `specs/autonomous-bug-remediation/evidence/ABR-AUX.md`. Rollback: revert `7b75f6e83f06badc09e73c87cba78f484d2625fd`, `1ccfb08b8bb86c215c09bc8ee3e45f7c290ae6fc`, `a134c9c4f4d4963c811a30bad72e4be6ae67254a`, and `b1e3ca80a9a79cf8e0482d6621d329c7ae88e236` in that order. Retirement: an exact adopted release must provide equivalent per-model Chat/Responses negotiation and preserve configured fallback attribution with the same boundary tests.
 
 The #349 tests-only commit corrects stale trace instrumentation to observe the checked-out connection; product FTS code is unchanged, so no downstream behavior patch or retirement gate is recorded for that issue.
+
+## Goal-mode review readiness and bounded flow recovery (Aether #369)
+
+This correction was developed from maintained-fork baseline
+`8a6b33ae480373015178b80e87c88fe0abda3919` for Objective Contract
+`oc_7a35eca6393f18a7@v1`. It does not activate the live TUI, gateway, profiles, or
+installation. Inherited GitHub Actions remain disabled and are therefore NOT RUN,
+not green. Portable Aether evidence is in
+`specs/followup-aether-bugs/evidence/FU-369.md`.
+
+Inspectable commits:
+
+- `8ddb28c8eb747345254970339f0c1a67d05b454e` — separates the goal-mode review
+  request from whole-objective completion and narrows controller recovery.
+- `74a4902200a6754b6ec5271f500f92716da349e7` — adds the distinct
+  implementation-readiness judge for tool and CLI review requests.
+- `8b600f3bf508326cd8defdb9da03757b838619b7` — covers phase-aware readiness,
+  incomplete rejection, and preserved completion behavior.
+
+A complete goal-mode implementation can request independent review using truthful
+summary and structured metadata without being required to supply the verdict that the
+reviewer will produce. Incomplete work remains running, whole-objective completion keeps
+its original goal judge, self-review remains rejected, and requested-changes/re-review
+provenance remains durable. The only additional goal-mode block route is the exact
+terminal flow-controller pair `kind="capability", origin_signal="recovery"` while a
+durable `flow_attention` remains unresolved. Arbitrary capability or transient blocks
+do not become goal-loop escape paths.
+
+Unchanged baseline regressions failed `3` acceptance cases and passed `93` controls.
+The reviewed candidate passed `97` focused tool/CLI/review/session-affinity tests,
+`155` extended goal/readiness tests, and the same `97` focused tests after applying the
+portable patch to the exact base. Ruff and compileall passed on changed source/tests,
+and both source and patch diff checks passed. Exact upstream
+`NousResearch/hermes-agent@6e07eb48387044dbcaf12490931c2b8ca7ec8653` retains the
+circular review gate and lacks the bounded recovery predicate, so the correction remains
+downstream.
+
+Rollback reverts the three commits above in reverse order without restoring whole files
+that also carry other Aether corrections. Retirement requires an adopted exact Hermes
+release to pass complete-to-review readiness, incomplete rejection, independent
+review/re-review, whole-objective completion, exact recovery-origin delivery, and
+arbitrary-block negative controls without these commits.

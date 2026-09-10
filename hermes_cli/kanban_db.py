@@ -134,6 +134,7 @@ VALID_ORIGIN_SIGNALS = {"input", "revision", "recovery"}
 # unblocking them only to have the worker re-block for the same reason.
 # ``None`` = legacy/un-typed block (treated as a generic human blocker).
 VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
+GOAL_MODE_BLOCK_ALLOWED_KINDS = frozenset({"dependency", "needs_input"})
 
 # After a task has been blocked, unblocked, and re-blocked this many times for
 # the same (truly-blocked) reason, the unblock-loop breaker stops trusting the
@@ -5546,6 +5547,35 @@ def _pending_flow_attentions(
         else:
             pending.pop(blocked_task_id, None)
     return sorted(pending.values(), key=lambda item: item["event_id"])
+
+
+def goal_mode_block_allowed(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    kind: Optional[str],
+    origin_signal: Optional[str],
+) -> bool:
+    """Return whether a goal worker may use a typed block exit.
+
+    Goal-mode workers may use ordinary dependency/input blocks. The only
+    capability escape is the controller's exact recovery route: a terminal
+    controller with unresolved flow attention emits ``capability`` plus the
+    authoritative ``recovery`` origin signal. Requiring the durable pending
+    attention here keeps callers from manufacturing that pair on an unrelated
+    goal-mode task.
+    """
+    if kind in GOAL_MODE_BLOCK_ALLOWED_KINDS:
+        return True
+    if kind != "capability" or origin_signal != "recovery":
+        return False
+    task = get_task(conn, task_id)
+    if task is None or not task.goal_mode:
+        return False
+    affinity = task.session_affinity
+    if not affinity or not affinity.get("terminal"):
+        return False
+    return bool(_pending_flow_attentions(conn, task_id))
 
 
 def _wake_terminal_flow_controller(
@@ -12193,7 +12223,9 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
         lines.append(
             "If bounded runtime recovery cannot succeed, call "
             "`kanban_block(kind=\"capability\", origin_signal=\"recovery\")` "
-            "so the originating agent resumes the flow."
+            "on this controller so the originating agent resumes the flow. "
+            "Do not use capability/transient blocking for an unrelated goal "
+            "exit; the exact pending-attention route is checked natively."
         )
     if task.max_runtime_seconds is not None:
         terminal_timeout = _worker_terminal_timeout_env(

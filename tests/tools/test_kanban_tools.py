@@ -283,10 +283,18 @@ def test_block_goal_mode_rejects_disallowed_kind(monkeypatch, tmp_path):
     from hermes_cli import kanban_db as kb
 
     tid = _make_goal_mode_worker_env(monkeypatch, tmp_path)
-    for kind in ("capability", "transient"):
-        out = kt._handle_block({"reason": "blocked", "kind": kind})
+    for block_args in (
+        {"reason": "blocked", "kind": "capability"},
+        {"reason": "blocked", "kind": "transient"},
+        {
+            "reason": "blocked",
+            "kind": "capability",
+            "origin_signal": "recovery",
+        },
+    ):
+        out = kt._handle_block(block_args)
         d = json.loads(out)
-        assert "error" in d, f"kind={kind} should be rejected for goal_mode"
+        assert "error" in d, f"block_args={block_args!r} should be rejected for goal_mode"
 
     conn = kb.connect()
     try:
