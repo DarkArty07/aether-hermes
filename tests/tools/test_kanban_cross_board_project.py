@@ -21,6 +21,8 @@ Coverage:
 * the recurrence RED/GREEN regression for the same-flow terminal;
 * the two-step current-board terminal -> cross-profile Implementer E2E with a
   real worktree materialized through the native dispatcher resolver;
+* the explicit ``board=<target>`` propagation regression against a
+  conflicting process-current decoy board;
 * the complete H226C-FR-004 fail-closed matrix (board Project, board
   repository, path shape, source Project, flow/assignee, explicit conflict);
 * unchanged HLP-226 / HLP-226b / scratch / non-affinity behavior.
@@ -32,6 +34,7 @@ import json
 import os
 import subprocess
 from pathlib import Path
+from typing import Optional
 
 import pytest
 
@@ -42,6 +45,8 @@ from tools import kanban_tools as kt
 BOARD = "hlp226c-board"
 PROJECT_ID = "p_226c0ffee"
 OTHER_PROJECT_ID = "p_otherboard"
+TARGET_BOARD = "hlp226c-target"
+DECOY_BOARD = "hlp226c-decoy"
 FLOW_ID = "hlp226c-flow-1"
 OTHER_FLOW_ID = "hlp226c-flow-2"
 PRIOR_BOARD_LEAF = "t_priorboard01"
@@ -77,20 +82,38 @@ class CrossBoard:
     ``supervisor`` and ``implementer`` both start with zero registered
     Projects, and the shared ``dir`` worktree leaf belongs to a prior board —
     exactly the reported recurrence.
+
+    ``board`` is the board the row helpers read/write explicitly. A fixture
+    may decouple it from the process-current board (``env_board``) to prove
+    that an explicit ``board=<target>`` call never falls back to the
+    process-current board's Project/repository metadata.
     """
 
-    def __init__(self, tmp_path: Path, repo: Path, shared: Path, profiles: dict):
+    def __init__(
+        self,
+        tmp_path: Path,
+        repo: Path,
+        shared: Path,
+        profiles: dict,
+        *,
+        board: str = BOARD,
+        env_board: Optional[str] = None,
+        decoy_repo: Optional[Path] = None,
+    ):
         self.tmp_path = tmp_path
         self.repo = repo
         self.shared = shared
         self.profiles = profiles
+        self.board = board
+        self.env_board = env_board or board
+        self.decoy_repo = decoy_repo
 
     # -- worker impersonation ------------------------------------------------
     def as_worker(self, monkeypatch, profile: str, task_id: str) -> None:
         monkeypatch.setenv("HERMES_HOME", str(self.profiles[profile]))
         monkeypatch.setenv("HERMES_PROFILE", profile)
         monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
-        monkeypatch.setenv("HERMES_KANBAN_BOARD", BOARD)
+        monkeypatch.setenv("HERMES_KANBAN_BOARD", self.env_board)
 
     def registered_project_ids(self, monkeypatch, profile: str) -> list[str]:
         monkeypatch.setenv("HERMES_HOME", str(self.profiles[profile]))
@@ -114,9 +137,11 @@ class CrossBoard:
         The row is written directly because no profile registers the Project:
         this is the durable state a prior board left behind.
         """
-        conn = kb.connect()
+        conn = kb.connect(board=self.board)
         try:
-            task_id = kb.create_task(conn, title=title, assignee=assignee)
+            task_id = kb.create_task(
+                conn, title=title, assignee=assignee, board=self.board
+            )
             conn.execute(
                 "UPDATE tasks SET project_id=?, workspace_kind=?, workspace_path=?, "
                 "session_affinity=?, session_id=? WHERE id=?",
@@ -139,7 +164,7 @@ class CrossBoard:
         return task_id
 
     def set_workspace(self, task_id: str, workspace) -> None:
-        conn = kb.connect()
+        conn = kb.connect(board=self.board)
         try:
             conn.execute(
                 "UPDATE tasks SET workspace_path=? WHERE id=?",
@@ -149,8 +174,8 @@ class CrossBoard:
         finally:
             conn.close()
 
-    def rows_for_title(self, title: str) -> list[dict]:
-        conn = kb.connect()
+    def rows_for_title(self, title: str, *, board: Optional[str] = None) -> list[dict]:
+        conn = kb.connect(board=board or self.board)
         try:
             return [
                 dict(row)
@@ -164,7 +189,7 @@ class CrossBoard:
             conn.close()
 
     def get_task(self, task_id: str):
-        conn = kb.connect()
+        conn = kb.connect(board=self.board)
         try:
             return kb.get_task(conn, task_id)
         finally:
@@ -329,6 +354,141 @@ def test_terminal_to_cross_profile_implementer_materializes_worktree(
     assert cross_board.shared.is_dir()
     assert list(cross_board.shared.iterdir()) == []
 
+    for profile in cross_board.profiles:
+        assert cross_board.registered_project_ids(monkeypatch, profile) == []
+
+
+# ---------------------------------------------------------------------------
+# Explicit ``board=<target>`` propagation vs the process-current board
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def explicit_target_board(tmp_path, monkeypatch):
+    """Target board + a conflicting process-current decoy board.
+
+    ``HERMES_KANBAN_DB`` is deliberately left unpinned so each board resolves
+    to its own ``<root>/kanban/boards/<slug>/kanban.db``: the decoy assertions
+    are then a real routing check rather than a shared-file artefact.
+    """
+    repo = tmp_path / "repo"
+    decoy_repo = tmp_path / "decoy-repo"
+    for candidate in (repo, decoy_repo):
+        candidate.mkdir()
+        _git(candidate, "init", "-q")
+        _git(candidate, "config", "user.email", "hlp226c@example.invalid")
+        _git(candidate, "config", "user.name", "HLP-226c fixture")
+        (candidate / "README.md").write_text("hlp226c fixture\n", encoding="utf-8")
+        _git(candidate, "add", "README.md")
+        _git(candidate, "commit", "-q", "-m", "fixture root")
+
+    # The prior board's worktree: present in the target repository, absent
+    # from every board — and absent from the decoy repository entirely.
+    shared = repo / ".worktrees" / PRIOR_BOARD_LEAF
+    shared.mkdir(parents=True)
+
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    # The process resolves a decoy board whose Project and repository both
+    # conflict with the shared worktree.
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", DECOY_BOARD)
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
+    kb._INITIALIZED_PATHS.clear()
+
+    kb.create_board(
+        TARGET_BOARD,
+        name="HLP-226c target board",
+        default_workdir=str(repo),
+        project_id=PROJECT_ID,
+    )
+    kb.create_board(
+        DECOY_BOARD,
+        name="HLP-226c decoy board",
+        default_workdir=str(decoy_repo),
+        project_id=OTHER_PROJECT_ID,
+    )
+
+    profiles = {
+        "supervisor": tmp_path / "profiles" / "supervisor",
+        "implementer": tmp_path / "profiles" / "implementer",
+    }
+    for path in profiles.values():
+        path.mkdir(parents=True)
+
+    return CrossBoard(
+        tmp_path,
+        repo,
+        shared,
+        profiles,
+        board=TARGET_BOARD,
+        env_board=DECOY_BOARD,
+        decoy_repo=decoy_repo,
+    )
+
+
+def test_explicit_target_board_uses_target_metadata_not_process_board(
+    explicit_target_board, monkeypatch
+):
+    """``kanban_create(board=target)`` must ignore the process-current board.
+
+    The decoy board binds a different Project and a different repository, so
+    a recovery that read the process-current board instead of the explicit
+    target would fail closed. The child must carry only the target board's
+    exact Project/path/kind/flow/provenance/parent gate, and nothing may land
+    in the conflicting decoy board.
+    """
+    cross_board = explicit_target_board
+
+    # The process-current decoy really does conflict with the shared dir.
+    assert kb.get_current_board() == DECOY_BOARD
+    decoy_meta = kb.read_board_metadata(DECOY_BOARD)
+    assert decoy_meta["project_id"] == OTHER_PROJECT_ID
+    assert decoy_meta["default_workdir"] == str(cross_board.decoy_repo)
+    assert decoy_meta["default_workdir"] != str(cross_board.repo)
+    assert not (cross_board.decoy_repo / ".worktrees" / PRIOR_BOARD_LEAF).exists()
+
+    # The source row lives in the explicit target board only.
+    root_id = cross_board.seed_shared_dir_task()
+    cross_board.as_worker(monkeypatch, "supervisor", root_id)
+
+    out = json.loads(
+        kt._handle_create({
+            "title": "terminal via explicit target board",
+            "assignee": "supervisor",
+            "parents": [root_id],
+            "session_affinity": {"flow_id": FLOW_ID, "terminal": True},
+            "board": TARGET_BOARD,
+        })
+    )
+    assert out.get("ok") is True, out
+    assert out["project_id"] == PROJECT_ID
+
+    terminal = cross_board.get_task(out["task_id"])
+    assert terminal is not None
+    # Only the target board's exact Project/path/kind/flow/provenance/gate.
+    assert terminal.project_id == PROJECT_ID
+    assert terminal.workspace_kind == "dir"
+    assert terminal.workspace_path == str(cross_board.shared)
+    assert terminal.session_affinity == {"flow_id": FLOW_ID, "terminal": True}
+    assert terminal.session_id == SESSION_ID
+    assert terminal.status == "todo"
+
+    # No invalid (or valid) child reached the conflicting decoy board.
+    decoy = kb.connect(board=DECOY_BOARD)
+    try:
+        assert decoy.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+        assert kb.get_task(decoy, out["task_id"]) is None
+    finally:
+        decoy.close()
+    assert (
+        cross_board.rows_for_title(
+            "terminal via explicit target board", board=DECOY_BOARD
+        )
+        == []
+    )
+
+    # Recovery supplied identity only: no Project was registered anywhere.
     for profile in cross_board.profiles:
         assert cross_board.registered_project_ids(monkeypatch, profile) == []
 
