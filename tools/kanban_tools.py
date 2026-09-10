@@ -2094,8 +2094,9 @@ KANBAN_REQUEST_REVIEW_SCHEMA = {
             "reviewer": {
                 "type": "string",
                 "description": (
-                    "Optional reviewer profile. When provided, the task is "
-                    "reassigned to that profile before review dispatch."
+                    "Reviewer profile. Required for an initial review and "
+                    "must differ from the implementing profile. On a re-review, "
+                    "omitting it reuses durable reviewer provenance."
                 ),
             },
             "metadata": {
