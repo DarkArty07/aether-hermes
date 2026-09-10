@@ -3653,6 +3653,87 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+def _project_from_board_binding(
+    source_task: Optional["Task"],
+    project_id: Optional[str],
+    *,
+    board: Optional[str] = None,
+) -> Optional[Any]:
+    """HLP-226c: recover a Project from the current board's own binding.
+
+    A project/affinity worker may deliberately share a canonical worktree
+    created for an **earlier** board — ``<repo>/.worktrees/<prior-board-leaf>``
+    — so the worktree leaf names no task in this board. Recovery is
+    conjunctive and board-bound:
+
+    * the current source task carries the exact requested Project, an absolute
+      ``dir`` workspace and session affinity;
+    * the current board metadata carries the same Hermes Project and a
+      ``default_workdir`` that resolves to the repository holding it; and
+    * the shared path resolves to exactly one opaque leaf under
+      ``<board default_workdir>/.worktrees/``.
+
+    The leaf stays opaque: it is neither looked up nor trusted for authority,
+    no other profile's Project registry is opened or copied, and no
+    cross-board task query is performed. ``None`` means "no recovery"; every
+    mismatch keeps its existing native validation/error behavior.
+    """
+    if source_task is None or not project_id:
+        return None
+    if source_task.project_id != project_id:
+        return None
+    if source_task.workspace_kind != "dir":
+        return None
+    if not source_task.workspace_path or not source_task.session_affinity:
+        return None
+    shared_path = Path(source_task.workspace_path)
+    if not shared_path.is_absolute():
+        return None
+
+    meta = read_board_metadata(board if board else get_current_board())
+    board_project = str(meta.get("project_id") or "").strip()
+    if board_project != project_id:
+        return None
+    board_default = str(meta.get("default_workdir") or "").strip()
+    if not board_default:
+        return None
+    repo_path = Path(board_default).expanduser()
+    if not repo_path.is_absolute():
+        return None
+
+    try:
+        resolved_repo = repo_path.resolve(strict=False)
+        resolved_shared = shared_path.resolve(strict=False)
+    except OSError:  # pragma: no cover - defensive
+        return None
+    # Inside ``<repo>/.worktrees/`` with exactly one opaque leaf. The
+    # comparison is on resolved paths (not string prefixes), so a sibling
+    # path, a traversal or a symlinked escape can never qualify.
+    if resolved_shared.parent != resolved_repo / ".worktrees":
+        return None
+    leaf = resolved_shared.name
+    if not leaf or leaf in {".", ".."}:
+        return None
+
+    from hermes_cli import projects_db as _pdb
+
+    try:
+        project_slug = _pdb.normalize_slug(project_id)
+    except ValueError:
+        return None
+    if not project_slug:
+        return None
+    # Transient identity only: the repository comes from the board binding,
+    # never from the opaque leaf, and nothing is written to any registry.
+    return _pdb.Project(
+        id=project_id,
+        slug=project_slug,
+        name=project_slug,
+        created_at=0,
+        primary_path=str(resolved_repo),
+    )
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -3787,6 +3868,10 @@ def create_task(
             # the source task's literal worktree path.
             source_task = get_task(conn, str(project_source_task_id))
             source_anchor = source_task
+            # HLP-226c: set only when the source is a project-linked ``dir``
+            # task whose ``.worktrees/<leaf>`` names no task in this board —
+            # i.e. the leaf is an opaque prior-board name.
+            shared_leaf_unresolved = False
             if (
                 source_task is not None
                 and source_task.project_id == project_id
@@ -3819,6 +3904,11 @@ def create_task(
                     and root_affinity.get("flow_id") == source_affinity.get("flow_id")
                 ):
                     source_anchor = root_task
+                elif root_task is None:
+                    # The leaf is opaque here: it need not resolve in this
+                    # board. A leaf that *does* resolve but conflicts keeps the
+                    # strict HLP-226b fail-closed behavior instead.
+                    shared_leaf_unresolved = True
             if (
                 source_anchor is not None
                 and source_anchor.project_id == project_id
@@ -3858,6 +3948,16 @@ def create_task(
                         )
                         if workspace_kind == "scratch":
                             workspace_kind = "worktree"
+            elif shared_leaf_unresolved:
+                # HLP-226c: the shared worktree belongs to a prior board, so
+                # the leaf names no task here. Recover Project/repository
+                # identity from the current board's own Project binding — and
+                # only when every conjunctive relation still holds. A rejected
+                # recovery stays rejected: no cross-board lookup, no registry
+                # read/copy, no fallback to scratch for an affinity request.
+                project_obj = _project_from_board_binding(
+                    source_task, project_id, board=board
+                )
 
         if project_obj is None:
             # A project id/slug that doesn't resolve must not crash task
