@@ -136,6 +136,27 @@ def test_unblock_recover_escalated_refuses_before_explicit_routing(kanban_home):
         )
 
 
+def test_goal_mode_cli_block_gate_does_not_bypass_completion(kanban_home, monkeypatch):
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="goal-mode cli block",
+            assignee="worker",
+            goal_mode=True,
+        )
+        claimed = kb.claim_task(conn, task_id, claimer="worker:1")
+        assert claimed is not None
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
+
+    output = kc.run_slash(f"block {task_id} blocked --kind capability")
+    assert "goal_mode" in output
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "running"
+
+
 def test_board_override_is_isolated_per_concurrent_call(kanban_home, monkeypatch):
     kb.create_board("alpha")
     kb.create_board("beta")

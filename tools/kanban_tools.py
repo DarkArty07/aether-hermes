@@ -251,8 +251,8 @@ def _goal_judge_available() -> bool:
     return client is not None and bool(model)
 
 
-def _goal_mode_handoff_rejection(task, evidence: str) -> Optional[str]:
-    """Return a rejection reason when a goal-mode terminal handoff is premature."""
+def _goal_mode_completion_rejection(task, evidence: str) -> Optional[str]:
+    """Return a rejection reason when a goal-mode completion is premature."""
     if not task or not task.goal_mode or not _goal_judge_available():
         return None
     verdict = "done"
@@ -752,7 +752,7 @@ def _handle_complete(args: dict, **kw) -> str:
             # Only enforce when a judge is actually reachable — see
             # _goal_judge_available for why an unavailable judge fails open.
             task = kb.get_task(conn, tid)
-            rejection = _goal_mode_handoff_rejection(
+            rejection = _goal_mode_completion_rejection(
                 task,
                 (summary or result or "").strip(),
             )
@@ -851,21 +851,29 @@ def _handle_block(args: dict, **kw) -> str:
         # the goal loop — run_kanban_goal_loop() treats ANY `blocked` status
         # as terminal, identically to `done`, regardless of kind. Without
         # this, a worker that learns kanban_complete is gated can just call
-        # kanban_block(reason="anything") to escape the loop instead.
-        # Restrict goal_mode tasks to the kinds that represent a genuine
-        # external blocker the worker cannot resolve itself; `capability`
-        # and `transient` (or an unset kind) route back through
-        # kanban_complete, which the judge now gates.
+        # kanban_block(reason="anything") to escape the loop.
+        # Dependency/needs_input remain valid external blockers. The only
+        # additional route is the exact recovery signal emitted for a goal
+        # controller with pending flow attention; the DB predicate makes that
+        # route impossible to forge on an unrelated goal-mode task.
         task = kb.get_task(conn, tid)
         if (
             task
             and task.goal_mode
-            and kind not in _GOAL_MODE_BLOCK_ALLOWED_KINDS
+            and not kb.goal_mode_block_allowed(
+                conn,
+                tid,
+                kind=kind,
+                origin_signal=origin_signal,
+            )
         ):
             conn.close()
             return tool_error(
                 f"goal_mode tasks can only block with kind in "
-                f"{sorted(_GOAL_MODE_BLOCK_ALLOWED_KINDS)} (got {kind!r}). "
+                f"{sorted(_GOAL_MODE_BLOCK_ALLOWED_KINDS)} or the exact "
+                "pending flow recovery signal "
+                "(kind='capability', origin_signal='recovery') "
+                f"(got kind={kind!r}, origin_signal={origin_signal!r}). "
                 f"If the task is actually finished or cannot proceed for "
                 f"another reason, call kanban_complete instead — the "
                 f"completion judge will evaluate it."
@@ -944,14 +952,10 @@ def _handle_request_review(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
-            task = kb.get_task(conn, tid)
-            rejection = _goal_mode_handoff_rejection(task, summary)
-            if rejection is not None:
-                return tool_error(
-                    f"Goal review handoff rejected by judge: {rejection}. "
-                    "Provide acceptance evidence matching the card before "
-                    "requesting review."
-                )
+            # Review is a distinct phase from completion. The reviewer will
+            # evaluate the implementation summary/metadata; requiring the
+            # completion judge here would require the verdict this transition
+            # exists to obtain.
             ok, fail_reason = kb.request_review(
                 conn, tid,
                 summary=summary,

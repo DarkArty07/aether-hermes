@@ -286,7 +286,7 @@ def test_cli_reopen_review_is_transition_first_and_redacts_reason(
         assert secret not in comments[0].body
 
 
-def test_goal_mode_review_handoff_cannot_bypass_judge(
+def test_goal_mode_completion_handoff_still_requires_judge(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -323,7 +323,7 @@ def test_goal_mode_review_handoff_cannot_bypass_judge(
             False,
         ),
     )
-    rejected = json.loads(tools._handle_request_review({"summary": "Looks ready."}))
+    rejected = json.loads(tools._handle_complete({"summary": "Looks ready."}))
     assert "error" in rejected
     assert "rejected by judge" in rejected["error"]
     with kb.connect() as conn:
@@ -331,7 +331,7 @@ def test_goal_mode_review_handoff_cannot_bypass_judge(
         assert tool_after is not None
         assert tool_after.status == "running"
 
-    # The shell/CLI path applies the same gate and must not bypass the tool.
+    # The shell/CLI completion path retains the same whole-objective gate.
     with kb.connect() as conn:
         cli_task = kb.create_task(
             conn,
@@ -357,12 +357,110 @@ def test_goal_mode_review_handoff_cannot_bypass_judge(
         "judge_goal",
         lambda *args, **kwargs: ("continue", "tests are missing", False, None, False),
     )
-    output = kc.run_slash(f"request-review {cli_task} --summary 'Looks ready.'")
+    output = kc.run_slash(f"complete {cli_task} --summary 'Looks ready.'")
     assert "rejected by judge" in output
     with kb.connect() as conn:
         cli_after = kb.get_task(conn, cli_task)
         assert cli_after is not None
         assert cli_after.status == "running"
+
+
+def test_goal_mode_review_handoff_uses_readiness_not_completion_judge(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+
+    from tools import kanban_tools as tools
+    from hermes_cli import goals
+
+    def no_completion_judge(*args, **kwargs):
+        pytest.fail("request-review must not require the completion judge")
+
+    monkeypatch.setattr(tools, "_goal_judge_available", no_completion_judge)
+    monkeypatch.setattr(tools, "judge_goal", no_completion_judge)
+    monkeypatch.setattr(goals, "judge_goal", no_completion_judge)
+
+    with kb.connect() as conn:
+        tool_task = kb.create_task(
+            conn,
+            title="Goal-mode tool review",
+            assignee="builder",
+            body="Implementation is complete when the regression is covered.",
+            goal_mode=True,
+        )
+        implementation = kb.claim_task(conn, tool_task, claimer="builder:1")
+        assert implementation is not None
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tool_task)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(implementation.current_run_id))
+    requested = json.loads(
+        tools._handle_request_review({
+            "summary": "Implemented the regression and ran the focused suite.",
+            "metadata": {"tests_run": 4},
+            "reviewer": "reviewer",
+        })
+    )
+    assert requested["ok"] is True
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tool_task)
+        assert task is not None
+        assert task.status == "review"
+        assert task.assignee == "reviewer"
+        review = kb.claim_review_task(conn, tool_task, claimer="reviewer:1")
+        assert review is not None
+    monkeypatch.setenv("HERMES_PROFILE", "reviewer")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(review.current_run_id))
+    changed = json.loads(
+        tools._handle_request_changes({"reason": "Add the boundary assertion."})
+    )
+    assert changed["ok"] is True
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tool_task)
+        assert task is not None
+        assert task.status == "ready"
+        assert task.assignee == "builder"
+        implementation = kb.claim_task(conn, tool_task, claimer="builder:2")
+        assert implementation is not None
+    monkeypatch.setenv("HERMES_PROFILE", "builder")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(implementation.current_run_id))
+    rereview = json.loads(
+        tools._handle_request_review({
+            "summary": "Addressed the review feedback and reran the focused suite.",
+            "metadata": {"tests_run": 5},
+        })
+    )
+    assert rereview["ok"] is True
+
+    # The shell/CLI request-review path uses the same readiness transition.
+    with kb.connect() as conn:
+        cli_task = kb.create_task(
+            conn,
+            title="Goal-mode CLI review",
+            assignee="builder",
+            body="Implementation is complete when the CLI path is covered.",
+            goal_mode=True,
+        )
+        cli_implementation = kb.claim_task(conn, cli_task, claimer="builder:3")
+        assert cli_implementation is not None
+    monkeypatch.setenv("HERMES_KANBAN_TASK", cli_task)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(cli_implementation.current_run_id))
+    output = kc.run_slash(
+        f"request-review {cli_task} --summary 'CLI implementation is verified' "
+        "--reviewer reviewer --metadata '{\"tests_run\": 2}'"
+    )
+    assert "Requested review" in output
+    with kb.connect() as conn:
+        cli_after = kb.get_task(conn, cli_task)
+        assert cli_after is not None
+        assert cli_after.status == "review"
+        assert cli_after.assignee == "reviewer"
 
 
 def test_goal_loop_stops_after_reviewer_requests_changes(

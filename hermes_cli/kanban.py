@@ -2252,8 +2252,8 @@ def _worker_run_id_for(task_id: str) -> Optional[int]:
         return None
 
 
-def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str) -> Optional[str]:
-    """Apply the goal judge to every terminal worker handoff, including review."""
+def _goal_mode_completion_rejection(task: Optional[kb.Task], evidence: str) -> Optional[str]:
+    """Apply the goal judge to completion, not to the review request phase."""
     if task is None or not task.goal_mode:
         return None
     try:
@@ -2316,11 +2316,11 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
-            # Goal-mode judge gate (mirrors tools/kanban_tools.py). Apply it
-            # to every terminal handoff so request-review cannot bypass the
-            # acceptance contract that protects complete.
+            # Goal-mode judge gate applies only to completion. Request-review
+            # is a distinct readiness handoff and must not require the
+            # independent verdict that it is asking the reviewer to produce.
             task = kb.get_task(conn, tid)
-            rejection = _goal_mode_handoff_rejection(
+            rejection = _goal_mode_completion_rejection(
                 task,
                 (summary or args.result or "").strip(),
             )
@@ -2383,6 +2383,25 @@ def _cmd_block(args: argparse.Namespace) -> int:
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
+            task = kb.get_task(conn, tid)
+            if (
+                task
+                and task.goal_mode
+                and not kb.goal_mode_block_allowed(
+                    conn,
+                    tid,
+                    kind=kind,
+                    origin_signal=None,
+                )
+            ):
+                failed.append(tid)
+                print(
+                    f"cannot block {tid}: goal_mode tasks can only use "
+                    "dependency/needs_input or the exact pending flow "
+                    "recovery signal",
+                    file=sys.stderr,
+                )
+                continue
             if reason:
                 kb.add_comment(conn, tid, author, f"BLOCKED: {reason}")
             if not kb.block_task(
@@ -2487,17 +2506,6 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
             return 2
     reviewer = getattr(args, "reviewer", None)
     with kb.connect_closing() as conn:
-        rejection = _goal_mode_handoff_rejection(
-            kb.get_task(conn, tid),
-            summary or "",
-        )
-        if rejection is not None:
-            print(
-                f"kanban: goal review handoff of {tid} rejected by judge: "
-                f"{rejection}. Provide acceptance evidence matching the task.",
-                file=sys.stderr,
-            )
-            return 1
         ok, reason = kb.request_review(
             conn,
             tid,

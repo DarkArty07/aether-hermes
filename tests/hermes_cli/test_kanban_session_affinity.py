@@ -576,7 +576,13 @@ def test_unrecoverable_affinity_spawn_failure_routes_flow_terminal(tmp_path, mon
         conn.close()
 
 
-def _blocked_flow_with_terminal_controller(conn, project_id, workspace):
+def _blocked_flow_with_terminal_controller(
+    conn,
+    project_id,
+    workspace,
+    *,
+    controller_goal_mode=False,
+):
     root = kb.create_task(
         conn,
         title="decompose",
@@ -609,6 +615,7 @@ def _blocked_flow_with_terminal_controller(conn, project_id, workspace):
         workspace_kind="dir",
         workspace_path=str(workspace),
         session_affinity={"flow_id": "flow-7", "terminal": True},
+        goal_mode=controller_goal_mode,
     )
     return unit, controller
 
@@ -639,6 +646,76 @@ def test_blocked_unit_wakes_terminal_flow_controller(tmp_path, monkeypatch):
         assert f"Blocked task: `{unit}`" in context
         assert "origin_signal=\"recovery\"" in context
         assert kb.claim_task(conn, controller) is not None
+    finally:
+        conn.close()
+
+
+def test_goal_mode_controller_accepts_exact_recovery_signal(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban"))
+    project_id = _project(tmp_path)
+    conn = kb.connect()
+    try:
+        unit, controller = _blocked_flow_with_terminal_controller(
+            conn,
+            project_id,
+            tmp_path,
+            controller_goal_mode=True,
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=controller,
+            platform="tui",
+            chat_id="origin-session",
+        )
+        assert kb.claim_task(conn, unit) is not None
+        assert kb.block_task(
+            conn,
+            unit,
+            reason="local guard regression",
+            kind="capability",
+        )
+        controller_run = kb.claim_task(conn, controller)
+        assert controller_run is not None
+    finally:
+        conn.close()
+
+    monkeypatch.setenv("HERMES_PROFILE", "supervisor")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", controller)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(controller_run.current_run_id))
+    from tools import kanban_tools
+
+    output = json.loads(
+        kanban_tools._handle_block({
+            "reason": "runtime recovery failed",
+            "kind": "capability",
+            "origin_signal": "recovery",
+        })
+    )
+    assert output["ok"] is True
+    assert output["status"] == "blocked"
+
+    conn = kb.connect()
+    try:
+        controller_after = kb.get_task(conn, controller)
+        blocked_unit = kb.get_task(conn, unit)
+        assert controller_after is not None and controller_after.status == "blocked"
+        assert blocked_unit is not None and blocked_unit.status == "blocked"
+        assert len(kb._pending_flow_attentions(conn, controller)) == 1
+        _, events = kb.unseen_events_for_sub(
+            conn,
+            task_id=controller,
+            platform="tui",
+            chat_id="origin-session",
+            kinds=("origin_signal", "flow_terminal"),
+        )
+        assert [event.kind for event in events] == ["origin_signal"]
+        assert events[0].payload is not None
+        assert events[0].payload["origin_signal"] == "recovery"
+        context = kb.build_worker_context(conn, controller)
+        assert "## Flow recovery attention" in context
     finally:
         conn.close()
 
