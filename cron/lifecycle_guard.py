@@ -43,6 +43,8 @@ import stat
 from pathlib import Path
 from typing import Callable, Iterator, Optional
 
+from tools.shell_heredoc import strip_inert_heredoc_bodies
+
 logger = logging.getLogger(__name__)
 
 
@@ -506,6 +508,34 @@ def _sanitize_remote_script_text(text: Optional[str]) -> tuple[Optional[str], bo
     return text, False
 
 
+def _reference_scan_view(command: str) -> str:
+    """Return the syntax-aware view used to discover executable references.
+
+    Direct lifecycle detection always scans the ORIGINAL text: interpreter
+    source that really asks for a lifecycle action
+    (``os.system("hermes gateway restart")``) lives in exactly the region this
+    view masks away, and that control must survive the #389 correction.
+
+    Executable-*reference* discovery is a different question. In a
+    well-formed, terminated, *quoted* heredoc whose consumer is a non-shell
+    interpreter (``python3``/``osascript``/``cat``) the body is program text or
+    plain data for that interpreter — never shell syntax this command line
+    executes. Walking those lines as shell made a path literal in Python source
+    (``Path('/var/log/gateway.log')``) look like an executable shell-script
+    reference and scanned the referenced log as shell (#389), so a read-only
+    log reader was denied whenever the log happened to mention a lifecycle
+    command.
+
+    ``strip_inert_heredoc_bodies`` is the conservative shared parse of that
+    view: it masks only quoted, terminated, single-command, known-consumer
+    bodies, replaces them with newlines that preserve line structure, and
+    returns the command untouched on ANY ambiguity (unquoted delimiter,
+    unterminated body, list operator, nested shell scope, unknown consumer), so
+    shell-capable and malformed forms keep the plain walk.
+    """
+    return strip_inert_heredoc_bodies(command)
+
+
 def _contains_unsafe_gateway_action(
     command: str,
     *,
@@ -519,7 +549,13 @@ def _contains_unsafe_gateway_action(
     if depth >= _MAX_REFERENCED_SCRIPT_DEPTH:
         return True
 
-    for payload in _iter_shell_command_payloads(command):
+    # The walk below discovers executable *references* — shell scripts and
+    # ``sh -c`` payloads. It must not attribute an interpreter's inline program
+    # text or data to the shell; direct detection above already scanned the
+    # original text in full (#389).
+    reference_view = _reference_scan_view(command)
+
+    for payload in _iter_shell_command_payloads(reference_view):
         if _contains_unsafe_gateway_action(
             payload,
             cwd=cwd,
@@ -529,7 +565,7 @@ def _contains_unsafe_gateway_action(
         ):
             return True
 
-    for script_path in _iter_referenced_shell_scripts(command, cwd=cwd):
+    for script_path in _iter_referenced_shell_scripts(reference_view, cwd=cwd):
         try:
             resolved = script_path.resolve(strict=False)
         except (OSError, ValueError):
