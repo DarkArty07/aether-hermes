@@ -524,6 +524,44 @@ def test_goal_mode_review_handoff_uses_readiness_not_completion_judge(
     assert len(readiness_calls) == 5
 
 
+def test_goal_readiness_phase_uses_a_distinct_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
+    from hermes_cli import goals
+
+    calls = []
+
+    def fake_call_llm(**kwargs):
+        calls.append(kwargs)
+        return type(
+            "Response",
+            (),
+            {
+                "choices": [
+                    type(
+                        "Choice",
+                        (),
+                        {
+                            "message": type(
+                                "Message",
+                                (),
+                                {"content": '{"verdict": "done", "reason": "ready"}'},
+                            )()
+                        },
+                    )()
+                ]
+            },
+        )()
+
+    monkeypatch.setattr("agent.auxiliary_client.call_llm", fake_call_llm)
+    verdict, reason, *_ = goals.judge_goal(
+        "implement the change",
+        "Implemented the change; pytest passed.",
+        phase="review_readiness",
+    )
+    assert (verdict, reason) == ("done", "ready")
+    assert "implementation-readiness" in calls[0]["messages"][0]["content"]
+    assert "independent reviewer" in calls[0]["messages"][1]["content"]
+
+
 def test_goal_loop_stops_after_reviewer_requests_changes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
