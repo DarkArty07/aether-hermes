@@ -820,12 +820,21 @@ class TestFTS5Search:
         db.append_message("s1", role="user", content="after")
 
         statements = []
-        read_conn = db._get_read_conn() or db._conn
-        traced_connections = [db._conn]
-        if read_conn is not db._conn:
-            traced_connections.append(read_conn)
-        for conn in traced_connections:
-            conn.set_trace_callback(statements.append)
+        # _get_read_conn() opens a fresh connection, while _read_ctx() may
+        # borrow another one from the pool. Trace the checkout seam so the
+        # callback follows the connection that actually executes each query.
+        traced_connections = []
+        checkout_read_conn = db._checkout_read_conn
+
+        def traced_checkout_read_conn():
+            result = checkout_read_conn()
+            conn = result if result is not None else db._conn
+            if conn not in traced_connections:
+                conn.set_trace_callback(statements.append)
+                traced_connections.append(conn)
+            return result
+
+        db._checkout_read_conn = traced_checkout_read_conn
 
         def context_query_count():
             normalized = (" ".join(sql.upper().split()) for sql in statements)
@@ -850,6 +859,7 @@ class TestFTS5Search:
             assert default[0]["context"]
             assert context_query_count() == 2
         finally:
+            db._checkout_read_conn = checkout_read_conn
             for conn in traced_connections:
                 conn.set_trace_callback(None)
 
