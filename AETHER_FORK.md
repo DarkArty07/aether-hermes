@@ -101,3 +101,33 @@ These changes land on `aether-main` from independently reviewed unit commits for
 ## Current blocking incident
 
 [Aether #305](https://github.com/DarkArty07/Aether-Agents/issues/305) tracks spontaneous TUI turn cancellation under session-store contention. The inherited HLP-305 patch bounds retry of a transient lease-refresh lock but does not establish which transaction held the original lock. Its full root-cause and reload/canary status remain tracked there; do not call the incident fully fixed merely because this baseline was preserved. The runtime-reliability corrections above do not close #305.
+
+## Autonomous bug-remediation corrections
+
+These changes land on `aether-main` from independently reviewed unit commits for Objective Contract `oc_ddebf175a40251f7@v1`. They do not activate the live TUI, gateway, profiles, or installation. Inherited GitHub Actions remain disabled and are not claimed green. Local evidence is in Aether `specs/autonomous-bug-remediation/evidence/`.
+
+| Issue | Disposition | Inspectable commit(s) | Scope |
+| --- | --- | --- | --- |
+| [#362](https://github.com/DarkArty07/Aether-Agents/issues/362) | reproduced-and-fixed | `8afefe7e304f2b3c80cecbbb24bf9e60be72044b` | `hermes_cli/kanban_db.py`, `tools/kanban_tools.py`, review-lifecycle tests |
+| [#315](https://github.com/DarkArty07/Aether-Agents/issues/315) | reproduced-and-fixed | `3bc559b6d29f5f5cb99f34c60e5163de38ae91ad`, `37d03ac30b239d990b515e88d475bed9ec714fdf` | `tools/file_tools.py`, file-write safety and SOUL-gating tests |
+| [#306](https://github.com/DarkArty07/Aether-Agents/issues/306), [#293](https://github.com/DarkArty07/Aether-Agents/issues/293) | reproduced-and-fixed | `0d0fbecb54bde61e5caa1eac5d4d66923bc5e71f`, `adaa181c08321e6d7fce4b875b8d36c0998b520a`, `d68132254b088d26730134d86f8b27a7474ef460` | `agent/model_metadata.py`, gateway metadata regressions |
+| [#296](https://github.com/DarkArty07/Aether-Agents/issues/296), [#303](https://github.com/DarkArty07/Aether-Agents/issues/303) | reproduced-and-fixed | `b1e3ca80a9a79cf8e0482d6621d329c7ae88e236`, `a134c9c4f4d4963c811a30bad72e4be6ae67254a`, `1ccfb08b8bb86c215c09bc8ee3e45f7c290ae6fc`, `7b75f6e83f06badc09e73c87cba78f484d2625fd` | `agent/auxiliary_client.py`, Chat/attribution regressions |
+| [#349](https://github.com/DarkArty07/Aether-Agents/issues/349) | tests-only qualification; no product defect demonstrated | `59ee7d05a7b67d52dbbfa95b6b2ced57ec6df20e` | `tests/test_hermes_state.py` trace setup |
+
+### HLP-362 / #362 — independent same-card review ownership
+
+An initial review request without a different reviewer fails closed before the implementation claim is cleared; self-review is rejected; legacy reviewer-null review events remain parked; valid re-review provenance and explicit reviewer cycles remain supported. Evidence: `specs/autonomous-bug-remediation/evidence/ABR-362.md`. Rollback: revert `8afefe7e304f2b3c80cecbbb24bf9e60be72044b`. Retirement: an adopted Hermes release must require an explicit independent reviewer, or resolve one and fail closed when unavailable, and pass the ABR-362 predicates without this patch.
+
+### HLP-315 / #315 — tracked package SOUL versus installed profile SOUL
+
+Installed Hermes profile `SOUL.md` files remain protected across supported path and case variants, while ordinary tracked package or project source files named `SOUL.md` proceed without false approval prompts. Project-local `AGENTS.md`, `CLAUDE.md`, and `.cursorrules` remain protected. Evidence: `specs/autonomous-bug-remediation/evidence/ABR-315.md`. Rollback: revert `37d03ac30b239d990b515e88d475bed9ec714fdf` and `3bc559b6d29f5f5cb99f34c60e5163de38ae91ad`. Retirement: an adopted Hermes release must preserve this distinction and pass the ABR-315 suite without the downstream commits.
+
+### ABR-META / #306 + #293 — shape-aware local gateway metadata
+
+The LM Studio branch now requires a top-level `models` list and a non-empty native cache. An HTTP-200 `/api/v1/models` response carrying a generic OpenAI-compatible `data` list is parsed by the existing bounded generic path, preserving advertised context values and the existing explicit override/fallback behavior. No provider, inference-routing, authentication, or auxiliary-client mechanism changed. Evidence: `specs/autonomous-bug-remediation/evidence/ABR-META.md`. Rollback: revert `d68132254b088d26730134d86f8b27a7474ef460`, `adaa181c08321e6d7fce4b875b8d36c0998b520a`, and `0d0fbecb54bde61e5caa1eac5d4d66923bc5e71f` in that order. Retirement: an exact adopted release must provide equivalent shape-aware metadata parsing and pass ABR-META without these commits.
+
+### ABR-AUX / #296 + #303 — Chat-only auxiliaries and fallback attribution
+
+Only a clear HTTP 400 model-surface directive selects the already-existing Chat Completions path for a configured auxiliary; Responses success and non-directive, non-400, or statusless failures retain existing behavior. Configured title-generation fallback attribution remains request-scoped, and destination authentication is not copied from the primary request. No provider, protocol, or live profile was added or changed. Evidence: `specs/autonomous-bug-remediation/evidence/ABR-AUX.md`. Rollback: revert `7b75f6e83f06badc09e73c87cba78f484d2625fd`, `1ccfb08b8bb86c215c09bc8ee3e45f7c290ae6fc`, `a134c9c4f4d4963c811a30bad72e4be6ae67254a`, and `b1e3ca80a9a79cf8e0482d6621d329c7ae88e236` in that order. Retirement: an exact adopted release must provide equivalent per-model Chat/Responses negotiation and preserve configured fallback attribution with the same boundary tests.
+
+The #349 tests-only commit corrects stale trace instrumentation to observe the checked-out connection; product FTS code is unchanged, so no downstream behavior patch or retirement gate is recorded for that issue.
