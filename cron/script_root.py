@@ -27,7 +27,10 @@ def get_effective_scripts_dir() -> Path:
 
     try:
         from cron import scheduler
-        base = scheduler._hermes_home or get_hermes_home()
+        if hasattr(scheduler, "_get_hermes_home") and callable(scheduler._get_hermes_home):
+            base = scheduler._get_hermes_home()
+        else:
+            base = getattr(scheduler, "_hermes_home", None) or get_hermes_home()
     except Exception:
         base = get_hermes_home()
 

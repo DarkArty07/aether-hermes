@@ -184,6 +184,154 @@ class TestIssue393CommissioningOrigin:
         assert os.environ.get("HERMES_SESSION_PLATFORM") is None
         assert os.environ.get("HERMES_SESSION_CHAT_ID") is None
 
+    def test_fire_restores_gateway_origin_kanban_auto_subscribe_group(self, profile_env, monkeypatch):
+        from hermes_cli import kanban_db as kb
+        import tools.kanban_tools as kt
+        from cron.scheduler import run_job
+
+        conn = kb.connect()
+        conn.close()
+
+        job = {
+            "id": "job-with-gateway-group-origin",
+            "name": "gateway-group-origin-job",
+            "prompt": "do work",
+            "schedule": {"kind": "once"},
+            "notification_origin": {
+                "platform": "telegram",
+                "chat_id": "tg-chat-999",
+                "chat_type": "group",
+                "thread_id": 101,
+                "user_id": "user-42",
+                "message_id": "msg-7",
+            },
+        }
+
+        created_receipt = {}
+        class MockAgent:
+            def __init__(self, **kwargs):
+                pass
+            def run_conversation(self, *a, **kw):
+                monkeypatch.setenv("HERMES_KANBAN_TASK", "t_root_worker_gw_group")
+                raw = kt._handle_create({"title": "Root cron task gateway group", "assignee": "implementer"})
+                created_receipt.update(json.loads(raw))
+                return {"final_response": "done", "messages": []}
+            def get_activity_summary(self):
+                return {"seconds_since_activity": 0.0}
+
+        import sys
+        fake_mod = type(sys)("run_agent")
+        fake_mod.AIAgent = MockAgent
+        monkeypatch.setitem(sys.modules, "run_agent", fake_mod)
+
+        from hermes_cli import runtime_provider as _rtp
+        monkeypatch.setattr(
+            _rtp, "resolve_runtime_provider",
+            lambda **kw: {"provider": "test", "api_key": "k", "base_url": "http://test", "api_mode": "chat_completions"}
+        )
+        monkeypatch.setattr("cron.scheduler._build_job_prompt", lambda *a, **kw: "prompt")
+        monkeypatch.setattr("cron.scheduler._deliver_result", lambda *a, **kw: None)
+        monkeypatch.setenv("HERMES_CRON_TIMEOUT", "0")
+
+        run_job(job)
+
+        assert created_receipt.get("subscribed") is True
+        task_id = created_receipt["task_id"]
+
+        c = kb.connect()
+        try:
+            subs = kb.list_notify_subs(c, task_id=task_id)
+            assert len(subs) == 1
+            sub = subs[0]
+            assert sub.get("platform") == "telegram"
+            assert sub.get("chat_id") == "tg-chat-999"
+            assert sub.get("chat_type") == "group"
+            assert str(sub.get("thread_id")) == "101"
+            assert sub.get("user_id") == "user-42"
+            assert sub.get("delivery_mode") == "notify+wake"
+            meta = sub.get("delivery_metadata") or {}
+            assert str(meta.get("thread_id")) == "101"
+            assert meta.get("chat_type") == "group"
+            assert meta.get("message_id") == "msg-7"
+            assert "telegram_dm_topic_reply_fallback" not in meta
+        finally:
+            c.close()
+
+    def test_fire_restores_gateway_origin_kanban_auto_subscribe_telegram_dm_with_thread(self, profile_env, monkeypatch):
+        from hermes_cli import kanban_db as kb
+        import tools.kanban_tools as kt
+        from cron.scheduler import run_job
+
+        conn = kb.connect()
+        conn.close()
+
+        job = {
+            "id": "job-with-gateway-dm-origin",
+            "name": "gateway-dm-origin-job",
+            "prompt": "do work",
+            "schedule": {"kind": "once"},
+            "notification_origin": {
+                "platform": "telegram",
+                "chat_id": "tg-chat-999",
+                "chat_type": "dm",
+                "thread_id": 101,
+                "user_id": "user-42",
+                "message_id": "msg-7",
+            },
+        }
+
+        created_receipt = {}
+        class MockAgent:
+            def __init__(self, **kwargs):
+                pass
+            def run_conversation(self, *a, **kw):
+                monkeypatch.setenv("HERMES_KANBAN_TASK", "t_root_worker_gw_dm")
+                raw = kt._handle_create({"title": "Root cron task gateway dm", "assignee": "implementer"})
+                created_receipt.update(json.loads(raw))
+                return {"final_response": "done", "messages": []}
+            def get_activity_summary(self):
+                return {"seconds_since_activity": 0.0}
+
+        import sys
+        fake_mod = type(sys)("run_agent")
+        fake_mod.AIAgent = MockAgent
+        monkeypatch.setitem(sys.modules, "run_agent", fake_mod)
+
+        from hermes_cli import runtime_provider as _rtp
+        monkeypatch.setattr(
+            _rtp, "resolve_runtime_provider",
+            lambda **kw: {"provider": "test", "api_key": "k", "base_url": "http://test", "api_mode": "chat_completions"}
+        )
+        monkeypatch.setattr("cron.scheduler._build_job_prompt", lambda *a, **kw: "prompt")
+        monkeypatch.setattr("cron.scheduler._deliver_result", lambda *a, **kw: None)
+        monkeypatch.setenv("HERMES_CRON_TIMEOUT", "0")
+
+        run_job(job)
+
+        assert created_receipt.get("subscribed") is True
+        task_id = created_receipt["task_id"]
+
+        c = kb.connect()
+        try:
+            subs = kb.list_notify_subs(c, task_id=task_id)
+            assert len(subs) == 1
+            sub = subs[0]
+            assert sub.get("platform") == "telegram"
+            assert sub.get("chat_id") == "tg-chat-999"
+            assert sub.get("chat_type") == "dm"
+            assert str(sub.get("thread_id")) == "101"
+            assert sub.get("user_id") == "user-42"
+            assert sub.get("delivery_mode") == "notify+wake"
+            meta = sub.get("delivery_metadata") or {}
+            assert str(meta.get("thread_id")) == "101"
+            assert meta.get("chat_type") == "dm"
+            assert meta.get("message_id") == "msg-7"
+            assert meta.get("telegram_dm_topic_reply_fallback") is True
+            assert meta.get("direct_messages_topic_id") == "101"
+            assert meta.get("telegram_reply_to_message_id") == "msg-7"
+        finally:
+            c.close()
+
     def test_unattached_cron_fire_creates_no_kanban_subscription(self, profile_env, monkeypatch):
         from hermes_cli import kanban_db as kb
         import tools.kanban_tools as kt
