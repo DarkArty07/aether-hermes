@@ -87,6 +87,13 @@ def _launch_cwd_for_session(source: str) -> Optional[str]:
         if workspace and os.path.isabs(workspace) and os.path.isdir(workspace):
             return workspace
         return None
+    if source == "cron":
+        from agent.runtime_cwd import _session_cwd_override
+
+        override = _session_cwd_override()
+        if override and os.path.isabs(override) and os.path.isdir(override):
+            return str(Path(override).resolve())
+        return None
     if source != "cli":
         return None
     backend = (os.environ.get("TERMINAL_ENV") or "local").strip().lower()
