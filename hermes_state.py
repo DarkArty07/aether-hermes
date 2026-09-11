@@ -57,6 +57,8 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     _RESET_END_REASONS,
     _RESET_END_REASONS_SQL,
     _ephemeral_child_sql,
+    _internal_session_exclusion,
+    _internal_session_id_exclusion,
     _legacy_reset_child_sql,
     _shape_preview,
     _sql_session_last_active,
@@ -78,6 +80,10 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     _PREVIEW_MAX_CHARS,
     _PREVIEW_SCAFFOLD_WINDOW,
     _PREVIEW_SCAFFOLDED_SQL,
+)
+from hermes_state_compaction import (
+    SessionCompactionPublicationMixin,
+    _PreparedMessage,
 )
 from hermes_state_portability import SessionPortabilityMixin
 from hermes_state_schema import SessionSchemaMixin
@@ -3063,7 +3069,12 @@ def classify_session_status(
     return SESSION_STATUS_COMPLETE
 
 
-class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin):
+class SessionDB(
+    SessionCompactionPublicationMixin,
+    SessionSearchMixin,
+    SessionSchemaMixin,
+    SessionPortabilityMixin,
+):
     """
     SQLite-backed session storage with FTS5 search.
 
@@ -3981,6 +3992,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         while True:
             try:
                 with self._lock:
+                    # A publication cutover may declare a pre-BEGIN preflight:
+                    # it runs under THIS instance lock but before BEGIN
+                    # IMMEDIATE, so validation never nests the non-reentrant
+                    # lock and never holds SQLite's writer slot. Ordinary
+                    # writer callables are unaffected (no attribute).
+                    preflight = getattr(fn, "_publication_preflight", None)
+                    if preflight is not None:
+                        preflight()
                     self._conn.execute("BEGIN IMMEDIATE")
                     try:
                         result = fn(self._conn)
@@ -7723,7 +7742,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 "COALESCE(sp.prompt, s.system_prompt) AS _system_prompt_resolved "
                 "FROM sessions s "
                 "LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash "
-                "WHERE s.id = ?",
+                f"WHERE s.id = ? AND {_internal_session_id_exclusion()}",
                 (session_id,),
             )
             row = cursor.fetchone()
@@ -7743,7 +7762,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         escaped = _escape_like(session_id_or_prefix)
         with self._lock:
             cursor = self._conn.execute(
-                "SELECT id FROM sessions WHERE id LIKE ? ESCAPE '\\' ORDER BY started_at DESC LIMIT 2",
+                "SELECT id FROM sessions WHERE id LIKE ? ESCAPE '\\' "
+                f"AND {_internal_session_id_exclusion('sessions')} "
+                "ORDER BY started_at DESC LIMIT 2",
                 (f"{escaped}%",),
             )
             matches = [row["id"] for row in cursor.fetchall()]
@@ -8561,6 +8582,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             where_clauses.append("s.archived = 0")
         if not include_hidden:
             where_clauses.append("s.hidden = 0")
+        # Internal staging sessions are never a public listing row: the modes
+        # above (hidden/archived) are caller-controlled, so the reserved
+        # staging id is excluded unconditionally (TS-382 design D2).
+        where_clauses.append(_internal_session_id_exclusion())
 
         where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
         # Snapshot the filter params before the query builders below extend
@@ -9527,97 +9552,137 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         return row[0] if row else None
 
+    def _prepare_message_row(
+        self, msg: Any, now_ts: float
+    ) -> tuple["_PreparedMessage", float]:
+        """Encode ONE message into a private prepared row.
+
+        Runs the exact row-serialization the insert seam has always run
+        (``_encode_content`` / ``_scrub_surrogates`` / ``_reasoning_json_text``
+        / tool-call parsing / timestamp defaulting / display metadata), so a
+        prepared row is byte-for-byte what :meth:`_insert_message_rows` would
+        have written — only computed OUTSIDE the caller's writer transaction.
+        Returns ``(prepared_row, next_now_ts)``; ``now_ts`` advances exactly as
+        the historical in-transaction loop advanced it, keeping the synthesized
+        timestamps of a batch strictly increasing.
+
+        Caller dictionaries are never mutated here; ``_row_id`` is stamped by
+        :meth:`_insert_message_rows` (dict inputs) or after a successful
+        publication (prepared rows carrying ``source``).
+        """
+        role = msg.get("role", "unknown")
+        tool_calls = msg.get("tool_calls")
+        message_timestamp = now_ts
+        if msg.get("timestamp") is not None:
+            try:
+                ts_value = msg.get("timestamp")
+                if hasattr(ts_value, "timestamp"):
+                    message_timestamp = float(ts_value.timestamp())
+                else:
+                    message_timestamp = float(ts_value)
+            except (TypeError, ValueError):
+                logger.debug("Ignoring invalid explicit message timestamp: %r", msg.get("timestamp"))
+        reasoning_details = msg.get("reasoning_details") if role == "assistant" else None
+        codex_reasoning_items = (
+            msg.get("codex_reasoning_items") if role == "assistant" else None
+        )
+        codex_message_items = (
+            msg.get("codex_message_items") if role == "assistant" else None
+        )
+        reasoning_details_json = self._reasoning_json_text(reasoning_details)
+        codex_items_json = self._reasoning_json_text(codex_reasoning_items)
+        codex_message_items_json = self._reasoning_json_text(codex_message_items)
+        # tool_calls may arrive as a Python list (from the live agent)
+        # or as a JSON string (from import_sessions / export_session,
+        # which store it as TEXT). json.dumps on an already-serialized
+        # string double-encodes it, so parse first.
+        if isinstance(tool_calls, str):
+            try:
+                tool_calls = json.loads(tool_calls)
+            except (json.JSONDecodeError, TypeError):
+                tool_calls = []
+        tool_calls_json = json.dumps(tool_calls) if tool_calls else None
+        # Accept either `platform_message_id` (new explicit name) or
+        # `message_id` (yuanbao's existing convention on message dicts).
+        platform_msg_id = (
+            msg.get("platform_message_id") or msg.get("message_id")
+        )
+
+        api_content = msg.get("api_content")
+
+        values = (
+            role,
+            self._encode_content(msg.get("content")),
+            msg.get("tool_call_id"),
+            tool_calls_json,
+            _scrub_surrogates(msg.get("tool_name")),
+            msg.get("effect_disposition"),
+            message_timestamp,
+            msg.get("token_count"),
+            msg.get("finish_reason"),
+            _scrub_surrogates(msg.get("reasoning")) if role == "assistant" else None,
+            _scrub_surrogates(msg.get("reasoning_content")) if role == "assistant" else None,
+            reasoning_details_json,
+            codex_items_json,
+            codex_message_items_json,
+            platform_msg_id,
+            1 if msg.get("observed") else 0,
+            1,
+            0,
+            _scrub_surrogates(api_content) if isinstance(api_content, str) else None,
+            _scrub_surrogates(msg.get("display_kind")) if isinstance(msg.get("display_kind"), str) else None,
+            self._encode_display_metadata(msg.get("display_metadata")),
+        )
+        tool_calls_total = 0
+        if tool_calls is not None:
+            tool_calls_total = len(tool_calls) if isinstance(tool_calls, list) else 1
+        next_now_ts = max(now_ts + 1e-6, message_timestamp + 1e-6)
+        return (
+            _PreparedMessage(values, tool_calls_total),
+            next_now_ts,
+        )
+
     def _insert_message_rows(self, conn, session_id: str, messages: List[Dict[str, Any]]) -> tuple[int, int]:
         """Insert *messages* as fresh active rows for *session_id*.
 
         Shared by :meth:`replace_messages` (delete-then-insert) and
-        :meth:`archive_and_compact` (soft-archive-then-insert). Runs inside the
+        ``archive_and_compact`` (bounded staged publication). Runs inside the
         caller's write transaction (takes the live ``conn``). Returns
         ``(inserted_count, tool_call_count)``. Does NOT touch sessions.* counters
-        — the caller owns that, since the two flows reconcile counts differently.
+        — the caller owns that, since the flows reconcile counts differently.
+
+        *messages* may hold plain message dicts (the historical shape, encoded
+        here exactly as before) or private :class:`_PreparedMessage` rows
+        prepared outside the transaction by a bounded publisher — the seam and
+        its positional shape are unchanged for every existing caller.
         """
         now_ts = time.time()
         inserted = 0
         tool_calls_total = 0
         for msg in messages:
-            role = msg.get("role", "unknown")
-            tool_calls = msg.get("tool_calls")
-            message_timestamp = now_ts
-            if msg.get("timestamp") is not None:
-                try:
-                    ts_value = msg.get("timestamp")
-                    if hasattr(ts_value, "timestamp"):
-                        message_timestamp = float(ts_value.timestamp())
-                    else:
-                        message_timestamp = float(ts_value)
-                except (TypeError, ValueError):
-                    logger.debug("Ignoring invalid explicit message timestamp: %r", msg.get("timestamp"))
-            reasoning_details = msg.get("reasoning_details") if role == "assistant" else None
-            codex_reasoning_items = (
-                msg.get("codex_reasoning_items") if role == "assistant" else None
-            )
-            codex_message_items = (
-                msg.get("codex_message_items") if role == "assistant" else None
-            )
-            reasoning_details_json = self._reasoning_json_text(reasoning_details)
-            codex_items_json = self._reasoning_json_text(codex_reasoning_items)
-            codex_message_items_json = self._reasoning_json_text(codex_message_items)
-            # tool_calls may arrive as a Python list (from the live agent)
-            # or as a JSON string (from import_sessions / export_session,
-            # which store it as TEXT). json.dumps on an already-serialized
-            # string double-encodes it, so parse first.
-            if isinstance(tool_calls, str):
-                try:
-                    tool_calls = json.loads(tool_calls)
-                except (json.JSONDecodeError, TypeError):
-                    tool_calls = []
-            tool_calls_json = json.dumps(tool_calls) if tool_calls else None
-            # Accept either `platform_message_id` (new explicit name) or
-            # `message_id` (yuanbao's existing convention on message dicts).
-            platform_msg_id = (
-                msg.get("platform_message_id") or msg.get("message_id")
-            )
-
-            api_content = msg.get("api_content")
-
+            if isinstance(msg, _PreparedMessage):
+                prepared = msg
+            else:
+                prepared, now_ts = self._prepare_message_row(msg, now_ts)
+            values = prepared.values
             cur = conn.execute(
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
-                   codex_message_items, platform_message_id, observed, active, api_content, display_kind, display_metadata)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    session_id,
-                    role,
-                    self._encode_content(msg.get("content")),
-                    msg.get("tool_call_id"),
-                    tool_calls_json,
-                    _scrub_surrogates(msg.get("tool_name")),
-                    msg.get("effect_disposition"),
-                    message_timestamp,
-                    msg.get("token_count"),
-                    msg.get("finish_reason"),
-                    _scrub_surrogates(msg.get("reasoning")) if role == "assistant" else None,
-                    _scrub_surrogates(msg.get("reasoning_content")) if role == "assistant" else None,
-                    reasoning_details_json,
-                    codex_items_json,
-                    codex_message_items_json,
-                    platform_msg_id,
-                    1 if msg.get("observed") else 0,
-                    1,
-                    _scrub_surrogates(api_content) if isinstance(api_content, str) else None,
-                    _scrub_surrogates(msg.get("display_kind")) if isinstance(msg.get("display_kind"), str) else None,
-                    self._encode_display_metadata(msg.get("display_metadata")),
-                ),
+                   codex_message_items, platform_message_id, observed, active, compacted, api_content, display_kind, display_metadata)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (session_id, *values),
             )
-            if isinstance(msg, dict) and cur.lastrowid is not None:
-                msg["_row_id"] = cur.lastrowid
+            if cur.lastrowid is not None:
+                prepared.row_id = cur.lastrowid
+                if isinstance(msg, dict):
+                    # Historical behavior for plain dicts: the caller's own
+                    # message object learns its row id immediately. Prepared
+                    # rows are stamped by their publisher only after a
+                    # successful (and therefore committed) publication.
+                    msg["_row_id"] = cur.lastrowid
             inserted += 1
-            if tool_calls is not None:
-                tool_calls_total += (
-                    len(tool_calls) if isinstance(tool_calls, list) else 1
-                )
-            now_ts = max(now_ts + 1e-6, message_timestamp + 1e-6)
+            tool_calls_total += prepared.tool_call_count
         return inserted, tool_calls_total
 
     def replace_messages(
@@ -9720,79 +9785,19 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             return cursor.fetchone() is not None
 
-    def archive_and_compact(
-        self,
-        session_id: str,
-        compacted_messages: List[Dict[str, Any]],
-        model_config_patch: Optional[Dict[str, Any]] = None,
-    ) -> int:
-        """Non-destructive in-place compaction for a single durable session id.
+    # ``archive_and_compact`` and ``capture_publication_snapshot`` are provided
+    # by SessionCompactionPublicationMixin (hermes_state_compaction): the
+    # original single-transaction implementation is replaced by a bounded,
+    # staged publication with one metadata-only cutover (TS-382 D1-D7).
+    def _compaction_owner_process_is_dead(self, holder: str) -> bool:
+        """Liveness probe for a structured publication owner token.
 
-        Soft-archives every currently-active message (``active = 0``) and
-        inserts *compacted_messages* as fresh active rows — atomically, in one
-        write transaction. The conversation keeps ONE session id for life
-        (#38763) WITHOUT destroying history:
-
-        - The live-context load (:meth:`get_messages_as_conversation`,
-          :meth:`get_messages`) filters ``active = 1`` by default, so the model
-          reloads ONLY the compacted set.
-        - The archived pre-compaction turns stay on disk (active=0) and stay
-          DISCOVERABLE: they are marked compacted=1, and search_messages()
-          includes compacted=1 rows by default — so session_search still finds
-          them, unlike rewind/undo rows (active=0, compacted=0) which stay
-          hidden. They remain in the FTS index (the messages_fts* triggers
-          index on INSERT / drop on DELETE and don't key on active/compacted;
-          flipping to active=0 is a content-preserving UPDATE) and are
-          recoverable via get_messages(..., include_inactive=True).
-
-        This is the durability-preserving alternative to :meth:`replace_messages`
-        for compaction. ``message_count`` is set to the ACTIVE (compacted) count,
-        matching what the live load returns. ``model_config_patch`` is merged
-        into the session's JSON config in the same transaction; a ``None``
-        value removes that key. Returns the new active count.
+        Host seam for the compaction-publication mixin: it reuses the native
+        compression-holder convention (``pid=<n>:...``) and its conservative
+        dead-local-process test, so a publication whose owner process died is
+        reclaimable without waiting out the full lease TTL.
         """
-
-        def _do(conn):
-            patched_model_config = None
-            if model_config_patch is not None:
-                # on_missing="raise": a prune/compaction must not commit
-                # against a vanished session row (the compressor's caller
-                # converts the raised error into a safe keep-the-original
-                # no-op), unlike the flag setters which tolerate missing rows.
-                patched_model_config = self._merge_model_config_json(
-                    conn, session_id, model_config_patch, on_missing="raise"
-                )
-
-            # Soft-archive the live turns: active=0 hides them from the live
-            # context load, compacted=1 marks them as "summarized away" (vs
-            # rewind/undo's active=0+compacted=0, which means "user took it
-            # back"). search_messages includes compacted=1 rows by default so
-            # the pre-compaction transcript stays discoverable; live-context
-            # loads (active=1 only) still exclude them.
-            conn.execute(
-                "UPDATE messages SET active = 0, compacted = 1 "
-                "WHERE session_id = ? AND active = 1",
-                (session_id,),
-            )
-            inserted, tool_calls_total = self._insert_message_rows(
-                conn, session_id, compacted_messages
-            )
-            # message_count / tool_call_count reflect the LIVE (active) set —
-            # the archived rows are still on disk but not part of the live count.
-            if model_config_patch is None:
-                conn.execute(
-                    "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
-                    (inserted, tool_calls_total, session_id),
-                )
-            else:
-                conn.execute(
-                    "UPDATE sessions SET message_count = ?, tool_call_count = ?, "
-                    "model_config = ? WHERE id = ?",
-                    (inserted, tool_calls_total, patched_model_config, session_id),
-                )
-            return inserted
-
-        return self._execute_write(_do)
+        return _compression_lock_holder_process_is_dead(holder)
 
     def set_latest_user_api_content(
         self, session_id: str, content: Any, api_content: str
@@ -9882,9 +9887,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         else:
             active_clause = " AND active = 1"
         keyset_clause = " AND id > ?" if after_id is not None else ""
+        staging_clause = f" AND {_internal_session_exclusion('messages')}"
         sql = (
             "SELECT * FROM messages WHERE session_id = ?"
-            f"{active_clause}{keyset_clause} ORDER BY id {'DESC' if latest else 'ASC'}"
+            f"{active_clause}{keyset_clause}{staging_clause}"
+            f" ORDER BY id {'DESC' if latest else 'ASC'}"
         )
         params: list = [session_id]
         if after_id is not None:
@@ -9901,6 +9908,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             with self._read_ctx() as conn:
                 cursor = conn.execute(
                     "SELECT * FROM messages WHERE session_id = ?" + active_clause
+                    + staging_clause
                     + " ORDER BY id ASC",
                     [session_id],
                 )
@@ -9975,6 +9983,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     f"""SELECT session_id, content FROM messages
                         WHERE session_id IN ({placeholders})
                           AND role = 'tool' AND content LIKE '%/pull/%'
+                          AND {_internal_session_exclusion('messages')}
                         ORDER BY id ASC""",
                     chunk,
                 ).fetchall()
@@ -10011,7 +10020,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         with self._read_ctx() as conn:
             # Confirm the anchor exists in this session.
             anchor_exists = conn.execute(
-                "SELECT 1 FROM messages WHERE id = ? AND session_id = ? LIMIT 1",
+                "SELECT 1 FROM messages WHERE id = ? AND session_id = ? "
+                f"AND {_internal_session_exclusion('messages')} LIMIT 1",
                 (around_message_id, session_id),
             ).fetchone()
             if not anchor_exists:
@@ -10186,6 +10196,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             session_ids = self._session_lineage_root_to_tip(session_id)
 
         active_clause = "" if include_inactive else " AND active = 1"
+        staging_clause = f" AND {_internal_session_exclusion('messages')}"
         with self._read_ctx() as conn:
             placeholders = ",".join("?" for _ in session_ids)
             rows = conn.execute(
@@ -10199,7 +10210,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # after its tool response, breaking tool-call/response adjacency
                 # and triggering an HTTP 400 on replay. This matches get_messages
                 # — see c03acca50 for the original fix.
-                f"{active_clause} ORDER BY id",
+                f"{active_clause}{staging_clause} ORDER BY id",
                 tuple(session_ids),
             ).fetchall()
 
@@ -10762,6 +10773,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         )
         where_clauses = []
         params: list = []
+        # Internal staging sessions are never listed, under any mode (TS-382 D2).
+        where_clauses.append(_internal_session_id_exclusion())
         if source:
             where_clauses.append("s.source = ?")
             params.append(source)
@@ -10811,6 +10824,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """
         where_clauses = []
         params = []
+        # Internal staging sessions are never counted, under any mode (TS-382 D2).
+        where_clauses.append(_internal_session_id_exclusion())
 
         if exclude_children:
             # Mirror list_sessions_rich's child-exclusion clause exactly so the
@@ -10857,7 +10872,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         is irrelevant.
         """
         with self._lock:
-            cursor = self._conn.execute("SELECT 1 FROM sessions LIMIT ?", (n,))
+            cursor = self._conn.execute(
+                f"SELECT 1 FROM sessions s WHERE {_internal_session_id_exclusion()} "
+                "LIMIT ?",
+                (n,),
+            )
             rows = cursor.fetchall()
         return len(rows) >= n
 
@@ -10883,6 +10902,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """
         where_clauses = []
         params: list = []
+        # Internal staging sessions are never counted, under any mode (TS-382 D2).
+        where_clauses.append(_internal_session_id_exclusion())
 
         if exclude_children:
             where_clauses.append(_LISTABLE_CHILD_SQL)
@@ -10911,7 +10932,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         with self._lock:
             if session_id:
                 cursor = self._conn.execute(
-                    "SELECT COUNT(*) FROM messages WHERE session_id = ?", (session_id,)
+                    "SELECT COUNT(*) FROM messages WHERE session_id = ? "
+                    f"AND {_internal_session_exclusion('messages')}",
+                    (session_id,),
                 )
             else:
                 cursor = self._conn.execute("SELECT COUNT(*) FROM messages")

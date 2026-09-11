@@ -26,12 +26,14 @@ from hermes_state_common import (
     MAX_FTS5_QUERY_CHARS,
     SCHEMA_VERSION,
     _FTS_CJK_TRIGGERS,
+    _internal_session_exclusion,
     escape_like as _escape_like,
 )
 
 # Moved methods logged under the "hermes_state" logger before the split;
 # keep that logger identity so log filtering/capture behavior is unchanged.
 logger = logging.getLogger("hermes_state")
+
 
 # Characters FTS5's query grammar rejects outside a quoted phrase. Anything
 # missing from this set reaches MATCH raw and raises, which the execute site
@@ -1121,6 +1123,10 @@ class SessionSearchMixin:
         active_clause = "" if include_inactive else " AND active = 1"
         # Match CLI/desktop: only real user turns, not timeline bookkeeping.
         display_clause = " AND (display_kind IS NULL OR display_kind = '')"
+        # Staging rows are never a user turn of any session (TS-382 D2), so the
+        # internal-session clause is unconditional: include_inactive drops only
+        # the rewind/undo visibility rule, never this exclusion.
+        staging_clause = f" AND {_internal_session_exclusion('messages')}"
         # Legacy standalone compaction handoffs (persisted pre-#80622) are
         # durable role='user' rows with NO display_kind — SQL can't see them,
         # so fetch with headroom and drop them in the decode loop below.
@@ -1132,7 +1138,7 @@ class SessionSearchMixin:
             cursor = self._conn.execute(
                 "SELECT id, timestamp, content FROM messages "
                 "WHERE session_id = ? AND role = 'user'"
-                f"{active_clause}{display_clause} "
+                f"{active_clause}{display_clause}{staging_clause} "
                 "ORDER BY id DESC LIMIT ?",
                 (session_id, fetch_limit),
             )
@@ -1373,6 +1379,9 @@ class SessionSearchMixin:
         trigram_query = " ".join(parts)
         tri_where = [f"{table} MATCH ?"]
         tri_params: list = [trigram_query]
+        # Internal publication staging rows are never a public search result,
+        # including under include_inactive (TS-382 design D2).
+        tri_where.append(_internal_session_exclusion())
         if not include_inactive:
             tri_where.append("(m.active = 1 OR m.compacted = 1)")
         if source_filter is not None:
@@ -1560,6 +1569,9 @@ class SessionSearchMixin:
             return []
 
         where = [f"({predicate})"]
+        # Internal publication staging rows are never a public search result,
+        # including under include_inactive (TS-382 design D2).
+        where.append(_internal_session_exclusion())
         if not include_inactive:
             where.append("(m.active = 1 OR m.compacted = 1)")
         if source_filter is not None:
@@ -1809,6 +1821,9 @@ class SessionSearchMixin:
         # Build WHERE clauses dynamically
         where_clauses = ["messages_fts MATCH ?"]
         params: list = [query]
+        # Internal publication staging rows are never a public search result,
+        # including under include_inactive (TS-382 design D2).
+        where_clauses.append(_internal_session_exclusion())
         if not include_inactive:
             # Live rows (active=1) AND compaction-archived rows (compacted=1)
             # are discoverable; only rewind/undo rows (active=0, compacted=0)
@@ -1911,6 +1926,9 @@ class SessionSearchMixin:
                 cjk_query = " ".join(parts)
                 cjk_where = ["messages_fts_cjk MATCH ?"]
                 cjk_params: list = [cjk_query]
+                # Internal publication staging rows are never a public search result,
+                # including under include_inactive (TS-382 design D2).
+                cjk_where.append(_internal_session_exclusion())
                 if not include_inactive:
                     cjk_where.append("(m.active = 1 OR m.compacted = 1)")
                 if source_filter is not None:
@@ -1999,6 +2017,9 @@ class SessionSearchMixin:
                 trigram_query = " ".join(parts)
                 tri_where = ["messages_fts_trigram MATCH ?"]
                 tri_params: list = [trigram_query]
+                # Internal publication staging rows are never a public search result,
+                # including under include_inactive (TS-382 design D2).
+                tri_where.append(_internal_session_exclusion())
                 if not include_inactive:
                     tri_where.append("(m.active = 1 OR m.compacted = 1)")
                 if source_filter is not None:
@@ -2089,6 +2110,9 @@ class SessionSearchMixin:
                     )
                     like_params += [f"%{esc}%", f"%{esc}%", f"%{esc}%"]
                 like_where = [f"({' OR '.join(token_clauses)})"]
+                # Internal publication staging rows are never a public search result,
+                # including under include_inactive (TS-382 design D2).
+                like_where.append(_internal_session_exclusion())
                 if not include_inactive:
                     # Same visibility rule as the FTS5 paths: live rows and
                     # compaction-archived rows are discoverable; rewind/undo
@@ -2268,6 +2292,9 @@ class SessionSearchMixin:
                 "OR m.tool_calls LIKE ? ESCAPE '\\')"
             )
             params += [f"%{esc}%"] * 3
+        # Internal publication staging rows are never a public search result,
+        # including under include_inactive (TS-382 design D2).
+        where.append(_internal_session_exclusion())
         if not include_inactive:
             where.append("(m.active = 1 OR m.compacted = 1)")
         if source_filter is not None:

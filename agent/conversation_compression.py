@@ -3415,13 +3415,22 @@ def compress_context(
                     from agent.context_compressor import (
                         PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY,
                     )
+                    from hermes_state_compaction import (
+                        invoke_archive_and_compact,
+                    )
 
-                    agent._session_db.archive_and_compact(
+                    # This path already holds the session's compression lease
+                    # (_lock_holder): hand it to the bounded publisher so every
+                    # staged batch and the cutover verify it is still ours, and
+                    # so an out-of-tree store still receives the historic call.
+                    invoke_archive_and_compact(
+                        agent._session_db,
                         agent.session_id,
                         compressed,
                         model_config_patch={
                             PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: None,
                         },
+                        known_holder=_lock_holder,
                     )
                     split_status = "in_place_committed"
                     # Reset the flush identity set so the next turn's appends are
