@@ -1454,6 +1454,35 @@ async def vision_analyze_tool(
                     f"or compress the image manually."
                 )
 
+        # Proactive embed cap — same policy the native fast path applies above.
+        # The provider enforces a per-side ceiling INDEPENDENTLY of the byte
+        # size, so a small-byte tall screenshot (e.g. 800x40000 at 0.2 MB)
+        # passes every byte check yet is rejected on its *decode* limit.  The
+        # reactive retry below cannot recover that class: the client-visible
+        # detail carries no size semantics for the classifier, and the payload
+        # is far under the 5 MB resize target.  Resize DOWN to the embed
+        # target (4 MB / 7900px, headroom under both ceilings) whenever the
+        # encoded payload exceeds either bound, before the first request.
+        # Within-bounds images are sent byte-identical — no resize, no
+        # re-encode.
+        _over_bytes = len(image_data_url) > _EMBED_TARGET_BYTES
+        _over_dims = await _run_encode_on_cpu_executor(
+            _image_exceeds_dimension, temp_image_path, _EMBED_MAX_DIMENSION,
+        )
+        if _over_bytes or _over_dims:
+            logger.info(
+                "Image exceeds proactive embed cap (%.1f MB, max_dimension=%s); "
+                "resizing before the first vision request...",
+                len(image_data_url) / (1024 * 1024), _EMBED_MAX_DIMENSION,
+            )
+            image_data_url = await _run_encode_on_cpu_executor(
+                _resize_image_for_vision,
+                temp_image_path, mime_type=detected_mime_type,
+                max_base64_bytes=_EMBED_TARGET_BYTES,
+                max_dimension=_EMBED_MAX_DIMENSION,
+                scale_out=_scale_info,
+            )
+
         debug_call_data["image_size_bytes"] = image_size_bytes
         
         # Use the prompt as provided (model_tools.py now handles full description formatting)
