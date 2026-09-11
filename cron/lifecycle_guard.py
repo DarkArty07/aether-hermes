@@ -656,35 +656,17 @@ def contains_gateway_lifecycle_command_or_referenced_script(
 
 
 def _resolve_script_path(script_path: str) -> Optional[Path]:
-    """Resolve a cron ``script`` value the same way the scheduler does.
+    """Resolve a cron ``script`` or ``monitor_script`` value (#372).
 
-    The scheduler (``cron.scheduler``) resolves a bare/relative script path
-    under ``<HERMES_HOME>/scripts/`` and only accepts absolute paths as-is.
-    We MUST mirror that here so the guard scans the file that will actually
-    run — otherwise a job whose script lives at the scheduler's real location
-    (``~/.hermes/scripts/restart.sh``) but is passed as the bare name
-    ``restart.sh`` would read as a nonexistent relative path and silently
-    scan prompt-only content, letting the command through.
-
-    Returns ``None`` for values that cannot be a real path (NUL bytes,
-    unexpandable ``~``) — the same ingestion contract as
-    ``_expand_candidate_path``; such a value can never name a file the
-    scheduler would execute, so there is nothing to scan.
+    Uses the shared profile-scoped script root resolver so the guard scans
+    the file that execution will actually run under the active profile.
     """
-    from hermes_constants import get_hermes_home
+    from cron.script_root import resolve_cron_script_path
 
-    raw = _expand_candidate_path(script_path)
-    if raw is None:
+    resolved, err = resolve_cron_script_path(script_path, for_execution=False)
+    if err or resolved is None:
         return None
-    if raw.is_absolute():
-        return raw
-    try:
-        return get_hermes_home() / "scripts" / raw
-    except (RuntimeError, OSError):
-        # get_hermes_home() falls back to Path.home(), which raises when
-        # neither HERMES_HOME nor HOME is resolvable (launchd/systemd
-        # environments) — same ingestion contract: nothing to scan.
-        return None
+    return resolved
 
 
 def _read_script_for_scanning(script_path: str) -> str:
@@ -706,25 +688,22 @@ def _read_script_for_scanning(script_path: str) -> str:
 def check_gateway_lifecycle(
     prompt: Optional[str],
     script: Optional[str] = None,
+    monitor_script: Optional[str] = None,
 ) -> None:
-    """Raise ``GatewayLifecycleBlocked`` if *prompt* or *script* contains a
-    gateway-lifecycle command pattern.
+    """Raise ``GatewayLifecycleBlocked`` if *prompt*, *script*, or *monitor_script* contains
+    a gateway-lifecycle command pattern.
 
-    ``prompt`` is scanned directly.  ``script``, when supplied, is read from
-    disk and concatenated for the scan.  Both are considered together so a
-    job cannot slip through by splitting the command across the prompt and
-    the script.
-
-    Callers should let the exception propagate when they want the create to
-    fail with a ``ValueError``-shaped error (the agent's ``cronjob`` tool
-    surfaces this as a tool error; the CLI prints it in red and exits 1).
+    ``prompt`` is scanned directly. ``script`` and ``monitor_script``, when supplied,
+    are read from disk and concatenated for the scan.
     """
     combined = prompt or ""
     python_script = False
-    if script:
-        resolved_script = _resolve_script_path(script)
-        python_script = resolved_script is not None and resolved_script.suffix == ".py"
-        script_text = _read_script_for_scanning(script)
+    scripts_to_scan = [s for s in (script, monitor_script) if s]
+    for s in scripts_to_scan:
+        resolved_script = _resolve_script_path(s)
+        if resolved_script is not None and resolved_script.suffix == ".py":
+            python_script = True
+        script_text = _read_script_for_scanning(s)
         if script_text:
             combined = f"{combined}\n{script_text}"
 
@@ -740,7 +719,8 @@ def check_gateway_lifecycle(
         # via the lifecycle-shaped sentinel in _read_script_for_scanning.
         unsafe = _lifecycle_command_scan_with_data_exemption(combined)
     else:
-        script_dir = _resolve_script_directory(script) if script else None
+        first_script = scripts_to_scan[0] if scripts_to_scan else None
+        script_dir = _resolve_script_directory(first_script) if first_script else None
         unsafe = contains_gateway_lifecycle_command_or_referenced_script(
             combined,
             cwd=script_dir,
