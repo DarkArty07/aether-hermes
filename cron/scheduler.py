@@ -4601,6 +4601,12 @@ def run_job(
     _cron_session_var = _VAR_MAP["HERMES_CRON_SESSION"]
     _cron_session_token = None
     _non_dispatcher_token = None
+    _notif_token = None
+    try:
+        from gateway.session_context import set_kanban_notification_origin
+        _notif_token = set_kanban_notification_origin(job.get("notification_origin"))
+    except Exception:
+        pass
     try:
         if not _cwd_lock_acquired:
             # Fail closed (#79768): running without the lock would let a
@@ -5465,6 +5471,12 @@ def run_job(
         clear_session_vars(_ctx_tokens)
         if _cron_session_token is not None:
             _cron_session_var.reset(_cron_session_token)
+        if _notif_token is not None:
+            try:
+                from gateway.session_context import reset_kanban_notification_origin
+                reset_kanban_notification_origin(_notif_token)
+            except Exception:
+                pass
         if _non_dispatcher_token is not None:
             exit_non_dispatcher_owned_context(_non_dispatcher_token)
         for _var_name in _cron_delivery_vars:

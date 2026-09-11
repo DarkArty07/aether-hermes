@@ -1768,10 +1768,18 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
 
     platform = ""
     chat_id = ""
+    notifier_profile = ""
     try:
         from gateway.session_context import get_session_env
-        platform = get_session_env("HERMES_SESSION_PLATFORM", "")
-        chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
+        platform = (
+            get_session_env("HERMES_SESSION_PLATFORM", "")
+            or os.environ.get("HERMES_SESSION_PLATFORM", "")
+        )
+        chat_id = (
+            get_session_env("HERMES_SESSION_CHAT_ID", "")
+            or os.environ.get("HERMES_SESSION_CHAT_ID", "")
+        )
+        ui_session_id = None
         if not platform or not chat_id:
             # TUI / desktop fallback: platform/chat_id ContextVars are
             # cleared for TUI sessions, but the parent process exports
@@ -1791,20 +1799,82 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
                 or os.environ.get("HERMES_SESSION_KEY", "")
             )
             if not session_key:
-                return False  # CLI / cron / test — no persistent channel
-            platform = "tui"
-            chat_id = session_key
+                # Ordinary inbound session routing is absent (e.g. in cron run).
+                # Check for request-local notification origin from cron (#393).
+                from gateway.session_context import get_kanban_notification_origin
+                notif_origin = get_kanban_notification_origin()
+                if not notif_origin or not isinstance(notif_origin, dict):
+                    return False  # CLI / cron / test — no persistent channel
+
+                notif_platform = str(notif_origin.get("platform") or "").strip()
+                notif_chat_id = str(notif_origin.get("chat_id") or notif_origin.get("session_key") or "").strip()
+                if not notif_platform or not notif_chat_id:
+                    return False
+
+                platform = notif_platform
+                chat_id = notif_chat_id
+                chat_type = notif_origin.get("chat_type")
+                thread_id = notif_origin.get("thread_id")
+                user_id = notif_origin.get("user_id")
+                user_id_alt = notif_origin.get("user_id_alt")
+                message_id = notif_origin.get("message_id") or ""
+                notifier_profile = notif_origin.get("notifier_profile") or ""
+                ui_session_id = notif_origin.get("ui_session_id")
+            else:
+                platform = "tui"
+                chat_id = session_key
         is_gateway_session = platform != "tui"
-        chat_type = get_session_env("HERMES_SESSION_CHAT_TYPE", "") or None
-        delivery_mode = "notify+wake" if is_gateway_session else None
-        thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "") or None
-        user_id = get_session_env("HERMES_SESSION_USER_ID", "") or None
-        user_id_alt = get_session_env("HERMES_SESSION_USER_ID_ALT", "") or None
-        message_id = get_session_env("HERMES_SESSION_MESSAGE_ID", "") or ""
-        notifier_profile = (
-            get_session_env("HERMES_SESSION_PROFILE", "")
-            or os.environ.get("HERMES_PROFILE")
+        chat_type = (
+            chat_type
+            if (not platform or not chat_id)
+            else (
+                get_session_env("HERMES_SESSION_CHAT_TYPE", "")
+                or os.environ.get("HERMES_SESSION_CHAT_TYPE", "")
+                or None
+            )
         )
+        delivery_mode = "notify+wake" if is_gateway_session else None
+        thread_id = (
+            thread_id
+            if (not platform or not chat_id)
+            else (
+                get_session_env("HERMES_SESSION_THREAD_ID", "")
+                or os.environ.get("HERMES_SESSION_THREAD_ID", "")
+                or None
+            )
+        )
+        user_id = (
+            user_id
+            if (not platform or not chat_id)
+            else (
+                get_session_env("HERMES_SESSION_USER_ID", "")
+                or os.environ.get("HERMES_SESSION_USER_ID", "")
+                or None
+            )
+        )
+        user_id_alt = (
+            user_id_alt
+            if (not platform or not chat_id)
+            else (
+                get_session_env("HERMES_SESSION_USER_ID_ALT", "")
+                or os.environ.get("HERMES_SESSION_USER_ID_ALT", "")
+                or None
+            )
+        )
+        message_id = (
+            message_id
+            if (not platform or not chat_id)
+            else (
+                get_session_env("HERMES_SESSION_MESSAGE_ID", "")
+                or os.environ.get("HERMES_SESSION_MESSAGE_ID", "")
+                or ""
+            )
+        )
+        if not notifier_profile:
+            notifier_profile = (
+                get_session_env("HERMES_SESSION_PROFILE", "")
+                or os.environ.get("HERMES_PROFILE")
+            )
         if not notifier_profile:
             try:
                 from hermes_cli.profiles import get_active_profile_name
@@ -1812,6 +1882,8 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
             except Exception:
                 notifier_profile = "default"
         delivery_metadata: dict[str, Any] = {}
+        if ui_session_id:
+            delivery_metadata["ui_session_id"] = ui_session_id
         if thread_id:
             delivery_metadata["thread_id"] = thread_id
         if chat_type:

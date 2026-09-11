@@ -38,7 +38,7 @@ needs to replace the import + call site:
 
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import Any, Iterator
+from typing import Any, Iterator, Optional
 
 # Sentinel to distinguish "never set in this context" from "explicitly set to empty".
 # When a contextvar holds _UNSET, we fall back to os.environ (CLI/cron compat).
@@ -156,6 +156,29 @@ _VAR_MAP = {
     "HERMES_CRON_AUTO_DELIVER_CHAT_ID": _CRON_AUTO_DELIVER_CHAT_ID,
     "HERMES_CRON_AUTO_DELIVER_THREAD_ID": _CRON_AUTO_DELIVER_THREAD_ID,
 }
+
+# Request-local commissioning notification origin for cron-commissioned Kanban subscriptions (#393).
+_KANBAN_NOTIFICATION_ORIGIN: ContextVar = ContextVar("HERMES_KANBAN_NOTIFICATION_ORIGIN", default=None)
+
+
+def set_kanban_notification_origin(origin: Optional[dict]) -> Any:
+    """Set request-local commissioning notification origin for cron-commissioned Kanban subscriptions (#393)."""
+    return _KANBAN_NOTIFICATION_ORIGIN.set(origin)
+
+
+def get_kanban_notification_origin() -> Optional[dict]:
+    """Get request-local commissioning notification origin, or None."""
+    val = _KANBAN_NOTIFICATION_ORIGIN.get()
+    return val if isinstance(val, dict) else None
+
+
+def reset_kanban_notification_origin(token: Any) -> None:
+    """Reset the request-local commissioning notification origin token."""
+    if token is not None:
+        try:
+            _KANBAN_NOTIFICATION_ORIGIN.reset(token)
+        except Exception:
+            _KANBAN_NOTIFICATION_ORIGIN.set(None)
 
 
 def set_current_session_id(session_id: str) -> None:

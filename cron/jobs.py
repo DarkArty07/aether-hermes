@@ -1648,6 +1648,36 @@ def _validate_job_mode_invariants(
         )
 
 
+def _normalize_notification_origin(origin: Any) -> Optional[Dict[str, Any]]:
+    """Normalize and validate a trusted commissioning notification origin (#393)."""
+    if not origin or not isinstance(origin, dict):
+        return None
+    platform = str(origin.get("platform") or "").strip()
+    chat_id = str(origin.get("chat_id") or origin.get("session_key") or "").strip()
+    if not platform or not chat_id:
+        return None
+    if any(c in platform or c in chat_id for c in ("\n", "\r", "\0")):
+        return None
+    normalized: Dict[str, Any] = {
+        "platform": platform,
+        "chat_id": chat_id,
+    }
+    if platform == "tui":
+        normalized["session_key"] = str(origin.get("session_key") or chat_id).strip()
+        ui_session_id = str(origin.get("ui_session_id") or "").strip()
+        if ui_session_id:
+            normalized["ui_session_id"] = ui_session_id
+    else:
+        for k in ("chat_type", "thread_id", "user_id", "user_id_alt", "message_id"):
+            v = str(origin.get(k) or "").strip()
+            if v:
+                normalized[k] = v
+    prof = str(origin.get("notifier_profile") or "").strip()
+    if prof:
+        normalized["notifier_profile"] = prof
+    return normalized
+
+
 def create_job(
     prompt: Optional[str],
     schedule: str,
@@ -1668,6 +1698,7 @@ def create_job(
     attach_to_session: Optional[bool] = None,
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
+    notification_origin: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -1861,6 +1892,7 @@ def create_job(
         # Delivery configuration
         "deliver": deliver,
         "origin": origin,  # Tracks where job was created for "origin" delivery
+        "notification_origin": _normalize_notification_origin(notification_origin),
         "enabled_toolsets": normalized_toolsets,
         "workdir": normalized_workdir,
     }
@@ -1974,6 +2006,9 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     _mv = updates[_mon_field]
                     _mv = str(_mv).strip() if isinstance(_mv, str) else None
                     updates[_mon_field] = _mv or None
+
+            if "notification_origin" in updates:
+                updates["notification_origin"] = _normalize_notification_origin(updates["notification_origin"])
 
             previous_inference_axes = _normalized_inference_axes(job)
             updated = _apply_skill_fields({**job, **updates})
