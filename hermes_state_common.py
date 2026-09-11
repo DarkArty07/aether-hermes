@@ -264,6 +264,33 @@ COMPACTION_PUBLICATION_MAX_ROUNDS = 8
 COMPACTION_PUBLICATION_LEASE_S = 300.0
 
 
+def _internal_session_exclusion(alias: str = "m") -> str:
+    """SQL predicate excluding internal transcript-publication staging rows.
+
+    ``archive_and_compact`` stages a rewritten transcript as hidden rows of an
+    internal session (``hermes-compaction-stage-v1-*``, ``hidden=1``,
+    ``archived=1``, ``active=0, compacted=0``). Flag-based visibility alone
+    hides them from the default paths, but the explicit ``include_inactive``
+    mode deliberately drops that filter — a staging session id must never
+    surface through ANY public read variant, so every query adds this clause
+    unconditionally (hermes_state_search's seven search paths,
+    ``get_messages``, ``get_messages_as_conversation``, ``get_messages_around``,
+    ``list_recent_user_messages``, ``find_pr_url_messages``, ``message_count``).
+    The prefix constant is LIKE-safe by construction (no ``_``/``%``).
+    """
+    return f"{alias}.session_id NOT LIKE '{COMPACTION_STAGING_SESSION_PREFIX}%'"
+
+
+def _internal_session_id_exclusion(alias: str = "s") -> str:
+    """SQL predicate excluding internal staging sessions themselves.
+
+    Sessions-table sibling of :func:`_internal_session_exclusion`: a staging
+    session must not appear in public listing, counting or by-id lookup
+    surfaces, including their explicit hidden/archived modes (TS-382 D2).
+    """
+    return f"{alias}.id NOT LIKE '{COMPACTION_STAGING_SESSION_PREFIX}%'"
+
+
 _FTS_TRIGGERS = (
     "messages_fts_insert",
     "messages_fts_delete",

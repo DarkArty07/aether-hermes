@@ -72,6 +72,27 @@ def _messages(count: int, tag: str, tool: bool = True) -> List[Dict[str, Any]]:
     return [_message(i, tag, tool) for i in range(count)]
 
 
+def _staged_replacement() -> List[Dict[str, Any]]:
+    """Replacement rows that WOULD surface publicly if staging leaked.
+
+    The tool rows exercise the search/transcript paths; the trailing user row
+    and PR-url tool row make the ``list_recent_user_messages`` and
+    ``find_pr_url_messages`` assertions non-vacuous (those paths return nothing
+    for tool-only content regardless of the exclusion).
+    """
+    rows = _messages(300, "needle-stage")
+    rows.append({"role": "user", "content": "needle-stage user turn"})
+    rows.append(
+        {
+            "role": "tool",
+            "content": "needle-stage pr https://github.com/DarkArty07/aether-hermes/pull/999",
+            "tool_name": "run_shell",
+            "tool_call_id": "call-needle-pr",
+        }
+    )
+    return rows
+
+
 def _mkdb(tmp_path: Path, *, legacy: bool = False) -> SessionDB:
     db = SessionDB(tmp_path / "state.db")
     db.create_session(SESSION_ID, source="tui")
@@ -167,11 +188,15 @@ def _seed_marker(
     return marker
 
 
-class _PauseAfterFirstBatch:
-    """Pause a publication after its first committed staging batch.
+class _PauseInsideFirstBatch:
+    """Pause a publication INSIDE its first staging batch, before it commits.
 
-    Lets a test observe the staged-but-unpublished state deterministically
-    (a real barrier, not a sleep).
+    The ownership claim (the staging session row) is already committed when the
+    pause is reached; this batch's message rows are not — the pause sits after
+    the insert call and before the flags UPDATE + COMMIT, inside
+    ``_execute_write``'s transaction. Lets a test observe that pre-commit state
+    deterministically (a real barrier, not a sleep). To assert against
+    COMMITTED staged rows, use ``_PauseAfterWriteCall`` instead.
     """
 
     def __init__(self, db: SessionDB, calls: int = 1) -> None:
@@ -317,10 +342,20 @@ def test_publication_uses_several_bounded_transactions(tmp_path):
 
 @pytest.mark.parametrize("legacy", [False, True])
 def test_staged_rows_are_invisible_while_publishing(tmp_path, legacy):
+    """No committed staging row reaches a transcript/search read, in any mode.
+
+    The barrier pauses AFTER the claim and the first staging batch have
+    COMMITTED, and every surface is read through a FRESH ``SessionDB`` (its own
+    pooled read connection). The assertions are therefore made against real
+    persisted staging state — they fail if the exclusion is missing — not
+    against an uncommitted buffer. The publisher holds neither the instance
+    lock nor SQLite's writer lock at the pause point.
+    """
     db = _mkdb(tmp_path, legacy=legacy)
+    db.append_message(SESSION_ID, role="user", content="old user turn")
     old_live = _live(db)
-    barrier = _PauseAfterFirstBatch(db)
-    replacement = _messages(300, "needle-stage")
+    barrier = _PauseAfterWriteCall(db, after_calls=2)
+    replacement = _staged_replacement()
     errors: List[BaseException] = []
 
     def publish():
@@ -331,37 +366,61 @@ def test_staged_rows_are_invisible_while_publishing(tmp_path, legacy):
 
     thread = threading.Thread(target=publish)
     thread.start()
+    reader: Optional[SessionDB] = None
     try:
-        assert barrier.entered.wait(30.0), "publication never staged a batch"
-
-        # Target's visible transcript is untouched.
-        assert _live(db) == old_live, "visible transcript changed during staging"
-        # No reader variant may expose the staged text or the staging session.
-        assert not db.search_messages("needle-stage"), "staged text is searchable"
-        assert not db.search_messages("needle-stage", include_inactive=True)
-        assert not db.search_messages("needle-stage", role_filter=["tool"])
-        staged_ids = _staging_sessions(db)
-        assert staged_ids, "no staging session created"
-        for staging_id in staged_ids:
-            assert db.get_messages(staging_id) == []
-            assert db.get_messages(staging_id, include_inactive=True) == []
-            assert db.search_messages(
-                "needle-stage", include_inactive=True
-            ) == [] or all(
-                match.get("session_id") != staging_id
-                for match in db.search_messages(
-                    "needle-stage", include_inactive=True
-                )
-            )
-        listed = {row["id"] for row in db.list_sessions_rich(limit=200)}
-        assert not (set(staged_ids) & listed), "staging session leaked into listing"
-        counts = db._conn.execute(
-            "SELECT COUNT(*) FROM messages WHERE session_id IN "
-            f"({','.join('?' for _ in staged_ids)})",
-            staged_ids,
+        assert barrier.entered.wait(30.0), "publication never committed a staging batch"
+        reader = SessionDB(tmp_path / "state.db")
+        raw_conn = reader._conn
+        assert raw_conn is not None
+        staged_ids = _staging_sessions(reader)
+        assert len(staged_ids) == 1, "no committed staging session"
+        staging_id = staged_ids[0]
+        committed_rows = raw_conn.execute(
+            "SELECT COUNT(*) FROM messages WHERE session_id = ?", (staging_id,)
         ).fetchone()[0]
-        assert counts > 0, "expected staged rows to exist"
+        assert committed_rows > 0, (
+            "barrier must sit after a COMMITTED staging batch or these "
+            "assertions pass vacuously"
+        )
+        flags = {
+            (row[0], row[1])
+            for row in raw_conn.execute(
+                "SELECT DISTINCT active, compacted FROM messages WHERE session_id = ?",
+                (staging_id,),
+            ).fetchall()
+        }
+        assert flags == {(0, 0)}, f"committed staging rows carry flags {flags}"
+        staged_row_id = raw_conn.execute(
+            "SELECT id FROM messages WHERE session_id = ? ORDER BY id LIMIT 1",
+            (staging_id,),
+        ).fetchone()[0]
+
+        # Transcript surfaces: explicit inactive mode must not expose staging rows.
+        assert reader.get_messages(staging_id) == []
+        assert reader.get_messages(staging_id, include_inactive=True) == []
+        assert reader.get_messages_as_conversation(staging_id, include_inactive=True) == []
+        assert reader.get_messages_around(staging_id, staged_row_id)["window"] == []
+        assert reader.list_recent_user_messages(staging_id, include_inactive=True) == []
+
+        # Search surfaces: default and explicit inactive mode.
+        assert reader.search_messages("needle-stage") == []
+        assert reader.search_messages("needle-stage", include_inactive=True) == []
+        assert (
+            reader.search_messages(
+                "needle-stage", role_filter=["tool"], include_inactive=True
+            )
+            == []
+        )
+
+        # Control: the same surfaces DO see the target's own committed rows, so
+        # the emptiness above is caused by the exclusion, not by a dead query.
+        assert reader.get_messages(SESSION_ID, include_inactive=True) == old_live
+        assert reader.list_recent_user_messages(SESSION_ID, include_inactive=True)
+        assert reader.search_messages("old", include_inactive=True)
+        assert reader.get_messages_around(SESSION_ID, old_live[-1]["id"])["window"]
     finally:
+        if reader is not None:
+            reader.close()
         barrier.release()
         thread.join(timeout=60.0)
 
@@ -374,9 +433,9 @@ def test_staged_rows_are_invisible_while_publishing(tmp_path, legacy):
 
 
 def test_staged_text_invisible_when_fts_is_disabled(tmp_path):
-    """The explicit inactive mode must not expose staging rows either."""
+    """The LIKE fallback path must not expose committed staging rows either."""
     db = _mkdb(tmp_path)
-    barrier = _PauseAfterFirstBatch(db)
+    barrier = _PauseAfterWriteCall(db, after_calls=2)
     errors: List[BaseException] = []
 
     def publish():
@@ -387,13 +446,165 @@ def test_staged_text_invisible_when_fts_is_disabled(tmp_path):
 
     thread = threading.Thread(target=publish)
     thread.start()
+    reader: Optional[SessionDB] = None
     try:
-        assert barrier.entered.wait(30.0)
-        db._fts_stale = True  # force the LIKE fallback paths
-        assert not db.search_messages("needle-fts-off", include_inactive=True)
+        assert barrier.entered.wait(30.0), "publication never committed a staging batch"
+        reader = SessionDB(tmp_path / "state.db")
+        staged_ids = _staging_sessions(reader)
+        assert len(staged_ids) == 1
+        staging_id = staged_ids[0]
+        raw_conn = reader._conn
+        assert raw_conn is not None
+        assert (
+            raw_conn.execute(
+                "SELECT COUNT(*) FROM messages WHERE session_id = ?", (staging_id,)
+            ).fetchone()[0]
+            > 0
+        ), "no committed staging rows to test the fallback against"
+        reader._fts_stale = True  # force the LIKE fallback paths
+        assert reader.search_messages("needle-fts-off") == []
+        assert reader.search_messages("needle-fts-off", include_inactive=True) == []
+        assert reader.get_messages(staging_id, include_inactive=True) == []
+        # Control: the fallback path still answers for the target's own rows.
+        assert reader.search_messages("old")
+    finally:
+        if reader is not None:
+            reader.close()
+        barrier.release()
+        thread.join(timeout=60.0)
+    assert not errors, f"publication failed: {errors[0]!r}"
+    db.close()
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_staging_session_is_invisible_to_listing_counts_and_lookup(tmp_path, legacy):
+    """No listing, count or by-id lookup mode may surface the staging session.
+
+    Same commit-boundary barrier as the transcript test: the staging session
+    row and its first batch are committed before every assertion, and the
+    reader is a fresh ``SessionDB``. Counts are compared against the exact
+    pre-publication values, so a staging session appearing in any of them is a
+    hard failure rather than a shifted expectation.
+    """
+    db = _mkdb(tmp_path, legacy=legacy)
+    before = {
+        "all": db.session_count(include_archived=True),
+        "archived_only": db.session_count(archived_only=True),
+        "by_source": db.session_count_by_source(include_archived=True),
+        "ge2": db.session_count_ge(2),
+    }
+    assert before == {
+        "all": 1,
+        "archived_only": 0,
+        "by_source": {"tui": 1},
+        "ge2": False,
+    }, f"unexpected pre-publication counts: {before}"
+    barrier = _PauseAfterWriteCall(db, after_calls=2)
+    errors: List[BaseException] = []
+
+    def publish():
+        try:
+            _publish(db, _staged_replacement())
+        except BaseException as exc:  # pragma: no cover
+            errors.append(exc)
+
+    thread = threading.Thread(target=publish)
+    thread.start()
+    reader: Optional[SessionDB] = None
+    try:
+        assert barrier.entered.wait(30.0), "publication never committed a staging batch"
+        reader = SessionDB(tmp_path / "state.db")
+        raw_conn = reader._conn
+        assert raw_conn is not None
+        staged_ids = _staging_sessions(reader)
+        assert len(staged_ids) == 1
+        staging_id = staged_ids[0]
+        assert (
+            raw_conn.execute(
+                "SELECT COUNT(*) FROM messages WHERE session_id = ?", (staging_id,)
+            ).fetchone()[0]
+            > 0
+        ), "no committed staging rows to test listing/counting against"
+
+        listed = {
+            row["id"]
+            for row in reader.list_sessions_rich(
+                limit=500, include_hidden=True, include_archived=True
+            )
+        }
+        assert SESSION_ID in listed, "target session missing from the listing"
+        assert staging_id not in listed, "staging session leaked into the listing"
+
+        searched = {row["id"] for row in reader.search_sessions(limit=500)}
+        assert SESSION_ID in searched
+        assert staging_id not in searched, "staging session leaked into search_sessions"
+
+        assert reader.session_count(include_archived=True) == before["all"]
+        assert reader.session_count(archived_only=True) == before["archived_only"]
+        assert (
+            reader.session_count_by_source(include_archived=True) == before["by_source"]
+        )
+        assert reader.session_count_ge(2) is before["ge2"]
+
+        assert reader.get_session(staging_id) is None, "staging session is lookupable"
+        assert reader.get_session(SESSION_ID) is not None
+        assert reader.export_session(staging_id) is None, "staging session is exportable"
+        assert reader.find_pr_url_messages([staging_id]) == [], (
+            "staged content is reachable through the PR scan"
+        )
+        assert reader.message_count(staging_id) == 0, (
+            "staged rows are counted for the staging session"
+        )
+        # Control: the target's own export remains intact.
+        export = reader.export_session(SESSION_ID)
+        assert export is not None and export["messages"]
+    finally:
+        if reader is not None:
+            reader.close()
+        barrier.release()
+        thread.join(timeout=60.0)
+
+    assert not errors, f"publication failed: {errors[0]!r}"
+    db.close()
+
+
+def test_uncommitted_first_batch_is_not_observable(tmp_path):
+    """The in-flight batch is invisible to a fresh connection before it commits.
+
+    The ownership claim (the staging session row) is committed; this batch's
+    message rows are not — the barrier sits inside that batch's transaction.
+    A fresh connection must see zero message rows for the staging session.
+    """
+    db = _mkdb(tmp_path)
+    # Open the reader BEFORE the publication starts: SessionDB.__init__ runs
+    # schema-init writes, which cannot proceed while the publisher holds the
+    # SQLite writer slot inside the batch transaction.
+    reader = SessionDB(tmp_path / "state.db")
+    barrier = _PauseInsideFirstBatch(db)
+    errors: List[BaseException] = []
+
+    def publish():
+        try:
+            _publish(db, _messages(20, "replacement"))
+        except BaseException as exc:  # pragma: no cover
+            errors.append(exc)
+
+    thread = threading.Thread(target=publish)
+    thread.start()
+    try:
+        assert barrier.entered.wait(30.0), "publication never entered a batch"
+        raw_conn = reader._conn
+        assert raw_conn is not None
+        staged_ids = _staging_sessions(reader)
+        assert len(staged_ids) == 1, "the claim must be committed before the batch"
+        visible = raw_conn.execute(
+            "SELECT COUNT(*) FROM messages WHERE session_id = ?", (staged_ids[0],)
+        ).fetchone()[0]
+        assert visible == 0, "an uncommitted staging batch is observable"
     finally:
         barrier.release()
         thread.join(timeout=60.0)
+        reader.close()
     assert not errors, f"publication failed: {errors[0]!r}"
     db.close()
 

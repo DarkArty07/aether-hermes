@@ -57,6 +57,8 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     _RESET_END_REASONS,
     _RESET_END_REASONS_SQL,
     _ephemeral_child_sql,
+    _internal_session_exclusion,
+    _internal_session_id_exclusion,
     _legacy_reset_child_sql,
     _shape_preview,
     _sql_session_last_active,
@@ -7740,7 +7742,7 @@ class SessionDB(
                 "COALESCE(sp.prompt, s.system_prompt) AS _system_prompt_resolved "
                 "FROM sessions s "
                 "LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash "
-                "WHERE s.id = ?",
+                f"WHERE s.id = ? AND {_internal_session_id_exclusion()}",
                 (session_id,),
             )
             row = cursor.fetchone()
@@ -7760,7 +7762,9 @@ class SessionDB(
         escaped = _escape_like(session_id_or_prefix)
         with self._lock:
             cursor = self._conn.execute(
-                "SELECT id FROM sessions WHERE id LIKE ? ESCAPE '\\' ORDER BY started_at DESC LIMIT 2",
+                "SELECT id FROM sessions WHERE id LIKE ? ESCAPE '\\' "
+                f"AND {_internal_session_id_exclusion('sessions')} "
+                "ORDER BY started_at DESC LIMIT 2",
                 (f"{escaped}%",),
             )
             matches = [row["id"] for row in cursor.fetchall()]
@@ -8578,6 +8582,10 @@ class SessionDB(
             where_clauses.append("s.archived = 0")
         if not include_hidden:
             where_clauses.append("s.hidden = 0")
+        # Internal staging sessions are never a public listing row: the modes
+        # above (hidden/archived) are caller-controlled, so the reserved
+        # staging id is excluded unconditionally (TS-382 design D2).
+        where_clauses.append(_internal_session_id_exclusion())
 
         where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
         # Snapshot the filter params before the query builders below extend
@@ -9879,9 +9887,11 @@ class SessionDB(
         else:
             active_clause = " AND active = 1"
         keyset_clause = " AND id > ?" if after_id is not None else ""
+        staging_clause = f" AND {_internal_session_exclusion('messages')}"
         sql = (
             "SELECT * FROM messages WHERE session_id = ?"
-            f"{active_clause}{keyset_clause} ORDER BY id {'DESC' if latest else 'ASC'}"
+            f"{active_clause}{keyset_clause}{staging_clause}"
+            f" ORDER BY id {'DESC' if latest else 'ASC'}"
         )
         params: list = [session_id]
         if after_id is not None:
@@ -9898,6 +9908,7 @@ class SessionDB(
             with self._read_ctx() as conn:
                 cursor = conn.execute(
                     "SELECT * FROM messages WHERE session_id = ?" + active_clause
+                    + staging_clause
                     + " ORDER BY id ASC",
                     [session_id],
                 )
@@ -9972,6 +9983,7 @@ class SessionDB(
                     f"""SELECT session_id, content FROM messages
                         WHERE session_id IN ({placeholders})
                           AND role = 'tool' AND content LIKE '%/pull/%'
+                          AND {_internal_session_exclusion('messages')}
                         ORDER BY id ASC""",
                     chunk,
                 ).fetchall()
@@ -10008,7 +10020,8 @@ class SessionDB(
         with self._read_ctx() as conn:
             # Confirm the anchor exists in this session.
             anchor_exists = conn.execute(
-                "SELECT 1 FROM messages WHERE id = ? AND session_id = ? LIMIT 1",
+                "SELECT 1 FROM messages WHERE id = ? AND session_id = ? "
+                f"AND {_internal_session_exclusion('messages')} LIMIT 1",
                 (around_message_id, session_id),
             ).fetchone()
             if not anchor_exists:
@@ -10183,6 +10196,7 @@ class SessionDB(
             session_ids = self._session_lineage_root_to_tip(session_id)
 
         active_clause = "" if include_inactive else " AND active = 1"
+        staging_clause = f" AND {_internal_session_exclusion('messages')}"
         with self._read_ctx() as conn:
             placeholders = ",".join("?" for _ in session_ids)
             rows = conn.execute(
@@ -10196,7 +10210,7 @@ class SessionDB(
                 # after its tool response, breaking tool-call/response adjacency
                 # and triggering an HTTP 400 on replay. This matches get_messages
                 # — see c03acca50 for the original fix.
-                f"{active_clause} ORDER BY id",
+                f"{active_clause}{staging_clause} ORDER BY id",
                 tuple(session_ids),
             ).fetchall()
 
@@ -10759,6 +10773,8 @@ class SessionDB(
         )
         where_clauses = []
         params: list = []
+        # Internal staging sessions are never listed, under any mode (TS-382 D2).
+        where_clauses.append(_internal_session_id_exclusion())
         if source:
             where_clauses.append("s.source = ?")
             params.append(source)
@@ -10808,6 +10824,8 @@ class SessionDB(
         """
         where_clauses = []
         params = []
+        # Internal staging sessions are never counted, under any mode (TS-382 D2).
+        where_clauses.append(_internal_session_id_exclusion())
 
         if exclude_children:
             # Mirror list_sessions_rich's child-exclusion clause exactly so the
@@ -10854,7 +10872,11 @@ class SessionDB(
         is irrelevant.
         """
         with self._lock:
-            cursor = self._conn.execute("SELECT 1 FROM sessions LIMIT ?", (n,))
+            cursor = self._conn.execute(
+                f"SELECT 1 FROM sessions s WHERE {_internal_session_id_exclusion()} "
+                "LIMIT ?",
+                (n,),
+            )
             rows = cursor.fetchall()
         return len(rows) >= n
 
@@ -10880,6 +10902,8 @@ class SessionDB(
         """
         where_clauses = []
         params: list = []
+        # Internal staging sessions are never counted, under any mode (TS-382 D2).
+        where_clauses.append(_internal_session_id_exclusion())
 
         if exclude_children:
             where_clauses.append(_LISTABLE_CHILD_SQL)
@@ -10908,7 +10932,9 @@ class SessionDB(
         with self._lock:
             if session_id:
                 cursor = self._conn.execute(
-                    "SELECT COUNT(*) FROM messages WHERE session_id = ?", (session_id,)
+                    "SELECT COUNT(*) FROM messages WHERE session_id = ? "
+                    f"AND {_internal_session_exclusion('messages')}",
+                    (session_id,),
                 )
             else:
                 cursor = self._conn.execute("SELECT COUNT(*) FROM messages")
