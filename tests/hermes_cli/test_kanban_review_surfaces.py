@@ -233,7 +233,15 @@ def test_worker_guidance_distinguishes_same_card_and_downstream_review() -> None
 
     assert "lists child IDs" in KANBAN_GUIDANCE
     assert "inspect those cards" in KANBAN_GUIDANCE
-    assert "pre-created review, QA, or release child" in KANBAN_GUIDANCE
+    assert (
+        "A terminal integration, release, or evidence-only child alone does NOT "
+        "replace unit review"
+    ) in KANBAN_GUIDANCE
+    assert (
+        "Only when the card delivery or task graph explicitly identifies a "
+        "distinct review/QA phase child"
+    ) in KANBAN_GUIDANCE
+    assert "pre-created review, QA, or release child" not in KANBAN_GUIDANCE
     assert "call `kanban_complete`" in KANBAN_GUIDANCE
     assert "Never sticky-block that parent for `review-required`" in KANBAN_GUIDANCE
     assert "`kanban_request_changes`" in KANBAN_GUIDANCE
@@ -248,6 +256,21 @@ def test_worker_guidance_distinguishes_same_card_and_downstream_review() -> None
     assert "kanban_request_changes" in skill_text
     assert "approve" in skill_text.lower()
     assert "escalate" in skill_text.lower()
+
+
+def test_worker_guidance_terminal_child_does_not_replace_review() -> None:
+    """#385 regression: guidance must not treat terminal/release children as unit review."""
+    from agent.prompt_builder import KANBAN_GUIDANCE
+
+    assert (
+        "A terminal integration, release, or evidence-only child alone does NOT "
+        "replace unit review"
+    ) in KANBAN_GUIDANCE
+    assert (
+        "Only when the card delivery or task graph explicitly identifies a "
+        "distinct review/QA phase child"
+    ) in KANBAN_GUIDANCE
+    assert "pre-created review, QA, or release child" not in KANBAN_GUIDANCE
 
 
 def test_cli_reopen_review_is_transition_first_and_redacts_reason(
