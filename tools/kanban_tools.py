@@ -1768,43 +1768,88 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
 
     platform = ""
     chat_id = ""
+    notifier_profile = ""
+    ui_session_id = None
+    chat_type = None
+    thread_id = None
+    user_id = None
+    user_id_alt = None
+    message_id = ""
+
     try:
         from gateway.session_context import get_session_env
-        platform = get_session_env("HERMES_SESSION_PLATFORM", "")
-        chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
-        if not platform or not chat_id:
-            # TUI / desktop fallback: platform/chat_id ContextVars are
-            # cleared for TUI sessions, but the parent process exports
-            # HERMES_SESSION_KEY into the subprocess env. Treat that
-            # as a "tui" subscription so the TUI notification poller
-            # (tui_gateway/server.py) can pick it up.
-            #
-            # HERMES_SESSION_ID is intentionally NOT a fallback here:
-            # it is set by ACP / the agent subprocess for telemetry
-            # regardless of whether the parent is a TUI or a CLI, so
-            # treating it as a notification target would auto-subscribe
-            # every CLI invocation, which is exactly the over-eager
-            # behaviour that got #19718 reverted upstream. The TUI
-            # poller keys on HERMES_SESSION_KEY.
+        platform = (
+            get_session_env("HERMES_SESSION_PLATFORM", "")
+            or os.environ.get("HERMES_SESSION_PLATFORM", "")
+        )
+        chat_id = (
+            get_session_env("HERMES_SESSION_CHAT_ID", "")
+            or os.environ.get("HERMES_SESSION_CHAT_ID", "")
+        )
+        if platform and chat_id:
+            chat_type = (
+                get_session_env("HERMES_SESSION_CHAT_TYPE", "")
+                or os.environ.get("HERMES_SESSION_CHAT_TYPE", "")
+                or None
+            )
+            thread_id = (
+                get_session_env("HERMES_SESSION_THREAD_ID", "")
+                or os.environ.get("HERMES_SESSION_THREAD_ID", "")
+                or None
+            )
+            user_id = (
+                get_session_env("HERMES_SESSION_USER_ID", "")
+                or os.environ.get("HERMES_SESSION_USER_ID", "")
+                or None
+            )
+            user_id_alt = (
+                get_session_env("HERMES_SESSION_USER_ID_ALT", "")
+                or os.environ.get("HERMES_SESSION_USER_ID_ALT", "")
+                or None
+            )
+            message_id = (
+                get_session_env("HERMES_SESSION_MESSAGE_ID", "")
+                or os.environ.get("HERMES_SESSION_MESSAGE_ID", "")
+                or ""
+            )
+        else:
             session_key = (
                 get_session_env("HERMES_SESSION_KEY", "")
                 or os.environ.get("HERMES_SESSION_KEY", "")
             )
-            if not session_key:
-                return False  # CLI / cron / test — no persistent channel
-            platform = "tui"
-            chat_id = session_key
+            if session_key:
+                platform = "tui"
+                chat_id = session_key
+            else:
+                # Ordinary inbound session routing is absent (e.g. in cron run).
+                # Check for request-local notification origin from cron (#393).
+                from gateway.session_context import get_kanban_notification_origin
+                notif_origin = get_kanban_notification_origin()
+                if not notif_origin or not isinstance(notif_origin, dict):
+                    return False  # CLI / cron / test — no persistent channel
+
+                notif_platform = str(notif_origin.get("platform") or "").strip()
+                notif_chat_id = str(notif_origin.get("chat_id") or notif_origin.get("session_key") or "").strip()
+                if not notif_platform or not notif_chat_id:
+                    return False
+
+                platform = notif_platform
+                chat_id = notif_chat_id
+                chat_type = str(notif_origin["chat_type"]) if notif_origin.get("chat_type") is not None else None
+                thread_id = str(notif_origin["thread_id"]) if notif_origin.get("thread_id") is not None else None
+                user_id = str(notif_origin["user_id"]) if notif_origin.get("user_id") is not None else None
+                user_id_alt = str(notif_origin["user_id_alt"]) if notif_origin.get("user_id_alt") is not None else None
+                message_id = str(notif_origin.get("message_id") or "")
+                notifier_profile = str(notif_origin.get("notifier_profile") or "")
+                ui_session_id = notif_origin.get("ui_session_id")
+
         is_gateway_session = platform != "tui"
-        chat_type = get_session_env("HERMES_SESSION_CHAT_TYPE", "") or None
         delivery_mode = "notify+wake" if is_gateway_session else None
-        thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "") or None
-        user_id = get_session_env("HERMES_SESSION_USER_ID", "") or None
-        user_id_alt = get_session_env("HERMES_SESSION_USER_ID_ALT", "") or None
-        message_id = get_session_env("HERMES_SESSION_MESSAGE_ID", "") or ""
-        notifier_profile = (
-            get_session_env("HERMES_SESSION_PROFILE", "")
-            or os.environ.get("HERMES_PROFILE")
-        )
+        if not notifier_profile:
+            notifier_profile = (
+                get_session_env("HERMES_SESSION_PROFILE", "")
+                or os.environ.get("HERMES_PROFILE")
+            )
         if not notifier_profile:
             try:
                 from hermes_cli.profiles import get_active_profile_name
@@ -1812,10 +1857,14 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
             except Exception:
                 notifier_profile = "default"
         delivery_metadata: dict[str, Any] = {}
+        if ui_session_id:
+            delivery_metadata["ui_session_id"] = ui_session_id
         if thread_id:
             delivery_metadata["thread_id"] = thread_id
         if chat_type:
             delivery_metadata["chat_type"] = chat_type
+        if message_id:
+            delivery_metadata["message_id"] = str(message_id)
         if (
             platform.lower() == "telegram"
             and thread_id

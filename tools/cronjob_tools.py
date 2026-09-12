@@ -356,6 +356,68 @@ def _origin_from_env() -> Optional[Dict[str, str]]:
     return None
 
 
+def _capture_commissioning_origin() -> tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Capture trusted durable notification origin for cron-commissioned Kanban auto-subscription (#393).
+
+    TUI/desktop sessions capture durable session key plus optional live UI id.
+    Gateway sessions capture full stable route.
+    Unattached cron/CLI/test sessions capture nothing.
+    Malformed/stale origins fail closed and return an error message.
+    """
+    import os
+    from gateway.session_context import get_session_env
+
+    platform = (get_session_env("HERMES_SESSION_PLATFORM") or "").strip()
+    chat_id = (get_session_env("HERMES_SESSION_CHAT_ID") or "").strip()
+
+    # Check gateway origin
+    if platform or chat_id:
+        if not platform or not chat_id:
+            return None, "Malformed gateway commissioning origin: platform or chat_id is missing"
+        if any(c in platform or c in chat_id for c in ("\n", "\r", "\0")):
+            return None, "Malformed gateway commissioning origin: invalid characters"
+        return {
+            "platform": platform,
+            "chat_id": chat_id,
+            "chat_type": get_session_env("HERMES_SESSION_CHAT_TYPE") or None,
+            "thread_id": get_session_env("HERMES_SESSION_THREAD_ID") or None,
+            "user_id": get_session_env("HERMES_SESSION_USER_ID") or None,
+            "user_id_alt": get_session_env("HERMES_SESSION_USER_ID_ALT") or None,
+            "message_id": get_session_env("HERMES_SESSION_MESSAGE_ID") or None,
+            "notifier_profile": (
+                get_session_env("HERMES_SESSION_PROFILE")
+                or os.environ.get("HERMES_PROFILE")
+                or "default"
+            ),
+        }, None
+
+    # Check TUI / desktop session
+    session_key = (
+        get_session_env("HERMES_SESSION_KEY", "")
+        or os.environ.get("HERMES_SESSION_KEY", "")
+    ).strip()
+    if session_key:
+        if any(c in session_key for c in ("\n", "\r", "\0")):
+            return None, "Malformed TUI commissioning origin: invalid characters in session key"
+        ui_session_id = (
+            get_session_env("HERMES_UI_SESSION_ID", "")
+            or os.environ.get("HERMES_UI_SESSION_ID", "")
+        ).strip() or None
+        return {
+            "platform": "tui",
+            "chat_id": session_key,
+            "session_key": session_key,
+            "ui_session_id": ui_session_id,
+            "notifier_profile": (
+                get_session_env("HERMES_SESSION_PROFILE")
+                or os.environ.get("HERMES_PROFILE")
+                or "default"
+            ),
+        }, None
+
+    return None, None
+
+
 def _local_delivery_notice(job: Dict[str, Any], user_deliver: Optional[str]) -> Optional[str]:
     """Return an informational notice when a created job won't deliver anywhere.
 
@@ -579,42 +641,20 @@ def _validate_cron_base_url(
 
 
 def _validate_cron_script_path(script: Optional[str]) -> Optional[str]:
-    """Validate a cron job script path at the API boundary.
+    """Validate a cron job script path at the API boundary (#372).
 
-    Scripts must be relative paths that resolve within HERMES_HOME/scripts/.
-    Absolute paths and ~ expansion are rejected to prevent arbitrary script
-    execution via prompt injection.
+    Scripts must be relative paths that resolve within the active profile's
+    scripts directory. Absolute paths, ~ expansion, traversal, symlink escapes,
+    and non-regular files are rejected.
 
     Returns an error string if blocked, else None (valid).
     """
     if not script or not script.strip():
         return None  # empty/None = clearing the field, always OK
 
-    from hermes_constants import get_hermes_home
+    from cron.script_root import validate_cron_script_path
 
-    raw = script.strip()
-
-    # Reject absolute paths and ~ expansion at the API boundary.
-    # Only relative paths within ~/.hermes/scripts/ are allowed.
-    if raw.startswith(("/", "~")) or (len(raw) >= 2 and raw[1] == ":"):
-        return (
-            f"Script path must be relative to ~/.hermes/scripts/. "
-            f"Got absolute or home-relative path: {raw!r}. "
-            f"Place scripts in ~/.hermes/scripts/ and use just the filename."
-        )
-
-    # Validate containment after resolution
-    from tools.path_security import validate_within_dir
-
-    scripts_dir = get_hermes_home() / "scripts"
-    scripts_dir.mkdir(parents=True, exist_ok=True)
-    containment_error = validate_within_dir(scripts_dir / raw, scripts_dir)
-    if containment_error:
-        return (
-            f"Script path escapes the scripts directory via traversal: {raw!r}"
-        )
-
-    return None
+    return validate_cron_script_path(script)
 
 
 def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
@@ -658,6 +698,8 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         result["enabled_toolsets"] = job["enabled_toolsets"]
     if job.get("workdir"):
         result["workdir"] = job["workdir"]
+    if job.get("notification_origin"):
+        result["notification_origin"] = job["notification_origin"]
     return result
 
 
@@ -1232,6 +1274,8 @@ def cronjob(
                 create_job_with_scheduler_registration,
             )
 
+            notif_origin, notif_err = _capture_commissioning_origin()
+
             try:
                 job = create_job_with_scheduler_registration(
                     prompt=prompt or "",
@@ -1242,6 +1286,7 @@ def cronjob(
                         _normalize_deliver_param(deliver)
                     ),
                     origin=_origin_from_env(),
+                    notification_origin=notif_origin,
                     skills=canonical_skills,
                     model=_normalize_optional_job_value(model),
                     provider=_normalize_optional_job_value(provider),
@@ -1259,23 +1304,30 @@ def cronjob(
                 _partial = exc.to_dict()
                 return tool_error(_partial.pop("error"), success=False, **_partial)
             _create_message = f"Cron job '{job['name']}' created."
+            if notif_err:
+                _create_message = f"{_create_message} Notification origin warning: {notif_err}."
             _local_notice = _local_delivery_notice(job, _normalize_deliver_param(deliver))
             if _local_notice:
                 _create_message = f"{_create_message} {_local_notice}"
+            response_payload: Dict[str, Any] = {
+                "success": True,
+                "job_id": job["id"],
+                "name": job["name"],
+                "skill": job.get("skill"),
+                "skills": job.get("skills", []),
+                "schedule": job["schedule_display"],
+                "repeat": _repeat_display(job),
+                "deliver": job.get("deliver", "local"),
+                "next_run_at": job["next_run_at"],
+                "job": _format_job(job),
+                "message": _create_message,
+            }
+            if notif_err:
+                response_payload["notification_origin_error"] = notif_err
+            elif job.get("notification_origin"):
+                response_payload["notification_origin"] = job["notification_origin"]
             return json.dumps(
-                {
-                    "success": True,
-                    "job_id": job["id"],
-                    "name": job["name"],
-                    "skill": job.get("skill"),
-                    "skills": job.get("skills", []),
-                    "schedule": job["schedule_display"],
-                    "repeat": _repeat_display(job),
-                    "deliver": job.get("deliver", "local"),
-                    "next_run_at": job["next_run_at"],
-                    "job": _format_job(job),
-                    "message": _create_message,
-                },
+                response_payload,
                 indent=2,
             )
 
