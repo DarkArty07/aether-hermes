@@ -1242,6 +1242,7 @@ def _handle_comment(args: dict, **kw) -> str:
                         recipient=str(collaboration.get("recipient") or ""),
                         evidence_refs=collaboration.get("evidence_refs"),
                         idempotency_key=collaboration.get("idempotency_key"),
+                        run_id=_worker_run_id(tid),
                     )
                     return json.dumps(res)
                 elif action == "respond":
@@ -1252,6 +1253,7 @@ def _handle_comment(args: dict, **kw) -> str:
                         body=str(body),
                         disposition=str(collaboration.get("disposition") or ""),
                         evidence_refs=collaboration.get("evidence_refs"),
+                        run_id=_worker_run_id(tid),
                     )
                     return json.dumps(res)
                 elif action == "ack":
@@ -1771,7 +1773,7 @@ def _handle_create(args: dict, **kw) -> str:
             )
             new_task = kb.get_task(conn, new_tid)
             if collaboration == "advisory":
-                kb.opt_in_collaboration(conn, new_tid, mode="advisory", session_id=session_id)
+                kb.opt_in_collaboration(conn, new_tid, mode="advisory", session_id=session_id, board=target_board)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
             return _ok(
                 task_id=new_tid,

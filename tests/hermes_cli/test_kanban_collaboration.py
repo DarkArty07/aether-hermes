@@ -24,14 +24,57 @@ import pytest
 from hermes_cli import kanban_db as kb
 
 
+def assert_isolated_db_path(db_path: Path, expected_root: Path) -> None:
+    try:
+        resolved_path = db_path.resolve()
+        resolved_root = expected_root.resolve()
+        assert resolved_path.is_relative_to(resolved_root), (
+            f"Isolation check failed: db_path {resolved_path} is not under expected root {resolved_root}"
+        )
+    except (ValueError, AttributeError):
+        assert str(db_path.resolve()).startswith(str(expected_root.resolve())), (
+            f"Isolation check failed: db_path {db_path} is not under expected root {expected_root}"
+        )
+
+
 @pytest.fixture
 def board_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, sqlite3.Connection]:
-    """Isolated temporary board environment."""
+    """Isolated temporary board environment with explicit env scrubbing and path assertion."""
+    for var in (
+        "HERMES_KANBAN_DB",
+        "HERMES_KANBAN_BOARD",
+        "HERMES_KANBAN_TASK",
+        "HERMES_KANBAN_RUN_ID",
+        "HERMES_KANBAN_WORKSPACES_ROOT",
+    ):
+        monkeypatch.delenv(var, raising=False)
     kanban_home = tmp_path / "kanban"
     kanban_home.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(kanban_home))
+    db_path = kb.kanban_db_path(board="test_board")
+    assert_isolated_db_path(db_path, tmp_path)
     conn = kb.connect(board="test_board")
     return kanban_home, conn
+
+
+def test_board_isolation_and_env_pin_rejection(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fixture/isolation check fails when HERMES_KANBAN_DB is pinned outside the tmp root."""
+    kanban_home = tmp_path / "kanban"
+    kanban_home.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(kanban_home))
+
+    # Negative control: HERMES_KANBAN_DB pin outside tmp root
+    fake_live_db = tmp_path.parent / "live_board.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(fake_live_db))
+    pinned_path = kb.kanban_db_path(board="test_board")
+    assert pinned_path == fake_live_db
+    with pytest.raises(AssertionError, match="Isolation check failed"):
+        assert_isolated_db_path(pinned_path, kanban_home)
+
+    # Positive control: after proper scrubbing, resolves inside tmp root
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    scrubbed_path = kb.kanban_db_path(board="test_board")
+    assert_isolated_db_path(scrubbed_path, kanban_home)
 
 
 def test_schema_initialization_and_idempotence(board_db: tuple[Path, sqlite3.Connection]) -> None:
@@ -83,7 +126,7 @@ def test_opt_in_binding_and_ancestor_inheritance(board_db: tuple[Path, sqlite3.C
     # 2. Opted-in root
     opted_root = kb.create_task(conn, title="Opted root", assignee="worker")
     kb.opt_in_collaboration(conn, opted_root, mode="advisory", session_id="sess-origin-1")
-    
+
     # Verify opt-in event recorded
     events = kb.list_events(conn, opted_root)
     opt_events = [e for e in events if e.kind == "collaboration_opted_in"]
@@ -102,8 +145,8 @@ def test_opt_in_binding_and_ancestor_inheritance(board_db: tuple[Path, sqlite3.C
 
 
 def test_mixed_root_and_unrelated_project_rejection(board_db: tuple[Path, sqlite3.Connection]) -> None:
-    """Case 1: child with multiple distinct roots rejects as mixed root."""
-    _, conn = board_db
+    """Case 1: child with multiple distinct roots rejects as mixed root; foreign project fails closed."""
+    kanban_home, conn = board_db
     root_a = kb.create_task(conn, title="Root A", assignee="worker")
     kb.opt_in_collaboration(conn, root_a, mode="advisory", session_id="sess-a")
 
@@ -113,6 +156,17 @@ def test_mixed_root_and_unrelated_project_rejection(board_db: tuple[Path, sqlite
     mixed_child = kb.create_task(conn, title="Mixed Child", assignee="worker", parents=[root_a, root_b])
     # Mixed root ancestry fails closed (returns None)
     assert kb.get_collaboration_root(conn, mixed_child) is None
+
+    # Foreign project ancestry check
+    from hermes_cli import projects_db
+    with projects_db.connect_closing() as pconn:
+        proj_a = projects_db.create_project(pconn, name="Proj A", primary_path=str(kanban_home / "proj_a"))
+        proj_b = projects_db.create_project(pconn, name="Proj B", primary_path=str(kanban_home / "proj_b"))
+
+    root_proj = kb.create_task(conn, title="Proj Root", assignee="worker", project_id=proj_a)
+    kb.opt_in_collaboration(conn, root_proj, mode="advisory", session_id="sess-proj")
+    child_foreign = kb.create_task(conn, title="Foreign Child", assignee="worker", project_id=proj_b, parents=[root_proj])
+    assert kb.get_collaboration_root(conn, child_foreign) is None
 
 
 def test_request_respond_ack_resolve_lifecycle(board_db: tuple[Path, sqlite3.Connection]) -> None:
@@ -438,3 +492,173 @@ def test_root_done_preserves_collaboration_vs_terminal_flow_expires(board_db: tu
     msg_after_expire = kb.get_collaboration_message(conn, req_id)
     assert msg_after_expire is not None
     assert msg_after_expire["resolution"] == "stale"
+
+
+def test_archive_task_expires_collaboration_to_stale(board_db: tuple[Path, sqlite3.Connection]) -> None:
+    """Case 8: archive_task on an opted-in root stales unresolved collaboration messages."""
+    _, conn = board_db
+    root = kb.create_task(conn, title="Archive Root", assignee="worker", project_id="p_test")
+    kb.opt_in_collaboration(conn, root, mode="advisory", session_id="sess-origin")
+    conn.execute(
+        """
+        INSERT INTO kanban_notify_subs
+            (task_id, platform, chat_id, thread_id, user_id, delivery_mode, created_at, last_event_id)
+        VALUES (?, 'tui', 'chat-1', '', 'user-1', 'notify', ?, 0)
+        """,
+        (root, int(time.time())),
+    )
+    child = kb.create_task(conn, title="Child Task", assignee="worker", project_id="p_test", parents=[root])
+
+    req = kb.create_collaboration_request(
+        conn, task_id=child, author="worker", body="Pending inquiry", recipient="origin"
+    )
+    req_id = req["collaboration_id"]
+    msg = kb.get_collaboration_message(conn, req_id)
+    assert msg is not None
+    assert msg["resolution"] == "open"
+
+    # Public archive_task call on root
+    archived = kb.archive_task(conn, root)
+    assert archived is True
+    root_task = kb.get_task(conn, root)
+    assert root_task is not None and root_task.status == "archived"
+
+    # Collaboration root fails closed for archived root and descendants
+    assert kb.get_collaboration_root(conn, root) is None
+    assert kb.get_collaboration_root(conn, child) is None
+
+    # Unresolved request must be marked stale with record preserved
+    msg_after = kb.get_collaboration_message(conn, req_id)
+    assert msg_after is not None
+    assert msg_after["resolution"] == "stale"
+    assert msg_after["resolved_at"] is not None
+
+
+def test_controller_worker_context_collaboration_advisory(board_db: tuple[Path, sqlite3.Connection]) -> None:
+    """Case 7: build_worker_context labels collaboration advisory and omits parent-recovery recipe."""
+    kanban_home, conn = board_db
+    from hermes_cli import projects_db
+    with projects_db.connect_closing() as pconn:
+        project_id = projects_db.create_project(pconn, name="Context Project", primary_path=str(kanban_home))
+
+    root = kb.create_task(conn, title="Root", assignee="worker", project_id=project_id)
+    kb.opt_in_collaboration(conn, root, mode="advisory", session_id="sess-origin")
+
+    child = kb.create_task(conn, title="Child", assignee="worker", project_id=project_id, parents=[root])
+    ctrl = kb.create_task(
+        conn,
+        title="Supervisor",
+        assignee="supervisor",
+        project_id=project_id,
+        parents=[root],
+        session_affinity={"flow_id": "flow-ctx", "terminal": True},
+    )
+
+    kb.create_collaboration_request(
+        conn, task_id=child, author="worker", body="Advisory query", recipient="controller"
+    )
+
+    ctx = kb.build_worker_context(conn, ctrl)
+    assert "## Flow collaboration advisory" in ctx
+    assert "requested collaboration advisory" in ctx
+    # Verify absence of recovery recipes
+    assert "## Flow recovery attention" not in ctx
+    assert 'kanban_block(kind="dependency")' not in ctx
+    assert 'origin_signal="recovery"' not in ctx
+
+
+def test_opt_in_persists_contract_binding_from_board_metadata(board_db: tuple[Path, sqlite3.Connection]) -> None:
+    """Case 1: opt_in_collaboration populates contract_id and contract_version from board.json metadata."""
+    kanban_home, conn = board_db
+    # Write board.json with contract metadata in the board directory
+    meta_path = kb.board_metadata_path("test_board")
+    meta_path.parent.mkdir(parents=True, exist_ok=True)
+    board_meta = {
+        "slug": "test_board",
+        "aether_contract_id": "oc_test_contract_abc",
+        "aether_contract_version": 1,
+        "aether_project_id": "proj_aether_uuid_99",
+    }
+    meta_path.write_text(json.dumps(board_meta), encoding="utf-8")
+
+    root = kb.create_task(conn, title="Contract Root", assignee="worker")
+    kb.opt_in_collaboration(conn, root, mode="advisory", session_id="sess-orig", board="test_board")
+
+    events = kb.list_events(conn, root)
+    opt_events = [e for e in events if e.kind == "collaboration_opted_in"]
+    assert len(opt_events) == 1
+    raw_payload = opt_events[0].payload
+    pl = raw_payload if isinstance(raw_payload, dict) else json.loads(str(raw_payload or "{}"))
+    assert pl.get("contract_id") == "oc_test_contract_abc"
+    assert pl.get("contract_version") == "1"
+    assert pl.get("project_id") == "proj_aether_uuid_99"
+
+    # Sibling request inherits contract_id and version
+    conn.execute(
+        """
+        INSERT INTO kanban_notify_subs
+            (task_id, platform, chat_id, thread_id, user_id, delivery_mode, created_at, last_event_id)
+        VALUES (?, 'tui', 'chat-1', '', 'user-1', 'notify', ?, 0)
+        """,
+        (root, int(time.time())),
+    )
+    req = kb.create_collaboration_request(
+        conn, task_id=root, author="worker", body="Check contract", recipient="origin"
+    )
+    msg = kb.get_collaboration_message(conn, req["collaboration_id"])
+    assert msg is not None
+    assert msg["contract_id"] == "oc_test_contract_abc"
+    assert msg["contract_version"] == "1"
+
+
+def test_source_run_id_persistence(board_db: tuple[Path, sqlite3.Connection], monkeypatch: pytest.MonkeyPatch) -> None:
+    """Case 4: source_run_id is persisted on requests, responses, and lifecycle notices when run exists."""
+    _, conn = board_db
+    root = kb.create_task(conn, title="Run Root", assignee="worker", project_id="p_test")
+    kb.opt_in_collaboration(conn, root, mode="advisory", session_id="sess-origin")
+    conn.execute(
+        """
+        INSERT INTO kanban_notify_subs
+            (task_id, platform, chat_id, thread_id, user_id, delivery_mode, created_at, last_event_id)
+        VALUES (?, 'tui', 'chat-1', '', 'user-1', 'notify', ?, 0)
+        """,
+        (root, int(time.time())),
+    )
+    child = kb.create_task(conn, title="Run Child", assignee="worker", project_id="p_test", parents=[root])
+
+    # 1. Explicit run_id on request
+    req = kb.create_collaboration_request(
+        conn, task_id=child, author="worker", body="Request with run", recipient="origin", run_id=123
+    )
+    req_row = kb.get_collaboration_message(conn, req["collaboration_id"])
+    assert req_row is not None
+    assert req_row["source_run_id"] == 123
+
+    # 2. Explicit run_id on response
+    resp = kb.create_collaboration_response(
+        conn, request_id=req["collaboration_id"], author="supervisor", body="Response with run", disposition="advice", run_id=124
+    )
+    resp_row = kb.get_collaboration_message(conn, resp["collaboration_id"])
+    assert resp_row is not None
+    assert resp_row["source_run_id"] == 124
+
+    # 3. Environment-derived run_id
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "777")
+    req2 = kb.create_collaboration_request(
+        conn, task_id=child, author="worker", body="Env run request", recipient="origin"
+    )
+    req2_row = kb.get_collaboration_message(conn, req2["collaboration_id"])
+    assert req2_row is not None
+    assert req2_row["source_run_id"] == 777
+
+    # 4. Lifecycle notice with run_id from claimed task
+    kb.complete_task(conn, root)
+    claimed = kb.claim_task(conn, child)
+    assert claimed is not None and claimed.current_run_id is not None
+    run_id_val = claimed.current_run_id
+    kb.block_task(conn, child, reason="Blocked notice test", kind="needs_input")
+    notices = conn.execute(
+        "SELECT * FROM kanban_collaboration WHERE action = 'notice' AND source_run_id = ?",
+        (run_id_val,),
+    ).fetchall()
+    assert len(notices) >= 1

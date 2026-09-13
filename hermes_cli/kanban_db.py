@@ -4959,6 +4959,55 @@ def list_comments_after(
 # Collaboration store and consume API
 # ---------------------------------------------------------------------------
 
+def _read_board_meta_for_conn(conn: sqlite3.Connection, board: Optional[str] = None) -> dict[str, Any]:
+    meta: dict[str, Any] = {}
+    target_board = board
+    if not target_board:
+        try:
+            for row in conn.execute("PRAGMA database_list").fetchall():
+                if row["name"] == "main" and row["file"]:
+                    db_p = Path(row["file"])
+                    cand = db_p.parent / "board.json"
+                    if cand.exists():
+                        try:
+                            raw = json.loads(cand.read_text(encoding="utf-8"))
+                            if isinstance(raw, dict):
+                                meta.update(raw)
+                        except Exception:
+                            pass
+                    if db_p.parent.parent.name == "boards":
+                        target_board = db_p.parent.name
+                    break
+        except Exception:
+            pass
+    if not (meta.get("aether_contract_id") or meta.get("contract_id")):
+        try:
+            meta.update(read_board_metadata(target_board))
+        except Exception:
+            pass
+    return meta
+
+
+def _resolve_source_run_id(
+    conn: sqlite3.Connection, task_id: str, run_id: Optional[int] = None
+) -> Optional[int]:
+    if run_id is not None:
+        return run_id
+    env_run = os.environ.get("HERMES_KANBAN_RUN_ID")
+    if env_run:
+        try:
+            return int(env_run)
+        except (TypeError, ValueError):
+            pass
+    try:
+        task = get_task(conn, task_id)
+        if task and task.current_run_id is not None:
+            return task.current_run_id
+    except Exception:
+        pass
+    return None
+
+
 def opt_in_collaboration(
     conn: sqlite3.Connection,
     root_task_id: str,
@@ -4967,6 +5016,7 @@ def opt_in_collaboration(
     session_id: Optional[str] = None,
     contract_id: Optional[str] = None,
     contract_version: Optional[str] = None,
+    board: Optional[str] = None,
 ) -> bool:
     """Record collaboration opt-in on a new root task."""
     if mode != "advisory":
@@ -4978,6 +5028,25 @@ def opt_in_collaboration(
         parents = parent_ids(conn, root_task_id)
         if parents:
             raise ValueError("collaboration opt-in is only valid on a root task (parents must be empty)")
+
+        meta = _read_board_meta_for_conn(conn, board)
+        resolved_contract_id = (
+            contract_id
+            or meta.get("aether_contract_id")
+            or meta.get("contract_id")
+        )
+        raw_version = (
+            contract_version
+            if contract_version is not None
+            else (meta.get("aether_contract_version") or meta.get("contract_version"))
+        )
+        resolved_contract_version = str(raw_version) if raw_version is not None else None
+        resolved_project_id = (
+            task.project_id
+            or meta.get("aether_project_id")
+            or meta.get("project_id")
+        )
+
         _append_event(
             conn,
             root_task_id,
@@ -4985,9 +5054,9 @@ def opt_in_collaboration(
             {
                 "mode": mode,
                 "origin_session_id": session_id or task.session_id,
-                "project_id": task.project_id,
-                "contract_id": contract_id,
-                "contract_version": contract_version,
+                "project_id": resolved_project_id,
+                "contract_id": resolved_contract_id,
+                "contract_version": resolved_contract_version,
                 "created_at": int(time.time()),
             },
         )
@@ -5013,7 +5082,9 @@ def _find_ancestor_roots(conn: sqlite3.Connection, task_id: str) -> set[str]:
     return roots
 
 
-def get_collaboration_root(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+def get_collaboration_root(
+    conn: sqlite3.Connection, task_id: str, *, allow_archived: bool = False
+) -> Optional[str]:
     """Return the unique opted-in collaboration root task id for `task_id`, or None."""
     roots = _find_ancestor_roots(conn, task_id)
     if len(roots) != 1:
@@ -5033,7 +5104,7 @@ def get_collaboration_root(conn: sqlite3.Connection, task_id: str) -> Optional[s
         return None
 
     r_task = get_task(conn, root_id)
-    if not r_task or r_task.status == "archived":
+    if not r_task or (not allow_archived and r_task.status == "archived"):
         return None
     t_task = get_task(conn, task_id)
     if t_task and t_task.project_id and r_task.project_id and t_task.project_id != r_task.project_id:
@@ -5081,6 +5152,7 @@ def create_collaboration_request(
     recipient: str,
     evidence_refs: Optional[list[Any]] = None,
     idempotency_key: Optional[str] = None,
+    run_id: Optional[int] = None,
 ) -> dict[str, Any]:
     """Create an addressed collaboration request on a task thread."""
     if not body or not body.strip():
@@ -5176,19 +5248,21 @@ def create_collaboration_request(
             except Exception:
                 pass
 
+        src_run_id = _resolve_source_run_id(conn, task_id, run_id)
         cur = conn.execute(
             """
             INSERT INTO kanban_collaboration (
-                root_task_id, task_id, source_kind, source_id, source_comment_id,
+                root_task_id, task_id, source_kind, source_id, source_run_id, source_comment_id,
                 recipient_kind, recipient_id, contract_id, contract_version,
                 action, evidence_refs, delivery_state, resolution, created_at,
                 dedup_key, body
-            ) VALUES (?, ?, 'worker', ?, ?, ?, ?, ?, ?, 'request', ?, 'pending', 'open', ?, ?, ?)
+            ) VALUES (?, ?, 'worker', ?, ?, ?, ?, ?, ?, ?, 'request', ?, 'pending', 'open', ?, ?, ?)
             """,
             (
                 root_id,
                 task_id,
                 author,
+                src_run_id,
                 cid,
                 recipient_kind,
                 recipient_id,
@@ -5241,6 +5315,7 @@ def create_collaboration_response(
     body: str,
     disposition: str,
     evidence_refs: Optional[list[Any]] = None,
+    run_id: Optional[int] = None,
 ) -> dict[str, Any]:
     """Record an attributable response to a collaboration request."""
     valid_dispositions = {"advice", "continue", "design_revision", "owner_input", "unavailable"}
@@ -5269,19 +5344,21 @@ def create_collaboration_response(
         )
 
         dedup_key = f"resp:{request_id}:{cid}"
+        src_run_id = _resolve_source_run_id(conn, row["task_id"], run_id)
         cur = conn.execute(
             """
             INSERT INTO kanban_collaboration (
-                root_task_id, task_id, source_kind, source_id, source_comment_id,
+                root_task_id, task_id, source_kind, source_id, source_run_id, source_comment_id,
                 recipient_kind, recipient_id, contract_id, contract_version,
                 request_id, action, disposition, evidence_refs, delivery_state,
                 resolution, created_at, dedup_key, body
-            ) VALUES (?, ?, 'worker', ?, ?, ?, ?, ?, ?, ?, 'respond', ?, ?, 'pending', 'open', ?, ?, ?)
+            ) VALUES (?, ?, 'worker', ?, ?, ?, ?, ?, ?, ?, ?, 'respond', ?, ?, 'pending', 'open', ?, ?, ?)
             """,
             (
                 row["root_task_id"],
                 row["task_id"],
                 author,
+                src_run_id,
                 cid,
                 row["source_kind"],
                 row["source_id"],
@@ -5503,15 +5580,35 @@ def _enqueue_lifecycle_collaboration_notice(
     task_id: str,
     event_kind: str,
     summary: Optional[str],
+    *,
     event_id: Optional[int] = None,
+    run_id: Optional[int] = None,
+    dedup_key: Optional[str] = None,
 ) -> None:
     root_id = get_collaboration_root(conn, task_id)
     if not root_id:
         return
     now = int(time.time())
+    src_run_id = _resolve_source_run_id(conn, task_id, run_id)
+
+    # Fetch contract binding from root opt-in event
+    opt_row = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'collaboration_opted_in' ORDER BY id DESC LIMIT 1",
+        (root_id,),
+    ).fetchone()
+    contract_id = None
+    contract_version = None
+    if opt_row and opt_row["payload"]:
+        try:
+            p = json.loads(opt_row["payload"])
+            contract_id = p.get("contract_id")
+            contract_version = p.get("contract_version")
+        except Exception:
+            pass
+
     row = conn.execute(
         """
-        SELECT id, evidence_refs, summary FROM kanban_collaboration
+        SELECT id, evidence_refs, summary, source_run_id FROM kanban_collaboration
         WHERE root_task_id = ? AND recipient_kind = 'origin' AND source_kind = 'lifecycle'
           AND delivery_state IN ('pending', 'queued') AND resolution = 'open'
         ORDER BY id DESC LIMIT 1
@@ -5530,40 +5627,44 @@ def _enqueue_lifecycle_collaboration_notice(
         base_sum = row["summary"] or ""
         add_sum = summary or event_kind
         combined_sum = f"{base_sum}; {add_sum}".strip("; ")[:400]
+        effective_run_id = src_run_id if src_run_id is not None else row["source_run_id"]
         conn.execute(
             """
             UPDATE kanban_collaboration
-            SET task_id = ?, source_event_id = ?, summary = ?, evidence_refs = ?, created_at = ?
+            SET task_id = ?, source_run_id = ?, source_event_id = ?, summary = ?, evidence_refs = ?, created_at = ?
             WHERE id = ?
             """,
-            (task_id, event_id, combined_sum, json.dumps(refs), now, row["id"]),
+            (task_id, effective_run_id, event_id, combined_sum, json.dumps(refs), now, row["id"]),
         )
     else:
         refs = [f"event:{event_id}"] if event_id else []
-        dedup_key = f"notice:{root_id}:{event_id or now}"
+        dk = dedup_key or f"notice:{root_id}:{event_id or now}"
         conn.execute(
             """
             INSERT INTO kanban_collaboration (
-                root_task_id, task_id, source_kind, source_id, source_event_id,
-                recipient_kind, action, summary, evidence_refs, delivery_state,
+                root_task_id, task_id, source_kind, source_id, source_run_id, source_event_id,
+                recipient_kind, contract_id, contract_version, action, summary, evidence_refs, delivery_state,
                 resolution, created_at, dedup_key
-            ) VALUES (?, ?, 'lifecycle', ?, ?, 'origin', 'notice', ?, ?, 'pending', 'open', ?, ?)
+            ) VALUES (?, ?, 'lifecycle', ?, ?, ?, 'origin', ?, ?, 'notice', ?, ?, 'pending', 'open', ?, ?)
             """,
             (
                 root_id,
                 task_id,
                 task_id,
+                src_run_id,
                 event_id,
+                contract_id,
+                str(contract_version) if contract_version is not None else None,
                 summary or event_kind,
                 json.dumps(refs),
                 now,
-                dedup_key,
+                dk,
             ),
         )
 
 
 def _expire_collaboration_for_flow(conn: sqlite3.Connection, task_id: str) -> None:
-    root_id = get_collaboration_root(conn, task_id)
+    root_id = get_collaboration_root(conn, task_id, allow_archived=True)
     if not root_id:
         return
     now = int(time.time())
@@ -7513,23 +7614,14 @@ def complete_task(
                     "SELECT MAX(id) FROM task_events WHERE task_id = ?", (task_id,)
                 ).fetchone()
                 ev_id = ev_id_row[0] if ev_id_row else None
-                conn.execute(
-                    """
-                    INSERT INTO kanban_collaboration (
-                        root_task_id, task_id, source_kind, source_id, source_event_id,
-                        recipient_kind, action, summary, delivery_state, resolution,
-                        created_at, dedup_key
-                    ) VALUES (?, ?, 'lifecycle', ?, ?, 'origin', 'notice', ?, 'pending', 'open', ?, ?)
-                    """,
-                    (
-                        task_id,
-                        task_id,
-                        task_id,
-                        ev_id,
-                        summary or "Root decomposition complete",
-                        int(time.time()),
-                        dedup_key,
-                    ),
+                _enqueue_lifecycle_collaboration_notice(
+                    conn,
+                    task_id,
+                    "completed",
+                    summary or "Root decomposition complete",
+                    event_id=ev_id,
+                    run_id=run_id,
+                    dedup_key=dedup_key,
                 )
     # Prose-scan the summary + result for t_<hex> references that do
     # not resolve. Advisory — does not block the completion. Runs in
@@ -8424,6 +8516,7 @@ def block_task(
             "blocked",
             reason,
             event_id=ev_row[0] if ev_row else None,
+            run_id=run_id,
         )
         _blocked_task = get_task(conn, task_id)
     _fire_kanban_lifecycle_hook(
@@ -8638,6 +8731,7 @@ def request_review(
             "review_requested",
             event_summary,
             event_id=ev_row[0] if ev_row else None,
+            run_id=run_id,
         )
     return _ret(True)
 
@@ -8767,6 +8861,7 @@ def request_changes(
             "changes_requested",
             reason,
             event_id=ev_row[0] if ev_row else None,
+            run_id=run_id,
         )
     return True, implementer
 
@@ -9532,7 +9627,7 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
             summary="task archived with run still active",
         )
         _append_event(conn, task_id, "archived", None, run_id=run_id)
-        root_id = get_collaboration_root(conn, task_id)
+        root_id = get_collaboration_root(conn, task_id, allow_archived=True)
         if root_id == task_id:
             _expire_collaboration_for_flow(conn, task_id)
     # ``archived`` parents no longer block children, same as ``done``.
@@ -13069,24 +13164,33 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     lines.append(f"Workspace: {task.workspace_kind} @ {task.workspace_path or '(unresolved)'}")
     pending_attention = _pending_flow_attentions(conn, task.id)
     if pending_attention:
-        blocked_task_id = pending_attention[0]["blocked_task_id"]
+        att = pending_attention[0]
+        blocked_task_id = att["blocked_task_id"]
         lines.append("")
-        lines.append("## Flow recovery attention")
-        lines.append(
-            f"Blocked task: `{blocked_task_id}`. Inspect and resolve this blocker "
-            "inside the existing contract before ordinary terminal integration."
-        )
-        lines.append(
-            "If resolved, call `kanban_block(kind=\"dependency\")` on this controller; "
-            "Hermes resumes the blocked task and returns this controller to dependency wait."
-        )
-        lines.append(
-            "If bounded runtime recovery cannot succeed, call "
-            "`kanban_block(kind=\"capability\", origin_signal=\"recovery\")` "
-            "on this controller so the originating agent resumes the flow. "
-            "Do not use capability/transient blocking for an unrelated goal "
-            "exit; the exact pending-attention route is checked natively."
-        )
+        if att.get("collaboration_advisory"):
+            lines.append("## Flow collaboration advisory")
+            lines.append(
+                f"Peer task `{blocked_task_id}` requested collaboration advisory. "
+                "Inspect the pending collaboration request and respond or coordinate "
+                "within your role boundaries without unblocking parent dependencies."
+            )
+        else:
+            lines.append("## Flow recovery attention")
+            lines.append(
+                f"Blocked task: `{blocked_task_id}`. Inspect and resolve this blocker "
+                "inside the existing contract before ordinary terminal integration."
+            )
+            lines.append(
+                "If resolved, call `kanban_block(kind=\"dependency\")` on this controller; "
+                "Hermes resumes the blocked task and returns this controller to dependency wait."
+            )
+            lines.append(
+                "If bounded runtime recovery cannot succeed, call "
+                "`kanban_block(kind=\"capability\", origin_signal=\"recovery\")` "
+                "on this controller so the originating agent resumes the flow. "
+                "Do not use capability/transient blocking for an unrelated goal "
+                "exit; the exact pending-attention route is checked natively."
+            )
     if task.max_runtime_seconds is not None:
         terminal_timeout = _worker_terminal_timeout_env(
             task.max_runtime_seconds,

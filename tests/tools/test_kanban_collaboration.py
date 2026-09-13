@@ -23,14 +23,36 @@ from hermes_cli import kanban_db as kb
 import tools.kanban_tools as kt
 
 
+def assert_isolated_db_path(db_path: Path, expected_root: Path) -> None:
+    try:
+        resolved_path = db_path.resolve()
+        resolved_root = expected_root.resolve()
+        assert resolved_path.is_relative_to(resolved_root), (
+            f"Isolation check failed: db_path {resolved_path} is not under expected root {resolved_root}"
+        )
+    except (ValueError, AttributeError):
+        assert str(db_path.resolve()).startswith(str(expected_root.resolve())), (
+            f"Isolation check failed: db_path {db_path} is not under expected root {expected_root}"
+        )
+
+
 @pytest.fixture
 def isolated_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    for var in (
+        "HERMES_KANBAN_DB",
+        "HERMES_KANBAN_BOARD",
+        "HERMES_KANBAN_TASK",
+        "HERMES_KANBAN_RUN_ID",
+        "HERMES_KANBAN_WORKSPACES_ROOT",
+    ):
+        monkeypatch.delenv(var, raising=False)
     kanban_home = tmp_path / "kanban"
     kanban_home.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(kanban_home))
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_home"))
     monkeypatch.setenv("HERMES_PROFILE", "implementer")
-    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    db_path = kb.kanban_db_path()
+    assert_isolated_db_path(db_path, tmp_path)
     return kanban_home
 
 
@@ -352,3 +374,60 @@ def test_inject_new_comments_peer_labeling_not_operator_wrapper(isolated_env: Pa
     # Must NOT contain operator wrapper
     assert "[OUT-OF-BAND USER MESSAGE" not in injected_text
     assert "from the operator" not in injected_text
+
+
+def test_kanban_tools_contract_metadata_and_source_run_id(isolated_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """kanban_create persists contract metadata from board.json and kanban_comment records source_run_id."""
+    # Write board.json using canonical board_metadata_path
+    meta_path = kb.board_metadata_path("default")
+    meta_path.parent.mkdir(parents=True, exist_ok=True)
+    board_meta = {
+        "slug": "default",
+        "aether_contract_id": "oc_tools_test_456",
+        "aether_contract_version": 2,
+    }
+    meta_path.write_text(json.dumps(board_meta), encoding="utf-8")
+
+    # 1. Create opted-in root
+    res_str = kt._handle_create({"title": "Root Task", "assignee": "supervisor", "collaboration": "advisory"})
+    res = json.loads(res_str)
+    assert res.get("ok") is True
+    root_id = res["task_id"]
+
+    conn = kb.connect()
+    try:
+        events = kb.list_events(conn, root_id)
+        opt_ev = [e for e in events if e.kind == "collaboration_opted_in"][0]
+        pl = opt_ev.payload if isinstance(opt_ev.payload, dict) else json.loads(str(opt_ev.payload or "{}"))
+        assert pl.get("contract_id") == "oc_tools_test_456"
+        assert pl.get("contract_version") == "2"
+
+        # Register notify sub for origin
+        conn.execute(
+            """
+            INSERT INTO kanban_notify_subs
+                (task_id, platform, chat_id, thread_id, user_id, delivery_mode, created_at, last_event_id)
+            VALUES (?, 'tui', 'chat-1', '', 'user-1', 'notify', ?, 0)
+            """,
+            (root_id, 1000),
+        )
+
+        # 2. Add request comment with HERMES_KANBAN_RUN_ID set
+        monkeypatch.setenv("HERMES_KANBAN_TASK", root_id)
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "555")
+        comm_res_str = kt._handle_comment({
+            "task_id": root_id,
+            "body": "Need advice on contract",
+            "collaboration": {"action": "request", "recipient": "origin"},
+        })
+        comm_res = json.loads(comm_res_str)
+        assert comm_res.get("ok") is True
+        collab_id = comm_res["collaboration_id"]
+
+        row = kb.get_collaboration_message(conn, collab_id)
+        assert row is not None
+        assert row["source_run_id"] == 555
+        assert row["contract_id"] == "oc_tools_test_456"
+        assert row["contract_version"] == "2"
+    finally:
+        conn.close()
