@@ -512,8 +512,13 @@ class TestBuildContextFilesPrompt:
         sub = tmp_path / "sub"
         sub.mkdir()
         from agent.prompt_builder import _load_agents_md
+        from unittest.mock import patch
 
-        assert _load_agents_md(sub) == ""
+        # tmp_path can be beneath an unrelated test-created .git marker
+        # (including /tmp/.git). Make the no-git-root premise explicit while
+        # exercising _load_agents_md's actual cwd-only branch.
+        with patch("agent.prompt_builder._find_git_root", return_value=None):
+            assert _load_agents_md(sub) == ""
 
     def test_skips_agents_md_in_install_tree_on_fallback(self, monkeypatch, tmp_path):
         # A backend that FALLS BACK into the install tree (cwd=None → getcwd,

@@ -18,7 +18,7 @@ def _project(tmp_path):
         )
 
 
-def _opt_in_aether_review(conn, root_id, project_id, *, contract_id="oc_review"):
+def _opt_in_aether_review(conn, root_id, project_id, *, contract_id="oc_review", legacy=False):
     """Mark the default test board/root as one exact Aether contract flow."""
     meta_path = kb.board_metadata_path()
     meta_path.parent.mkdir(parents=True, exist_ok=True)
@@ -40,6 +40,17 @@ def _opt_in_aether_review(conn, root_id, project_id, *, contract_id="oc_review")
         contract_version="1",
         session_id="origin-session",
     )
+    if legacy:
+        # The pre-snapshot event format remains a supported input.
+        event = conn.execute(
+            "SELECT id, payload FROM task_events WHERE task_id=? "
+            "AND kind='collaboration_opted_in' ORDER BY id DESC LIMIT 1",
+            (root_id,),
+        ).fetchone()
+        payload = json.loads(event["payload"])
+        payload.pop("aether_project_id", None)
+        conn.execute("UPDATE task_events SET payload=? WHERE id=?", (json.dumps(payload), event["id"]))
+        conn.commit()
 
 
 def _task(conn, project_id, *, title="work", flow="flow-7", terminal=False, workspace=None, session_id=None):
@@ -393,8 +404,9 @@ def test_review_dispatch_reuses_supervisor_flow_session_without_rewriting_unit_w
         conn.close()
 
 
+@pytest.mark.parametrize("legacy", [False, True])
 def test_review_rework_rereview_and_terminal_reuse_one_supervisor_session(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, legacy
 ):
     """One Aether flow keeps the exact Supervisor session across all phases."""
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban"))
@@ -416,7 +428,7 @@ def test_review_rework_rereview_and_terminal_reuse_one_supervisor_session(
             session_id="origin-session",
             session_affinity={"flow_id": "flow-review", "terminal": False},
         )
-        _opt_in_aether_review(conn, root, project_id)
+        _opt_in_aether_review(conn, root, project_id, legacy=legacy)
         root_run = kb.claim_task(conn, root)
         assert root_run is not None
         root_lease = kb.reserve_session_affinity(
@@ -1080,8 +1092,10 @@ def test_derived_review_requires_existing_flow_binding(tmp_path, monkeypatch):
         conn.close()
 
 
+@pytest.mark.parametrize("collaboration", [False, True])
+@pytest.mark.parametrize("stray_key", [None, "aether_project_id", "aether_contract_id", "aether_contract_version"])
 def test_generic_review_without_flow_affinity_keeps_bundled_review_skill(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, collaboration, stray_key
 ):
     """The generic Hermes review lane remains unchanged outside an affinity flow."""
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban"))
@@ -1109,6 +1123,25 @@ def test_generic_review_without_flow_affinity_keeps_bundled_review_skill(
             conn, root_claim, lease, session_id="generic-supervisor-session"
         )
         assert kb.complete_task(conn, root)
+        if stray_key:
+            values = {
+                "aether_project_id": "unrelated-label",
+                "aether_contract_id": "oc_generic",
+                "aether_contract_version": "1",
+            }
+            meta_path = kb.board_metadata_path()
+            meta_path.parent.mkdir(parents=True, exist_ok=True)
+            meta_path.write_text(json.dumps({"project_id": project_id, stray_key: values[stray_key]}))
+        if collaboration:
+            assert kb.opt_in_collaboration(
+                conn, root, contract_id="oc_generic", contract_version="1",
+                session_id="origin-session",
+            )
+            event = conn.execute(
+                "SELECT payload FROM task_events WHERE task_id=? "
+                "AND kind='collaboration_opted_in' ORDER BY id DESC LIMIT 1", (root,),
+            ).fetchone()
+            assert "aether_project_id" not in json.loads(event["payload"])
         task_id = kb.create_task(
             conn,
             title="plain implementation",
@@ -1131,7 +1164,28 @@ def test_generic_review_without_flow_affinity_keeps_bundled_review_skill(
         conn.close()
 
 
-def test_aether_review_without_supervisor_affinity_fails_closed(
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _profile: True)
+    captured = {}
+
+    def fake_spawn(task, workspace, **kwargs):
+        captured.update(task=task, workspace=workspace, kwargs=kwargs)
+        return 1001
+
+    conn = kb.connect()
+    try:
+        result = kb.dispatch_once(conn, spawn_fn=fake_spawn, max_spawn=1)
+        assert [row[0] for row in result.spawned] == [task_id]
+        assert captured["workspace"] == str(workspace)
+        assert "sdlc-review" in (captured["task"].skills or [])
+        assert captured["kwargs"].get("affinity") is None
+        assert captured["kwargs"].get("session_workspace") is None
+    finally:
+        conn.close()
+
+
+def test_aether_review_without_supervisor_affinity_blocks_at_failure_limit(
     tmp_path, monkeypatch
 ):
     """An opted-in Aether review must not silently fall back to a fresh reviewer."""
@@ -1199,29 +1253,9 @@ def test_aether_review_without_supervisor_affinity_fails_closed(
         assert unit in result.auto_blocked
         task = kb.get_task(conn, unit)
         assert task is not None and task.status == "blocked"
-        assert "review flow has no same-profile affinity ancestor" in (
+        assert "no same-profile flow affinity ancestor" in (
             task.last_failure_error or ""
         )
-    finally:
-        conn.close()
-
-    from hermes_cli import profiles
-
-    monkeypatch.setattr(profiles, "profile_exists", lambda _profile: True)
-    captured = {}
-
-    def fake_spawn(task, workspace, **kwargs):
-        captured.update(task=task, workspace=workspace, kwargs=kwargs)
-        return 1001
-
-    conn = kb.connect()
-    try:
-        result = kb.dispatch_once(conn, spawn_fn=fake_spawn, max_spawn=1)
-        assert [row[0] for row in result.spawned] == [task_id]
-        assert captured["workspace"] == str(workspace)
-        assert "sdlc-review" in (captured["task"].skills or [])
-        assert captured["kwargs"].get("affinity") is None
-        assert captured["kwargs"].get("session_workspace") is None
     finally:
         conn.close()
 
@@ -1236,12 +1270,19 @@ def test_aether_review_without_supervisor_affinity_fails_closed(
         "mismatched_event_project",
         "mismatched_board_project",
         "missing_aether_project",
+        "mismatched_aether_project",
+        "missing_board_metadata",
+        "malformed_opt_in",
+        "non_object_opt_in",
+        "invalid_opt_in_mode",
+        "archived_root",
+        "ambiguous_roots",
     ],
 )
-def test_nonmatching_aether_identity_uses_generic_review(
+def test_recognized_aether_identity_damage_never_spawns_fresh_review(
     tmp_path, monkeypatch, mutation
 ):
-    """Partial/mismatched Aether identity must never borrow Supervisor affinity."""
+    """A damaged opted-in flow fails closed, preserving the candidate and pins."""
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban"))
     project_id = _project(tmp_path)
     canonical = tmp_path / "supervisor-root"
@@ -1293,15 +1334,20 @@ def test_nonmatching_aether_identity_uses_generic_review(
             meta["project_id"] = "p_other"
         elif mutation == "missing_aether_project":
             meta.pop("aether_project_id", None)
+        elif mutation == "mismatched_aether_project":
+            meta["aether_project_id"] = "other-aether-project"
+        elif mutation == "missing_board_metadata":
+            meta = {}
+        elif mutation == "malformed_opt_in":
+            payload = "malformed-json"
+        elif mutation == "non_object_opt_in":
+            payload = []
+        elif mutation == "invalid_opt_in_mode":
+            payload["mode"] = "invalid"
+        elif mutation in ("archived_root", "ambiguous_roots"):
+            pass  # Damage the topology after creating/requesting review below.
         else:  # pragma: no cover - parametrization is closed above
             raise AssertionError(mutation)
-        meta_path.write_text(json.dumps(meta), encoding="utf-8")
-        conn.execute(
-            "UPDATE task_events SET payload=? WHERE id=?",
-            (json.dumps(payload), event["id"]),
-        )
-        conn.commit()
-
         unit = kb.create_task(
             conn,
             title="unit",
@@ -1323,6 +1369,22 @@ def test_nonmatching_aether_identity_uses_generic_review(
             reviewer="supervisor",
             expected_run_id=impl.current_run_id,
         )
+        # Corrupt a fully-created review, not the setup/lifecycle that creates it.
+        meta_path.write_text(json.dumps(meta), encoding="utf-8")
+        conn.execute(
+            "UPDATE task_events SET payload=? WHERE id=?",
+            ("{invalid" if mutation == "malformed_opt_in" else json.dumps(payload), event["id"]),
+        )
+        if mutation == "archived_root":
+            conn.execute("UPDATE tasks SET status='archived' WHERE id=?", (root,))
+        elif mutation == "ambiguous_roots":
+            other = kb.create_task(
+                conn, title="independent root", project_id=project_id,
+                workspace_kind="dir", workspace_path=str(canonical),
+            )
+            conn.execute("UPDATE tasks SET status='done' WHERE id=?", (other,))
+            kb.link_tasks(conn, other, unit)
+        conn.commit()
     finally:
         conn.close()
 
@@ -1331,21 +1393,107 @@ def test_nonmatching_aether_identity_uses_generic_review(
     monkeypatch.setattr(profiles, "profile_exists", lambda _profile: True)
     captured = {}
 
-    def fake_spawn(task, workspace, **kwargs):
-        captured.update(task=task, workspace=workspace, kwargs=kwargs)
+    def fake_spawn(task, workspace, *, affinity=None, session_workspace=None):
+        captured.update(
+            task=task, workspace=workspace,
+            kwargs={"affinity": affinity, "session_workspace": session_workspace},
+        )
         return 9010
 
     conn = kb.connect()
     try:
-        result = kb.dispatch_once(conn, spawn_fn=fake_spawn, max_spawn=1)
-        assert [row[0] for row in result.spawned] == [unit]
+        result = kb.dispatch_once(conn, spawn_fn=fake_spawn, max_spawn=1, failure_limit=3)
+        assert result.spawned == []
+        assert captured == {}
+        reviewed = kb.get_task(conn, unit)
+        assert reviewed.status == "review"
+        assert reviewed.current_run_id is None
+        assert reviewed.consecutive_failures == 1
+        assert "Aether review" in reviewed.last_failure_error
+        assert reviewed.workspace_path == str(candidate)
+        assert reviewed.session_affinity is None
+        assert reviewed.skills == ["implementation-evidence"]
+        assert reviewed.model_override == "implementer-model"
+        assert reviewed.provider_override == "custom:implementer-provider"
+        assert reviewed.reasoning_effort == "high"
+
+        # One damaged review must not prevent independent work from dispatching.
+        independent = kb.create_task(
+            conn, title="independent work", assignee="other-worker",
+            project_id=project_id, workspace_kind="dir", workspace_path=str(candidate),
+        )
+        other_dispatch = kb.dispatch_once(conn, spawn_fn=fake_spawn, max_spawn=1, failure_limit=3)
+        assert [row[0] for row in other_dispatch.spawned] == [independent]
+        assert kb.complete_task(conn, independent)
+
+        # Repair through the existing metadata/opt-in lifecycle and retry the
+        # review. Do not erase the corrupt event or allocate another session.
+        bad_payload = conn.execute("SELECT payload FROM task_events WHERE id=?", (event["id"],)).fetchone()[0]
+        if mutation == "archived_root":
+            conn.execute("UPDATE tasks SET status='done' WHERE id=?", (root,))
+            conn.commit()
+        elif mutation == "ambiguous_roots":
+            assert kb.unlink_tasks(conn, other, unit)
+        _opt_in_aether_review(conn, root, project_id)
+        assert conn.execute("SELECT payload FROM task_events WHERE id=?", (event["id"],)).fetchone()[0] == bad_payload
+        resumed = kb.dispatch_once(conn, spawn_fn=fake_spawn, max_spawn=1, failure_limit=3)
+        assert [row[0] for row in resumed.spawned] == [unit]
         assert captured["workspace"] == str(candidate)
-        assert captured["kwargs"].get("affinity") is None
-        assert captured["kwargs"].get("session_workspace") is None
-        assert captured["task"].skills == ["implementation-evidence", "sdlc-review"]
-        assert captured["task"].model_override == "implementer-model"
-        assert captured["task"].provider_override == "custom:implementer-provider"
-        assert captured["task"].reasoning_effort == "high"
+        assert captured["kwargs"]["session_workspace"] == str(canonical)
+        assert captured["kwargs"]["affinity"].session_id == "supervisor-session"
+        assert kb.get_task(conn, unit).session_affinity is None
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    "handoff",
+    [
+        "delta=documentation only; valid=E-unit (executable patch unchanged); "
+        "invalid=none; open=R-format; retired=R-lines (wrong source artifact)",
+        "delta=functional routing; valid=E-schema; "
+        "invalid=E-routing (changed branch requires targeted recheck); "
+        "open=R-routing; retired=R-format",
+        "delta=no executable change; valid=E-origin; invalid=none; open=none; "
+        "retired=R-broadcast (contradicts OC-1); optional=broadcast is not acceptance",
+    ],
+    ids=["documentation", "functional", "contradictory-return"],
+)
+def test_native_rereview_context_preserves_incremental_handoff_and_contract(
+    tmp_path, monkeypatch, handoff
+):
+    """Exercise native transfer, not the semantic truth of reviewer assertions."""
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban"))
+    project_id = _project(tmp_path)
+    contract = "OC-1: deliver to the exact commissioning origin, not all subscribers."
+    conn = kb.connect()
+    try:
+        unit = kb.create_task(
+            conn, title="origin delivery", body=contract, assignee="implementer",
+            project_id=project_id, workspace_kind="dir", workspace_path=str(tmp_path),
+        )
+        first = kb.claim_task(conn, unit)
+        assert kb.request_review(
+            conn, unit, reviewer="supervisor", summary="candidate-one; E-unit; E-origin",
+            expected_run_id=first.current_run_id,
+        )
+        review = kb.claim_review_task(conn, unit)
+        assert review is not None
+        ok, owner = kb.request_changes(
+            conn, unit, reason="Review return to resolve against OC-1",
+            expected_run_id=review.current_run_id,
+        )
+        assert ok and owner == "implementer"
+        rework = kb.claim_task(conn, unit)
+        transfer = "prior=candidate-one; next=candidate-two; " + handoff
+        assert kb.request_review(
+            conn, unit, summary=transfer, expected_run_id=rework.current_run_id,
+        )
+        context = kb.build_worker_context(conn, unit)
+        assert transfer in context
+        assert contract in context
+        assert "Review return to resolve against OC-1" in context
+        assert kb.get_task(conn, unit).body == contract
     finally:
         conn.close()
 

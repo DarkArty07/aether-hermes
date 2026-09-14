@@ -1334,56 +1334,92 @@ def _review_flow_session_context(
     This helper discovers that existing binding without persisting affinity on
     the implementation card itself.
 
-    Generic Hermes review remains unchanged: when no unique same-profile
-    affinity ancestor exists, return ``None`` and let review use a fresh
-    reviewer session in the task workspace.
+    Generic Hermes review remains unchanged when no Aether opt-in can be
+    established. Once established, missing/inconsistent identity is an error,
+    not permission to start a fresh reviewer. A persisted opt-in snapshot or
+    corroborated legacy board/event identity establishes that boundary.
     """
-    if not task.project_id or not task.assignee or task.session_affinity:
+    if task.session_affinity:
         return None
     if task.session_affinity_corrupt:
         raise AffinityRegistrationError("review task affinity is corrupt")
-    root_id = get_collaboration_root(conn, task.id)
-    if not root_id:
-        return None
     meta = _read_board_meta_for_conn(conn, board)
     board_contract_id = str(meta.get("aether_contract_id") or "").strip()
     board_contract_version = str(meta.get("aether_contract_version") or "").strip()
     board_project_id = str(meta.get("project_id") or "").strip()
     board_aether_project_id = str(meta.get("aether_project_id") or "").strip()
-    if not all(
-        (
-            board_contract_id,
-            board_contract_version,
-            board_project_id,
-            board_aether_project_id,
-        )
-    ):
-        return None
-    if board_project_id != task.project_id:
-        return None
+    # Inspect persisted opt-ins before using get_collaboration_root: its None
+    # intentionally conflates no opt-in with malformed/ambiguous ancestry for
+    # generic collaboration callers. Review must distinguish those cases.
     opted_in = conn.execute(
-        "SELECT payload FROM task_events "
-        "WHERE task_id = ? AND kind = 'collaboration_opted_in' "
-        "ORDER BY id DESC LIMIT 1",
-        (root_id,),
-    ).fetchone()
+        """WITH RECURSIVE ancestors(id) AS (
+               SELECT ?
+               UNION
+               SELECT l.parent_id FROM task_links l
+                 JOIN ancestors a ON l.child_id = a.id
+           )
+           SELECT e.task_id, e.payload FROM task_events e
+             JOIN ancestors a ON a.id = e.task_id
+            WHERE e.kind = 'collaboration_opted_in'
+              AND e.id = (SELECT MAX(last.id) FROM task_events last
+                           WHERE last.task_id = e.task_id
+                             AND last.kind = 'collaboration_opted_in')""",
+        (task.id,),
+    ).fetchall()
+    if not opted_in:
+        return None  # Board metadata alone does not opt a task into Aether.
+    payloads: dict[str, dict[str, Any]] = {}
+    for event in opted_in:
+        try:
+            raw = json.loads(event["payload"]) if event["payload"] else {}
+        except (TypeError, json.JSONDecodeError):
+            raw = {}
+        payloads[event["task_id"]] = raw if isinstance(raw, dict) else {}
+
+    complete_board_identity = all((
+        board_contract_id, board_contract_version,
+        board_project_id, board_aether_project_id,
+    ))
+    recognized = complete_board_identity
+    for payload in payloads.values():
+        if payload.get("aether_project_id"):
+            recognized = True  # Snapshot created by native opt-in, not a new registry.
+        # Legacy opt-ins predate the snapshot. Corroborate separate stores;
+        # a single arbitrary Aether-looking board key is never sufficient.
+        if task.project_id and payload.get("project_id") == task.project_id:
+            contract_matches = bool(board_contract_id) and payload.get("contract_id") == board_contract_id
+            version_matches = bool(board_contract_version) and str(payload.get("contract_version")) == board_contract_version
+            if (contract_matches and version_matches) or (
+                board_aether_project_id and board_project_id == task.project_id
+                and (contract_matches or version_matches)
+            ):
+                recognized = True
+    if not recognized:
+        return None
+    if not task.project_id or not task.assignee:
+        raise AffinityRegistrationError("Aether review is missing project/reviewer identity")
     try:
-        opt_payload = (
-            json.loads(opted_in["payload"])
-            if opted_in is not None and opted_in["payload"]
-            else {}
-        )
-    except (TypeError, json.JSONDecodeError):
-        opt_payload = {}
+        root_id = get_collaboration_root(conn, task.id)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise AffinityRegistrationError("Aether review opt-in is malformed") from exc
+    if not root_id or len(payloads) != 1 or root_id not in payloads:
+        raise AffinityRegistrationError("Aether review has missing/inconsistent collaboration root")
+    opt_payload = payloads[root_id]
+    root_task = get_task(conn, root_id)
     event_contract_id = str(opt_payload.get("contract_id") or "").strip()
     event_contract_version = str(opt_payload.get("contract_version") or "").strip()
     opt_project = str(opt_payload.get("project_id") or "").strip()
     if (
-        event_contract_id != board_contract_id
+        not complete_board_identity
+        or board_project_id != task.project_id
+        or root_task is None or root_task.project_id != task.project_id
+        or event_contract_id != board_contract_id
         or event_contract_version != board_contract_version
         or opt_project != board_project_id
+        or (opt_payload.get("aether_project_id") is not None
+            and opt_payload["aether_project_id"] != board_aether_project_id)
     ):
-        return None
+        raise AffinityRegistrationError("Aether review board/opt-in identity is inconsistent")
     reviewer = _canonical_assignee(task.assignee)
     rows = conn.execute(
         """WITH RECURSIVE ancestors(id) AS (
@@ -5240,6 +5276,17 @@ def opt_in_collaboration(
             "contract_version": resolved_contract_version,
             "created_at": int(time.time()),
         }
+        # Preserve the corroborated Aether identity in the existing event so a
+        # later damaged/missing board.json cannot silently turn this flow into
+        # generic review. Generic collaboration events keep their old shape.
+        if (
+            meta.get("aether_project_id")
+            and task.project_id
+            and meta.get("project_id") == task.project_id
+            and meta.get("aether_contract_id") == resolved_contract_id
+            and str(meta.get("aether_contract_version")) == resolved_contract_version
+        ):
+            event_payload["aether_project_id"] = str(meta["aether_project_id"]).strip()
         if origin_route is not None:
             if not isinstance(origin_route, dict):
                 raise ValueError(f"origin_route must be a dict, got {type(origin_route).__name__}")
@@ -5353,7 +5400,7 @@ def get_collaboration_root(
         payload = json.loads(row["payload"]) if row["payload"] else {}
     except (TypeError, json.JSONDecodeError):
         return None
-    if payload.get("mode") != "advisory":
+    if not isinstance(payload, dict) or payload.get("mode") != "advisory":
         return None
 
     r_task = get_task(conn, root_id)

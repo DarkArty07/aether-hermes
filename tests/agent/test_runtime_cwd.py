@@ -51,10 +51,14 @@ class TestResolveSessionIdentityCwd:
         monkeypatch.setenv("HERMES_KANBAN_SESSION_WORKSPACE", str(canonical))
         monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(candidate))
         monkeypatch.setenv("TERMINAL_CWD", str(candidate))
+        monkeypatch.chdir(candidate)
 
         assert resolve_session_identity_cwd() == canonical
         assert resolve_agent_cwd() == candidate
         assert resolve_context_cwd() == candidate
+        # Session identity intentionally does not mutate the process cwd;
+        # direct os.getcwd() users remain at their launch/tool boundary.
+        assert Path(os.getcwd()) == candidate
 
     def test_without_affinity_falls_back_to_normal_agent_cwd(
         self, monkeypatch, tmp_path

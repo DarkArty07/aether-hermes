@@ -16,8 +16,10 @@ Bug scenario (pre-fix):
   8. Fallback wrote only user/assistant pair — summary lost
 """
 
+import json
 import os
 import tempfile
+from hashlib import sha256
 from pathlib import Path
 from unittest.mock import patch
 
@@ -367,6 +369,98 @@ class TestFlushAfterCompression:
             row = db.get_session(exact_session)
             assert row is not None
             assert row.get("ended_at") is None
+            db.close()
+
+    def test_affinity_restore_keeps_stored_prompt_when_tools_target_candidate(
+        self, monkeypatch
+    ):
+        """A resumed review restores its canonical prompt without a provider call.
+
+        This covers the startup restore helper, not a full CLI process: the
+        session identity remains the supervisor workspace while file/terminal
+        resolution intentionally stays on the review candidate.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            canonical = root / "supervisor"
+            candidate = root / "candidate"
+            canonical.mkdir()
+            candidate.mkdir()
+            (candidate / "review.txt").write_text("candidate evidence\n")
+            monkeypatch.setenv("HERMES_HOME", str(root / "profile"))
+            monkeypatch.setenv("HERMES_KANBAN_AFFINITY_TOKEN", "lease")
+            monkeypatch.setenv("HERMES_KANBAN_SESSION_WORKSPACE", str(canonical))
+            monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(candidate))
+            monkeypatch.setenv("TERMINAL_CWD", str(candidate))
+            monkeypatch.setenv("TERMINAL_ENV", "local")
+
+            # Keep all state/profile isolation in place before importing the
+            # real restoration path or SessionDB.
+            from agent.conversation_loop import _restore_or_build_system_prompt
+            from agent.runtime_cwd import (
+                resolve_agent_cwd,
+                resolve_session_identity_cwd,
+            )
+            from hermes_state import SessionDB
+            from tools.file_tools import read_file_tool
+            from tools.terminal_tool import terminal_tool
+
+            session_id = "supervisor-review-session"
+            stored = (
+                "User home directory: /isolated-home\n"
+                f"Current working directory: {canonical}\n"
+                "Model: test/model\n"
+                "Provider: openrouter\n"
+                "Platform: kanban"
+            )
+            expected_hash = sha256(stored.encode("utf-8")).hexdigest()
+            db = SessionDB(db_path=root / "state.db")
+            db.create_session(
+                session_id,
+                "kanban",
+                model="test/model",
+                system_prompt=stored,
+                cwd=str(canonical),
+            )
+            agent = self._make_agent(db)
+            agent.session_id = session_id
+            agent.platform = "kanban"
+            agent.provider = "openrouter"
+            agent._build_system_prompt = lambda _message: (_ for _ in ()).throw(
+                AssertionError("stored prompt must be restored, not rebuilt")
+            )
+
+            assert resolve_session_identity_cwd() == canonical
+            assert resolve_agent_cwd() == candidate
+            with patch.object(db, "update_system_prompt", wraps=db.update_system_prompt) as update:
+                _restore_or_build_system_prompt(
+                    agent, None, [{"role": "user", "content": "review"}]
+                )
+
+            # Exercise the supported tools rather than only asserting their
+            # resolver: relative file reads and local terminal commands must
+            # both remain in the candidate workspace.
+            assert "candidate evidence" in read_file_tool(
+                "review.txt", task_id=session_id
+            )
+            pwd = json.loads(terminal_tool(command="pwd", task_id=session_id))
+            assert pwd["exit_code"] == 0
+            assert Path(pwd["output"].strip()).resolve() == candidate.resolve()
+
+            restored = db.get_session(session_id)
+            assert agent.session_id == session_id
+            assert agent._cached_system_prompt.encode("utf-8") == stored.encode("utf-8")
+            assert (
+                sha256(agent._cached_system_prompt.encode("utf-8")).hexdigest()
+                == expected_hash
+            )
+            assert restored is not None
+            assert restored["system_prompt"].encode("utf-8") == stored.encode("utf-8")
+            assert (
+                sha256(restored["system_prompt"].encode("utf-8")).hexdigest()
+                == expected_hash
+            )
+            update.assert_not_called()
             db.close()
 
 
