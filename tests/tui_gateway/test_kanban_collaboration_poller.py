@@ -401,3 +401,204 @@ class TestTuiCollaborationPoller:
         # Collaboration returned distinct item
         assert len(collab_items) == 1
         assert "PEER COLLABORATION EVIDENCE" in collab_items[0][1]
+
+
+def _expire_collab_leases(board: str = "default") -> None:
+    """Age every collaboration lease so the next claim exercises CORE's reclaim."""
+    conn = _isolated_connect(board)
+    try:
+        conn.execute(
+            "UPDATE kanban_collaboration "
+            "SET lease_expires = CAST(strftime('%s', 'now') AS INTEGER) - 10"
+        )
+    finally:
+        conn.close()
+
+
+class TestTuiCollaborationLeaseAndRouteScope:
+    def test_live_session_is_not_rewoken_after_lease_reclaim(self):
+        """A reclaimed expired lease must not re-enqueue to a still-live session (D3)."""
+        root_id, child_id = _setup_collab_tree(assignee="worker-1")
+
+        conn = _isolated_connect()
+        try:
+            res = kb.create_collaboration_request(
+                conn,
+                task_id=child_id,
+                author="worker-1",
+                body="live session must be woken once",
+                recipient="origin",
+            )
+            assert res["ok"] is True
+            pre_cursor = kb.list_notify_subs(conn, task_id=root_id)[0]["last_event_id"]
+        finally:
+            conn.close()
+
+        session = _session()
+        items = server._collect_kanban_collaboration(session)
+        assert len(items) == 1
+        assert items[0][0]["delivery_state"] == "queued"
+
+        # CORE reclaims the expired, still-unacknowledged lease (process-loss
+        # redelivery path). The same live session key must not receive a second
+        # copy of the still-visible record.
+        _expire_collab_leases()
+        items_again = server._collect_kanban_collaboration(_session())
+        assert items_again == []
+
+        conn = _isolated_connect()
+        try:
+            row = kb.get_collaboration_message(conn, items[0][0]["id"])
+            assert row is not None
+            assert row["delivery_state"] == "queued"
+            assert row["acknowledged_at"] is None
+            assert (
+                kb.list_notify_subs(conn, task_id=root_id)[0]["last_event_id"]
+                == pre_cursor
+            )
+        finally:
+            conn.close()
+
+    def test_poller_loop_does_not_resubmit_after_lease_reclaim(self, monkeypatch):
+        """The autonomous poller submits one turn per record, not one per lease cycle."""
+        root_id, child_id = _setup_collab_tree(assignee="implementer")
+
+        conn = _isolated_connect()
+        try:
+            res = kb.create_collaboration_request(
+                conn,
+                task_id=child_id,
+                author="implementer",
+                body="single autonomous turn expected",
+                recipient="origin",
+            )
+            assert res["ok"] is True
+        finally:
+            conn.close()
+
+        session = _session(running=False)
+        submits: list = []
+        emits: list = []
+        collect_passes: list = []
+
+        real_collect = server._collect_kanban_collaboration
+
+        def counting_collect(sess):
+            items = real_collect(sess)
+            collect_passes.append(len(items))
+            return items
+
+        monkeypatch.setattr(server, "_KANBAN_POLL_SECONDS", 0.01)
+        monkeypatch.setattr(server, "_collect_kanban_collaboration", counting_collect)
+        monkeypatch.setattr(
+            server,
+            "_emit",
+            lambda event, sid, payload=None: emits.append((event, payload)),
+        )
+        monkeypatch.setattr(
+            server,
+            "_run_prompt_submit",
+            lambda rid, sid, sess, text: submits.append(text),
+        )
+
+        stop = threading.Event()
+        thread = threading.Thread(
+            target=server._notification_poller_loop,
+            args=(stop, "sid-tui-collab-lease", session),
+            daemon=True,
+        )
+        thread.start()
+        try:
+            assert _wait_for(lambda: submits), "agent turn was never dispatched"
+            # The stubbed submit does not clear the session's running flag.
+            session["running"] = False
+            _expire_collab_leases()
+            # Two more poll passes must observe the reclaimed lease before the
+            # absence claim below is meaningful.
+            _baseline_passes = len(collect_passes)
+            assert _wait_for(
+                lambda: len(collect_passes) >= _baseline_passes + 2, timeout=10.0
+            ), f"poll passes: {collect_passes}"
+            assert len(submits) == 1, f"record was re-submitted: {len(submits)} turns"
+        finally:
+            stop.set()
+            thread.join(timeout=5)
+
+        assert "single autonomous turn expected" in submits[0]
+        assert collect_passes[1:] == [0] * (len(collect_passes) - 1)
+        assert [p for e, p in emits if e == "status.update"] == []
+
+    def test_process_loss_redelivers_unconsumed_record(self, monkeypatch):
+        """A restarted process (empty record) re-collects the unconsumed record."""
+        root_id, child_id = _setup_collab_tree(assignee="worker-1")
+
+        conn = _isolated_connect()
+        try:
+            res = kb.create_collaboration_request(
+                conn,
+                task_id=child_id,
+                author="worker-1",
+                body="redelivery after restart",
+                recipient="origin",
+            )
+            assert res["ok"] is True
+        finally:
+            conn.close()
+
+        items = server._collect_kanban_collaboration(_session())
+        assert len(items) == 1
+        assert items[0][0]["delivery_state"] == "queued"
+
+        _expire_collab_leases()
+        assert server._collect_kanban_collaboration(_session()) == []
+
+        # A restarted TUI gateway starts with an empty process-lifetime record,
+        # so CORE's lease reclaim still redelivers the unconsumed record.
+        # (The intermediate collect above renewed the lease, so age it again.)
+        _expire_collab_leases()
+        monkeypatch.setattr(server, "_KANBAN_COLLAB_ENQUEUED", {})
+        items_again = server._collect_kanban_collaboration(_session())
+
+        assert len(items_again) == 1
+        assert items_again[0][0]["id"] == items[0][0]["id"]
+        assert items_again[0][0]["delivery_state"] == "queued"
+        assert "redelivery after restart" in items_again[0][1]
+
+    def test_telegram_sub_on_same_root_does_not_block_tui_origin(self):
+        """A telegram watcher on the root must not make the TUI origin ambiguous."""
+        conn = _isolated_connect()
+        try:
+            root = kb.create_task(conn, title="shared root", assignee="morfeo")
+            kb.opt_in_collaboration(conn, root, mode="advisory", session_id=SESSION_KEY)
+            kb.add_notify_sub(conn, task_id=root, platform="tui", chat_id=SESSION_KEY)
+            kb.add_notify_sub(
+                conn, task_id=root, platform="telegram", chat_id="chat-100"
+            )
+            child = kb.create_task(
+                conn, title="child implementation", assignee="worker-1", parents=[root]
+            )
+            kb.claim_task(conn, root)
+            kb.complete_task(conn, root)
+            conn.execute(
+                "UPDATE kanban_notify_subs SET last_event_id = "
+                "(SELECT COALESCE(MAX(id), 0) FROM task_events)"
+            )
+            conn.execute("DELETE FROM kanban_collaboration")
+            kb.claim_task(conn, child)
+            res = kb.create_collaboration_request(
+                conn,
+                task_id=child,
+                author="worker-1",
+                body="tui origin survives a telegram watcher",
+                recipient="origin",
+            )
+            assert res["ok"] is True
+        finally:
+            conn.close()
+
+        items = server._collect_kanban_collaboration(_session())
+        assert len(items) == 1
+        collab_dict, text = items[0]
+        assert collab_dict["recipient_kind"] == "origin"
+        assert collab_dict["delivery_state"] == "queued"
+        assert "tui origin survives a telegram watcher" in text

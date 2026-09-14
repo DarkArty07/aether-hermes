@@ -25,6 +25,13 @@ from agent.i18n import t
 # "gateway.run") so extracted log records keep their original logger name.
 logger = logging.getLogger("gateway.run")
 
+# A collaboration wake is only *queued* until the recipient consumes it, so
+# CORE's expired-lease reclaim — the process-loss redelivery path — would
+# otherwise enqueue the same record to a still-live origin once per lease
+# cycle. This is the bound on the process-lifetime record of wakes this
+# gateway already queued; see ``_kanban_collaboration_wakes``.
+_KANBAN_COLLAB_ENQUEUED_MAX = 512
+
 
 def _resolve_auto_decompose_settings(
     load_config: Callable[[], Any],
@@ -271,6 +278,49 @@ class GatewayKanbanWatchersMixin:
         self._kanban_dispatcher_lock_handle = None
         _release_singleton_lock(handle)
 
+    def _kanban_collaboration_wakes(self) -> dict:
+        """Return this process's record of collaboration wakes already queued.
+
+        A wake is only *queued* until the recipient consumes it (ack/respond),
+        so CORE's expired-lease reclaim — the process-loss redelivery path —
+        would otherwise enqueue the same record to a still-live origin once per
+        lease cycle (D3 forbids that endless re-enqueue). The entry lives for
+        the lifetime of this process only: when the gateway dies, CORE's
+        reclaim is free to redeliver, which is what that path exists for.
+        Bounded so a long-lived gateway cannot grow it without limit;
+        eviction can at worst re-enqueue an old, still-unconsumed record.
+        """
+        wakes = getattr(self, "_kanban_collab_wakes", None)
+        if wakes is None:
+            wakes = {}
+            self._kanban_collab_wakes = wakes
+        return wakes
+
+    @staticmethod
+    def _kanban_collaboration_wake_key(
+        board: Optional[str], collab: dict
+    ) -> tuple[str, int]:
+        """Identity of one origin wake: board plus collaboration record id."""
+        return (str(board or ""), int(collab.get("id") or 0))
+
+    def _kanban_collaboration_wake_queued(
+        self, board: Optional[str], collab: dict
+    ) -> bool:
+        """Whether this live process already queued a wake for this record."""
+        return (
+            self._kanban_collaboration_wake_key(board, collab)
+            in self._kanban_collaboration_wakes()
+        )
+
+    def _remember_kanban_collaboration_wake(
+        self, board: Optional[str], collab: dict
+    ) -> None:
+        """Record that this process queued a wake for this record."""
+        wakes = self._kanban_collaboration_wakes()
+        wakes[self._kanban_collaboration_wake_key(board, collab)] = None
+        while len(wakes) > _KANBAN_COLLAB_ENQUEUED_MAX:
+            wakes.pop(next(iter(wakes)), None)
+
     def _kanban_rewind_collaboration(
         self,
         collab: dict,
@@ -456,6 +506,10 @@ class GatewayKanbanWatchersMixin:
                 sub.get("chat_id"),
                 board,
             )
+            # The wake is queued, not consumed. Remember it for the life of
+            # this process so CORE's lease reclaim cannot re-enqueue the same
+            # record to a still-live origin.
+            self._remember_kanban_collaboration_wake(board, collab)
         except Exception as exc:
             logger.warning(
                 "kanban collaboration: internal wake failed for message %s; retrying: %s",
@@ -535,6 +589,10 @@ class GatewayKanbanWatchersMixin:
             self, "_kanban_sub_fail_counts", {}
         )
         self._kanban_sub_fail_counts = sub_fail_counts
+        # Create the collaboration wake record on this (loop) thread before the
+        # first tick: the per-tick collection runs in a worker thread via
+        # ``asyncio.to_thread``, so a lazy first access could otherwise race.
+        self._kanban_collaboration_wakes()
         notifier_profile = getattr(self, "_kanban_notifier_profile", None)
         if not notifier_profile:
             notifier_profile = self._active_profile_name()
@@ -737,13 +795,24 @@ class GatewayKanbanWatchersMixin:
                                             sub for sub in subs
                                             if sub.get("task_id") == _collab_root
                                         ]
-                                        if not _all_root_subs:
-                                            continue
-                                        _all_routes = {
+                                        # Uniqueness is scoped to the platforms
+                                        # THIS consumer can deliver to. A root
+                                        # also watched from a platform this
+                                        # gateway has no adapter for (the
+                                        # tui_gateway process owns ``tui``
+                                        # sessions) is not an ambiguity here,
+                                        # while two chat routes on a platform we
+                                        # do host genuinely are: the exact
+                                        # origin chat/thread cannot be inferred,
+                                        # so the message stays unavailable
+                                        # instead of being rerouted.
+                                        _reachable_routes = {
                                             _collaboration_route_key(sub): sub
                                             for sub in _all_root_subs
+                                            if str(sub.get("platform") or "").lower()
+                                            in active_platforms
                                         }
-                                        if _all_root_subs and len(_all_routes) != 1:
+                                        if len(_reachable_routes) > 1:
                                             logger.warning(
                                                 "kanban collaboration: origin for root %s is ambiguous on board %s; leaving messages unavailable",
                                                 _collab_root,
@@ -753,21 +822,18 @@ class GatewayKanbanWatchersMixin:
                                         _routes = {
                                             _collaboration_route_key(_origin_sub): _origin_sub
                                             for _origin_sub in _origin_subs
+                                            if str(_origin_sub.get("platform") or "").lower()
+                                            in active_platforms
                                         }
                                         if len(_routes) != 1:
-                                            if _routes:
-                                                logger.warning(
-                                                    "kanban collaboration: origin for root %s is ambiguous on board %s; leaving messages unavailable",
-                                                    _collab_root,
-                                                    slug,
-                                                )
+                                            # No route this consumer owns and can
+                                            # reach: the origin is missing/closed
+                                            # (or owned by another gateway), so the
+                                            # messages stay visible and unavailable.
+                                            # More than one such route was already
+                                            # left unavailable as ambiguous above.
                                             continue
                                         _origin_sub = next(iter(_routes.values()))
-                                        _origin_platform = str(
-                                            _origin_sub.get("platform") or ""
-                                        ).lower()
-                                        if _origin_platform not in active_platforms:
-                                            continue
                                         _claimed_collab = _collab_claim(
                                             conn,
                                             recipient_kind="origin",
@@ -776,6 +842,18 @@ class GatewayKanbanWatchersMixin:
                                             limit=10,
                                         )
                                         for _collab in _claimed_collab:
+                                            if self._kanban_collaboration_wake_queued(
+                                                slug, _collab
+                                            ):
+                                                # Already queued to this exact
+                                                # origin while this process is
+                                                # live. CORE's claim reclaimed
+                                                # an expired lease, but that
+                                                # reclaim is the process-loss
+                                                # redelivery path — not a second
+                                                # ping to a session that already
+                                                # has the record queued.
+                                                continue
                                             _collab_task = _kb.get_task(
                                                 conn,
                                                 _collab.get("task_id") or _collab_root,

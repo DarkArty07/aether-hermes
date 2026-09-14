@@ -9469,6 +9469,18 @@ _KANBAN_SILENT_KINDS = frozenset({"archived", "unblocked"})
 _KANBAN_POLL_SECONDS = 5.0
 _LOOP_POLL_SECONDS = 5.0
 
+# Collaboration records this process already queued into a live TUI session.
+# A wake is only *queued* until the recipient consumes it (ack/respond), so
+# CORE's expired-lease reclaim — the process-loss redelivery path — would
+# otherwise re-submit the same record on every lease cycle, which D3 forbids
+# for a session that is still live. Entries are dropped only with the process,
+# which is exactly when CORE's reclaim is supposed to redeliver. Bounded, so a
+# long-lived process cannot grow the record without limit; eviction can at
+# worst re-submit an old, still-unconsumed record.
+_KANBAN_COLLAB_ENQUEUED_MAX = 512
+_KANBAN_COLLAB_ENQUEUED: dict[tuple, None] = {}
+_KANBAN_COLLAB_ENQUEUED_LOCK = threading.Lock()
+
 
 def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
     """Fire a due /loop wakeup for an idle TUI/Desktop/dashboard session.
@@ -9814,6 +9826,27 @@ def _format_kanban_collaboration_text(
     return "\n".join(parts)
 
 
+def _kanban_collaboration_enqueue_key(
+    db_path: str, session_key: str, collab: dict
+) -> tuple:
+    """Identity of one queued collaboration wake: board DB, session, record."""
+    return (str(db_path or ""), str(session_key or ""), int(collab.get("id") or 0))
+
+
+def _kanban_collaboration_already_enqueued(key: tuple) -> bool:
+    """Whether this live process already queued this record into this session."""
+    with _KANBAN_COLLAB_ENQUEUED_LOCK:
+        return key in _KANBAN_COLLAB_ENQUEUED
+
+
+def _remember_kanban_collaboration_enqueue(key: tuple) -> None:
+    """Record that this process queued this record into this session."""
+    with _KANBAN_COLLAB_ENQUEUED_LOCK:
+        _KANBAN_COLLAB_ENQUEUED[key] = None
+        while len(_KANBAN_COLLAB_ENQUEUED) > _KANBAN_COLLAB_ENQUEUED_MAX:
+            _KANBAN_COLLAB_ENQUEUED.pop(next(iter(_KANBAN_COLLAB_ENQUEUED)), None)
+
+
 def _collect_kanban_collaboration(session: dict) -> list:
     """Claim pending collaboration messages addressed to 'origin' for this TUI session.
 
@@ -9923,12 +9956,22 @@ def _collect_kanban_collaboration(session: dict) -> list:
                 if not claimed:
                     continue
                 for c in claimed:
+                    enqueue_key = _kanban_collaboration_enqueue_key(
+                        resolved, session_key, c
+                    )
+                    if _kanban_collaboration_already_enqueued(enqueue_key):
+                        # Already queued into this live session. CORE's claim
+                        # reclaimed an expired lease, but that reclaim is the
+                        # process-loss redelivery path — not a second turn for
+                        # a session that already has the record.
+                        continue
                     task = _kb.get_task(conn, c.get("task_id") or sub_task_id)
                     source_label = _collaboration_source_label(conn, c, task)
                     text = _format_kanban_collaboration_text(
                         origin_sub, task, c, slug, source_label=source_label
                     )
                     results.append((c, text))
+                    _remember_kanban_collaboration_enqueue(enqueue_key)
         finally:
             conn.close()
 

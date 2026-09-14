@@ -526,3 +526,250 @@ async def test_gateway_terminal_and_collaboration_coexist(monkeypatch):
     # 2. deliver_wake was called for collaboration
     assert len(wakes_delivered) == 1
     assert "collaboration notice" in wakes_delivered[0]["text"]
+
+
+def _expire_collaboration_leases(board: str = "default") -> None:
+    """Age every collaboration lease so the next claim exercises CORE's reclaim."""
+    conn = _isolated_connect(board)
+    try:
+        conn.execute(
+            "UPDATE kanban_collaboration "
+            "SET lease_expires = CAST(strftime('%s', 'now') AS INTEGER) - 10"
+        )
+    finally:
+        conn.close()
+
+
+def _create_root_with_extra_sub(
+    *,
+    platform: str,
+    chat_id: str,
+    extra_platform: str,
+    extra_chat_id: str,
+    request_body: str,
+) -> str:
+    """Root with two notify routes (origin + another platform) plus one request."""
+    conn = _isolated_connect()
+    try:
+        root_id = kb.create_task(conn, title="multi-route root", assignee="morfeo")
+        kb.opt_in_collaboration(conn, root_id, mode="advisory", session_id=chat_id)
+        kb.add_notify_sub(
+            conn,
+            task_id=root_id,
+            platform=platform,
+            chat_id=chat_id,
+            chat_type="group",
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=root_id,
+            platform=extra_platform,
+            chat_id=extra_chat_id,
+        )
+        child_id = kb.create_task(
+            conn, title="child implementation", assignee="worker-1", parents=[root_id]
+        )
+        kb.claim_task(conn, root_id)
+        assert kb.complete_task(conn, root_id)
+        conn.execute(
+            "UPDATE kanban_notify_subs SET last_event_id = "
+            "(SELECT COALESCE(MAX(id), 0) FROM task_events)"
+        )
+        conn.execute("DELETE FROM kanban_collaboration")
+        assert kb.claim_task(conn, child_id)
+        res = kb.create_collaboration_request(
+            conn,
+            task_id=child_id,
+            author="worker-1",
+            body=request_body,
+            recipient="origin",
+        )
+        assert res["ok"] is True
+        return root_id
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_gateway_live_origin_not_rewoken_after_lease_reclaim(monkeypatch):
+    """A reclaimed expired lease must not wake a still-live origin twice (D3).
+
+    Uses the real ``gateway.wake.deliver_wake`` path against the controlled
+    fake adapter (no monkeypatched wake), so the recorded wake count is the
+    one the consumer actually produced.
+    """
+    root_id = _create_opted_in_root()
+    child_id = _create_child_task(root_id, assignee="worker-1")
+
+    conn = _isolated_connect()
+    try:
+        res = kb.create_collaboration_request(
+            conn,
+            task_id=child_id,
+            author="worker-1",
+            body="still-live origin must be woken once",
+            recipient="origin",
+        )
+        assert res["ok"] is True
+    finally:
+        conn.close()
+
+    adapter = FakeTelegramAdapter()
+    runner = FakeGatewayRunner(adapter, is_busy=False)
+
+    await _run_single_tick(runner, monkeypatch)
+
+    assert len(adapter.wakes) == 1
+    wake_event = adapter.wakes[0]["event"]
+    assert wake_event.internal is True
+    assert "still-live origin must be woken once" in wake_event.text
+    assert adapter.sends == []
+
+    # CORE reclaims an expired, still-unacknowledged lease (process-loss
+    # redelivery path). The same live consumer must not enqueue a second
+    # wake for the record that is still visible/queued.
+    _expire_collaboration_leases()
+    runner._running = True
+    runner._ticks = 0
+    await _run_single_tick(runner, monkeypatch)
+
+    assert len(adapter.wakes) == 1, "still-live origin was re-woken after lease reclaim"
+    assert adapter.sends == []
+
+    conn = _isolated_connect()
+    try:
+        rows = kb.list_collaboration_for_task(conn, root_id)
+        assert len(rows) == 1
+        assert rows[0]["delivery_state"] == "queued"
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_gateway_process_loss_redelivers_unconsumed_record(monkeypatch):
+    """A fresh consumer (process loss) still redelivers the unconsumed record."""
+    root_id = _create_opted_in_root()
+    child_id = _create_child_task(root_id, assignee="worker-1")
+
+    conn = _isolated_connect()
+    try:
+        res = kb.create_collaboration_request(
+            conn,
+            task_id=child_id,
+            author="worker-1",
+            body="redelivery after process loss",
+            recipient="origin",
+        )
+        assert res["ok"] is True
+    finally:
+        conn.close()
+
+    adapter = FakeTelegramAdapter()
+    runner = FakeGatewayRunner(adapter, is_busy=False)
+    await _run_single_tick(runner, monkeypatch)
+    assert len(adapter.wakes) == 1
+    assert adapter.sends == []
+
+    # The wake record is process-scoped, so CORE's lease reclaim still does its
+    # job: a restarted gateway (fresh consumer instance) redelivers the record
+    # that was never consumed.
+    _expire_collaboration_leases()
+    restarted = FakeGatewayRunner(adapter, is_busy=False)
+    await _run_single_tick(restarted, monkeypatch)
+
+    assert len(adapter.wakes) == 2
+    assert "redelivery after process loss" in adapter.wakes[1]["event"].text
+    assert adapter.wakes[1]["event"].internal is True
+    assert adapter.sends == []
+
+    conn = _isolated_connect()
+    try:
+        rows = kb.list_collaboration_for_task(conn, root_id)
+        assert len(rows) == 1
+        assert rows[0]["delivery_state"] == "queued"
+        assert rows[0]["acknowledged_at"] is None
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_gateway_two_telegram_chats_on_one_root_stay_unavailable(monkeypatch):
+    """Two distinct telegram routes on one root stay ambiguous/unavailable."""
+    root_id = _create_opted_in_root()
+    child_id = _create_child_task(root_id, assignee="worker-1")
+
+    conn = _isolated_connect()
+    try:
+        kb.add_notify_sub(
+            conn,
+            task_id=root_id,
+            platform="telegram",
+            chat_id="chat-101",
+            chat_type="group",
+        )
+        res = kb.create_collaboration_request(
+            conn,
+            task_id=child_id,
+            author="worker-1",
+            body="two telegram routes",
+            recipient="origin",
+        )
+        assert res["ok"] is True
+    finally:
+        conn.close()
+
+    adapter = FakeTelegramAdapter()
+    runner = FakeGatewayRunner(adapter, is_busy=False)
+    wakes_delivered: list[dict[str, Any]] = []
+
+    async def fake_deliver_wake(adapt, *, text, session_id="", source=None):
+        wakes_delivered.append({"text": text})
+
+    monkeypatch.setattr("gateway.wake.deliver_wake", fake_deliver_wake)
+    await _run_single_tick(runner, monkeypatch)
+
+    assert wakes_delivered == []
+    assert adapter.sends == []
+    conn = _isolated_connect()
+    try:
+        rows = kb.list_collaboration_for_task(conn, root_id)
+        assert len(rows) == 1
+        assert rows[0]["delivery_state"] == "pending"
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_gateway_tui_sub_does_not_make_telegram_origin_ambiguous(monkeypatch):
+    """A TUI session sub on the same root must not block the gateway's route.
+
+    Uniqueness is scoped to the routes this consumer would use: the gateway
+    has no ``tui`` adapter, so the TUI sub is not a candidate origin for it.
+    """
+    root_id = _create_root_with_extra_sub(
+        platform="telegram",
+        chat_id="chat-100",
+        extra_platform="tui",
+        extra_chat_id="tui-session-11",
+        request_body="gateway route survives a tui watcher",
+    )
+
+    adapter = FakeTelegramAdapter()
+    runner = FakeGatewayRunner(adapter, is_busy=False)
+
+    await _run_single_tick(runner, monkeypatch)
+
+    assert len(adapter.wakes) == 1
+    wake_event = adapter.wakes[0]["event"]
+    assert wake_event.internal is True
+    assert wake_event.source.chat_id == "chat-100"
+    assert "gateway route survives a tui watcher" in wake_event.text
+    assert adapter.sends == []
+
+    conn = _isolated_connect()
+    try:
+        rows = kb.list_collaboration_for_task(conn, root_id)
+        assert len(rows) == 1
+        assert rows[0]["delivery_state"] == "queued"
+    finally:
+        conn.close()
