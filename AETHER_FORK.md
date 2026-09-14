@@ -224,3 +224,42 @@ Hermes release to perform the same conjunctive board-bound recovery — or to re
 the prior-board leaf with an equivalent safe alternative — and to pass the
 recurrence, the E2E, the fail-closed matrix and the explicit-board regression without
 these commits.
+
+## Native collaboration store, tool surface, and origin-bound delivery (Aether #334)
+
+These changes land on `aether-main` from independently reviewed unit commits for
+Objective Contract `oc_a28ff9b7fa20d29d@v1`. They do not activate the live TUI,
+gateway, profiles, or installation. Inherited GitHub Actions remain disabled and
+are therefore NOT RUN, not green. Portable Aether evidence is in
+`specs/collaborative-execution/evidence/`.
+
+Inspectable commits on this branch:
+
+- `31ec39a8560df24938e78d6956693bd811f04311` — adjunct `kanban_collaboration`
+  table, optional `kanban_create(collaboration="advisory")` root opt-in, and
+  request/respond/ack/resolve on `kanban_comment`.
+- `20db06c0b8441190830aa72e3c0de6fdce6b8db4` — fixture isolation, `archive_task`
+  expiry, advisory worker context, board.json contract binding, and
+  `source_run_id` persistence (independently reviewed CE-HF-CORE).
+- `3b569a345b`, `4942a7cfa3`, `d1d1f9e9f4` — TUI/gateway consumers and
+  exclusive-claim/process-loss recovery.
+- `2ec004ea54ab2401f63f1885a7c26f59bf1eb7db` — persist runtime-derived
+  `origin_route` on the existing `collaboration_opted_in` event and match it
+  before claim so extra notify subscribers are not recipients (independently
+  reviewed CE-HF-DELIVER; Morfeo D5).
+
+Behavior: optional collaboration is additive. Legacy roots, ordinary comments,
+and the terminal-notification cursor remain unchanged. Internal collaboration
+is wake-only with labeled peer evidence; it does not impersonate owner input.
+Exact-one-origin delivery uses the trusted commissioning route; missing or
+ambiguous origin stays unavailable. Decomposition-root `done` does not expire
+descendant collaboration; archived or terminal flow does.
+
+Candidate evidence (this tree, `HERMES_TEST_FILE_RETRIES=0`): collaboration
+suites 53 passed in 8.07s; neighboring regression 671 passed in 39.66s;
+`git diff --check 3b81e9d...HEAD` clean. Imports resolved to this candidate.
+
+Rollback reverts the listed commits in reverse order without restoring whole
+files that also carry other Aether corrections. Retirement requires an adopted
+exact Hermes release to provide equivalent optional collaboration semantics and
+to pass the focused collaboration suites without these commits.
