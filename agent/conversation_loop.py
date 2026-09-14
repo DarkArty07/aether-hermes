@@ -46,7 +46,7 @@ from agent.turn_context import (
     reanchor_current_turn_user_idx,
 )
 from agent.turn_retry_state import TurnRetryState
-from agent.runtime_cwd import resolve_agent_cwd
+from agent.runtime_cwd import resolve_session_identity_cwd
 from agent.message_sanitization import (
     close_interrupted_tool_sequence,
     _repair_tool_call_arguments,
@@ -930,12 +930,12 @@ def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
 
     # Detect cwd drift: if the stored prompt was built in a different working
     # directory, reuse would silently inject a stale path into the prefix cache.
-    # Compare against resolve_agent_cwd() — the SAME resolver used to build the
-    # prompt — so gateway/TUI sessions that set TERMINAL_CWD are not falsely
-    # rejected (they would always differ from the launch dir's os.getcwd()).
+    # Compare against the SAME session-identity resolver used to build the
+    # prompt. Affinity review can deliberately point tools at another task
+    # workspace without changing the resumed conversation's stable identity.
     stored_cwd = host_info_value("Current working directory")
     if stored_cwd:
-        if stored_cwd != str(resolve_agent_cwd()):
+        if stored_cwd != str(resolve_session_identity_cwd()):
             return False
 
     # Detect runtime-surface drift: the stored prompt records which platform it

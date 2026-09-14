@@ -73,6 +73,32 @@ def resolve_agent_cwd() -> Path:
     return Path(os.getcwd())
 
 
+def resolve_session_identity_cwd() -> Path:
+    """Return the cwd that belongs to the durable conversation identity.
+
+    Most sessions use the same directory for conversation identity and tools,
+    so this simply delegates to :func:`resolve_agent_cwd`. A Kanban affinity
+    worker may intentionally review another task workspace while resuming one
+    exact long-lived session. In that case the dispatcher supplies the
+    session's canonical workspace separately so prompt identity/cache checks
+    stay stable while file and terminal tools continue to target the task.
+
+    This is deliberately a prompt/session-identity resolver, not a process
+    cwd mutation: direct ``os.getcwd()`` callers retain the launch-process
+    boundary. Tool code that must target the candidate workspace must use
+    :func:`resolve_agent_cwd` (or the ``TERMINAL_CWD`` it resolves), rather
+    than treating this identity path as a tool-execution cwd.
+    """
+    if os.environ.get("HERMES_KANBAN_AFFINITY_TOKEN"):
+        raw = os.environ.get("HERMES_KANBAN_SESSION_WORKSPACE", "").strip()
+        if raw:
+            p = Path(raw).expanduser()
+            if p.is_dir():
+                return p
+            logger.warning("HERMES_KANBAN_SESSION_WORKSPACE does not exist: %s", raw)
+    return resolve_agent_cwd()
+
+
 def resolve_context_cwd() -> Path | None:
     # None means "no configured cwd": build_context_files_prompt then falls back
     # to the launch dir (os.getcwd()), correct for a local CLI launched inside a

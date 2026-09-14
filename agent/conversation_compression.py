@@ -101,6 +101,19 @@ COMPACTION_STATUS = (
     f"🗜️ {COMPACTION_STATUS_MARKER} — summarizing earlier conversation so I can continue..."
 )
 
+
+def _compression_in_place_for_agent(agent) -> bool:
+    """Resolve rotation policy without breaking exact Kanban affinity.
+
+    Affinity binds one durable session id across worker processes. Legacy
+    rotate-on-compress would end that exact row and create a child id the
+    board binding does not own, so affinity workers must compact in place even
+    when an older/private profile explicitly disabled the modern default.
+    """
+    if os.environ.get("HERMES_KANBAN_AFFINITY_TOKEN"):
+        return True
+    return bool(getattr(agent, "compression_in_place", True))
+
 COMPACTION_DONE_STATUS = "✓ Context compaction complete — continuing turn..."
 
 
@@ -2389,7 +2402,7 @@ def compress_context(
     # Default True matches DEFAULT_CONFIG / #38763. A missing attribute must
     # NOT fall back to rotation mode — that re-enables the pre-lease drift
     # path and can wedge busy sessions that never set the flag.
-    in_place = bool(getattr(agent, "compression_in_place", True))
+    in_place = _compression_in_place_for_agent(agent)
     # Set True once the in-place DB write actually completes (the DB block can
     # raise and skip it). Surfaced to the gateway via agent._last_compaction_in_place.
     compacted_in_place = False

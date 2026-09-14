@@ -80,7 +80,8 @@ def _launch_cwd_for_session(source: str) -> Optional[str]:
     """
     if source == "kanban":
         workspace = (
-            os.environ.get("HERMES_KANBAN_WORKSPACE")
+            os.environ.get("HERMES_KANBAN_SESSION_WORKSPACE")
+            or os.environ.get("HERMES_KANBAN_WORKSPACE")
             or os.environ.get("TERMINAL_CWD")
             or ""
         ).strip()

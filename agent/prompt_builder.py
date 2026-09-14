@@ -22,7 +22,7 @@ from hermes_constants import (
 )
 from typing import List, Optional
 
-from agent.runtime_cwd import resolve_agent_cwd
+from agent.runtime_cwd import resolve_session_identity_cwd
 from agent.skill_utils import (
     EXCLUDED_SKILL_DIRS,
     ORG_ACTIVE_MARKER,
@@ -1346,7 +1346,9 @@ def build_environment_hints() -> str:
 
         host_lines.append(f"User home directory: {os.path.expanduser('~')}")
         try:
-            host_lines.append(f"Current working directory: {resolve_agent_cwd()}")
+            host_lines.append(
+                f"Current working directory: {resolve_session_identity_cwd()}"
+            )
         except OSError:
             pass
 

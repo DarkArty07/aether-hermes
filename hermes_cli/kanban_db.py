@@ -85,7 +85,7 @@ import threading
 import logging
 import time
 from contextvars import ContextVar, Token
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
 
@@ -1320,6 +1320,195 @@ def get_session_affinity(
     return result
 
 
+def _review_flow_session_context(
+    conn: sqlite3.Connection,
+    task: Task,
+    *,
+    board: Optional[str] = None,
+) -> Optional[tuple[dict[str, Any], str]]:
+    """Resolve an existing reviewer flow session for same-card review.
+
+    Same-card review deliberately keeps the implementation task and its
+    candidate workspace.  A reviewer may nevertheless already own one exact
+    flow-bound session through an ancestor (Aether's Supervisor topology).
+    This helper discovers that existing binding without persisting affinity on
+    the implementation card itself.
+
+    Generic Hermes review remains unchanged when no Aether opt-in can be
+    established. Once established, missing/inconsistent identity is an error,
+    not permission to start a fresh reviewer. A persisted opt-in snapshot or
+    corroborated legacy board/event identity establishes that boundary.
+    """
+    if task.session_affinity:
+        return None
+    if task.session_affinity_corrupt:
+        raise AffinityRegistrationError("review task affinity is corrupt")
+    meta = _read_board_meta_for_conn(conn, board)
+    board_contract_id = str(meta.get("aether_contract_id") or "").strip()
+    board_contract_version = str(meta.get("aether_contract_version") or "").strip()
+    board_project_id = str(meta.get("project_id") or "").strip()
+    board_aether_project_id = str(meta.get("aether_project_id") or "").strip()
+    # Inspect persisted opt-ins before using get_collaboration_root: its None
+    # intentionally conflates no opt-in with malformed/ambiguous ancestry for
+    # generic collaboration callers. Review must distinguish those cases.
+    opted_in = conn.execute(
+        """WITH RECURSIVE ancestors(id) AS (
+               SELECT ?
+               UNION
+               SELECT l.parent_id FROM task_links l
+                 JOIN ancestors a ON l.child_id = a.id
+           )
+           SELECT e.task_id, e.payload FROM task_events e
+             JOIN ancestors a ON a.id = e.task_id
+            WHERE e.kind = 'collaboration_opted_in'
+              AND e.id = (SELECT MAX(last.id) FROM task_events last
+                           WHERE last.task_id = e.task_id
+                             AND last.kind = 'collaboration_opted_in')""",
+        (task.id,),
+    ).fetchall()
+    if not opted_in:
+        return None  # Board metadata alone does not opt a task into Aether.
+    payloads: dict[str, dict[str, Any]] = {}
+    for event in opted_in:
+        try:
+            raw = json.loads(event["payload"]) if event["payload"] else {}
+        except (TypeError, json.JSONDecodeError):
+            raw = {}
+        payloads[event["task_id"]] = raw if isinstance(raw, dict) else {}
+
+    complete_board_identity = all((
+        board_contract_id, board_contract_version,
+        board_project_id, board_aether_project_id,
+    ))
+    recognized = complete_board_identity
+    for payload in payloads.values():
+        if payload.get("aether_project_id"):
+            recognized = True  # Snapshot created by native opt-in, not a new registry.
+        # Legacy opt-ins predate the snapshot. Corroborate separate stores;
+        # a single arbitrary Aether-looking board key is never sufficient.
+        if task.project_id and payload.get("project_id") == task.project_id:
+            contract_matches = bool(board_contract_id) and payload.get("contract_id") == board_contract_id
+            version_matches = bool(board_contract_version) and str(payload.get("contract_version")) == board_contract_version
+            if (contract_matches and version_matches) or (
+                board_aether_project_id and board_project_id == task.project_id
+                and (contract_matches or version_matches)
+            ):
+                recognized = True
+    if not recognized:
+        return None
+    if not task.project_id or not task.assignee:
+        raise AffinityRegistrationError("Aether review is missing project/reviewer identity")
+    try:
+        root_id = get_collaboration_root(conn, task.id)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise AffinityRegistrationError("Aether review opt-in is malformed") from exc
+    if not root_id or len(payloads) != 1 or root_id not in payloads:
+        raise AffinityRegistrationError("Aether review has missing/inconsistent collaboration root")
+    opt_payload = payloads[root_id]
+    root_task = get_task(conn, root_id)
+    event_contract_id = str(opt_payload.get("contract_id") or "").strip()
+    event_contract_version = str(opt_payload.get("contract_version") or "").strip()
+    opt_project = str(opt_payload.get("project_id") or "").strip()
+    if (
+        not complete_board_identity
+        or board_project_id != task.project_id
+        or root_task is None or root_task.project_id != task.project_id
+        or event_contract_id != board_contract_id
+        or event_contract_version != board_contract_version
+        or opt_project != board_project_id
+        or (opt_payload.get("aether_project_id") is not None
+            and opt_payload["aether_project_id"] != board_aether_project_id)
+    ):
+        raise AffinityRegistrationError("Aether review board/opt-in identity is inconsistent")
+    reviewer = _canonical_assignee(task.assignee)
+    rows = conn.execute(
+        """WITH RECURSIVE ancestors(id) AS (
+               SELECT parent_id FROM task_links WHERE child_id = ?
+               UNION
+               SELECT l.parent_id
+                 FROM task_links l
+                 JOIN ancestors a ON l.child_id = a.id
+           )
+           SELECT t.id, t.project_id, t.assignee, t.session_affinity
+             FROM tasks t
+             JOIN ancestors a ON a.id = t.id
+            WHERE t.project_id = ? AND t.session_affinity IS NOT NULL""",
+        (task.id, task.project_id),
+    ).fetchall()
+    flows: set[str] = set()
+    for row in rows:
+        if _canonical_assignee(row["assignee"]) != reviewer:
+            continue
+        try:
+            parsed = normalize_session_affinity(json.loads(row["session_affinity"]))
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise AffinityRegistrationError(
+                "review affinity ancestor is corrupt"
+            ) from exc
+        if parsed is not None:
+            flows.add(parsed["flow_id"])
+    if not flows:
+        raise AffinityRegistrationError(
+            "Aether review has no same-profile flow affinity ancestor"
+        )
+    if len(flows) != 1:
+        raise AffinityRegistrationError(
+            "review has ambiguous same-profile flow affinity ancestry"
+        )
+    flow_id = next(iter(flows))
+    board_slug = _normalize_board_slug(board) or get_current_board()
+    row = conn.execute(
+        """SELECT session_id, workspace_path
+             FROM kanban_session_affinity
+            WHERE board = ? AND project_id = ? AND flow_id = ? AND assignee = ?""",
+        (board_slug, task.project_id, flow_id, task.assignee),
+    ).fetchone()
+    if row is None or not row["session_id"] or not row["workspace_path"]:
+        raise AffinityRegistrationError(
+            "review flow affinity has no resumable session/workspace binding"
+        )
+    workspace = str(row["workspace_path"])
+    if not os.path.isabs(workspace) or not os.path.isdir(workspace):
+        raise AffinityRegistrationError(
+            "review flow affinity workspace is unavailable"
+        )
+    return {"flow_id": flow_id, "terminal": False}, workspace
+
+
+def _reserve_review_flow_session(
+    conn: sqlite3.Connection,
+    task: Task,
+    *,
+    board: Optional[str] = None,
+) -> Optional[tuple[AffinityLease, str]]:
+    """Reserve an existing Aether Supervisor binding for same-card review.
+
+    This path never creates a flow binding and never writes affinity onto the
+    implementation card. It borrows only a previously registered exact
+    Supervisor session after the Aether root/contract/ancestry checks above.
+    """
+    context = _review_flow_session_context(conn, task, board=board)
+    if context is None:
+        return None
+    affinity, workspace = context
+    affinity_task = replace(
+        task,
+        session_affinity=affinity,
+        session_affinity_corrupt=False,
+    )
+    lease = reserve_session_affinity(
+        conn,
+        affinity_task,
+        workspace_path=workspace,
+        board=board,
+    )
+    if lease is None or not lease.session_id:
+        raise AffinityRegistrationError(
+            "review flow affinity has no existing registered session"
+        )
+    return lease, workspace
+
+
 def reserve_session_affinity(
     conn: sqlite3.Connection,
     task: Task,
@@ -1562,10 +1751,14 @@ def register_worker_session_from_env(session_id: str) -> bool:
             try:
                 from hermes_cli.profiles import resolve_profile_env
 
+                session_workspace = (
+                    os.environ.get("HERMES_KANBAN_SESSION_WORKSPACE")
+                    or os.environ.get("HERMES_KANBAN_WORKSPACE")
+                )
                 validate_worker_resume_session(
                     session_id,
                     db_path=Path(resolve_profile_env(task.assignee or "")) / "state.db",
-                    workspace_path=os.environ.get("HERMES_KANBAN_WORKSPACE"),
+                    workspace_path=session_workspace,
                     expected_profile=task.assignee,
                 )
             except AffinityRegistrationError:
@@ -1581,6 +1774,33 @@ def register_worker_session_from_env(session_id: str) -> bool:
                 generation=int(generation),
                 token=token,
             )
+            if os.environ.get("HERMES_KANBAN_REVIEW_AFFINITY") == "1":
+                context = _review_flow_session_context(
+                    conn,
+                    task,
+                    board=os.environ.get("HERMES_KANBAN_BOARD"),
+                )
+                if context is None:
+                    return register_session_affinity(
+                        conn, task, lease, session_id=session_id,
+                    )
+                review_affinity, expected_workspace = context
+                if review_affinity["flow_id"] != lease.flow_id:
+                    raise AffinityRegistrationError(
+                        "derived review flow changed before session registration"
+                    )
+                if not session_workspace or (
+                    os.path.realpath(session_workspace)
+                    != os.path.realpath(expected_workspace)
+                ):
+                    raise AffinityRegistrationError(
+                        "derived review workspace changed before session registration"
+                    )
+                task = replace(
+                    task,
+                    session_affinity=review_affinity,
+                    session_affinity_corrupt=False,
+                )
             return register_session_affinity(
                 conn, task, lease, session_id=session_id,
             )
@@ -5056,6 +5276,17 @@ def opt_in_collaboration(
             "contract_version": resolved_contract_version,
             "created_at": int(time.time()),
         }
+        # Preserve the corroborated Aether identity in the existing event so a
+        # later damaged/missing board.json cannot silently turn this flow into
+        # generic review. Generic collaboration events keep their old shape.
+        if (
+            meta.get("aether_project_id")
+            and task.project_id
+            and meta.get("project_id") == task.project_id
+            and meta.get("aether_contract_id") == resolved_contract_id
+            and str(meta.get("aether_contract_version")) == resolved_contract_version
+        ):
+            event_payload["aether_project_id"] = str(meta["aether_project_id"]).strip()
         if origin_route is not None:
             if not isinstance(origin_route, dict):
                 raise ValueError(f"origin_route must be a dict, got {type(origin_route).__name__}")
@@ -5169,7 +5400,7 @@ def get_collaboration_root(
         payload = json.loads(row["payload"]) if row["payload"] else {}
     except (TypeError, json.JSONDecodeError):
         return None
-    if payload.get("mode") != "advisory":
+    if not isinstance(payload, dict) or payload.get("mode") != "advisory":
         return None
 
     r_task = get_task(conn, root_id)
@@ -12515,38 +12746,62 @@ def _dispatch_once_locked(
             claimed.branch_name = effective_branch_name
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
         affinity_lease = None
-        if claimed.session_affinity or claimed.session_affinity_corrupt:
-            try:
+        derived_flow_review = False
+        session_workspace = str(workspace)
+        try:
+            if claimed.session_affinity or claimed.session_affinity_corrupt:
                 affinity_lease = reserve_session_affinity(
                     conn, claimed, workspace_path=str(workspace), board=board,
                 )
-            except AffinityBusy as exc:
-                _release_claim_for_affinity_busy(
-                    conn, claimed, source_status="review"
+            else:
+                review_reservation = _reserve_review_flow_session(
+                    conn, claimed, board=board
                 )
-                result.affinity_deferred.append((claimed.id, str(exc)))
-                continue
-            except (AffinityRegistrationError, ValueError) as exc:
-                auto = _record_spawn_failure(
-                    conn, claimed.id, f"session affinity: {exc}",
-                    failure_limit=failure_limit,
+                if review_reservation is not None:
+                    affinity_lease, session_workspace = review_reservation
+                    derived_flow_review = True
+        except AffinityBusy as exc:
+            _release_claim_for_affinity_busy(
+                conn, claimed, source_status="review"
+            )
+            result.affinity_deferred.append((claimed.id, str(exc)))
+            continue
+        except (AffinityRegistrationError, ValueError) as exc:
+            auto = _record_spawn_failure(
+                conn, claimed.id, f"session affinity: {exc}",
+                failure_limit=failure_limit,
+            )
+            if auto:
+                result.auto_blocked.append(claimed.id)
+                _route_affinity_terminal(
+                    conn, claimed.id,
+                    reason=f"session affinity: {exc}",
+                    outcome="failed",
                 )
-                if auto:
-                    result.auto_blocked.append(claimed.id)
-                    _route_affinity_terminal(
-                        conn, claimed.id,
-                        reason=f"session affinity: {exc}",
-                        outcome="failed",
-                    )
-                continue
+            continue
         # Force-load the sdlc-review skill for review agents — it carries
         # the review logic (AC verification, merge, etc.). The mandatory
         # kanban lifecycle is already injected into every worker's system
         # prompt via KANBAN_GUIDANCE, so this is the only extra skill the
-        # review agent needs.
-        claimed.skills = list(
-            dict.fromkeys([*(claimed.skills or []), "sdlc-review"])
-        )
+        # review agent needs. A flow-bound reviewer is different: it resumes
+        # the exact existing controller session, whose product procedure is
+        # already owned by that profile. Do not stack the generic bundled
+        # reviewer procedure on top of it.
+        if derived_flow_review:
+            # Card-pinned skills belong to the implementation phase. Same-card
+            # review changes the assignee without changing the durable card,
+            # so carrying those pins into a resumed controller session would
+            # preload Implementer procedure into Supervisor. Keep the durable
+            # list untouched for possible rework; suppress it only for this
+            # review subprocess.
+            claimed.skills = []
+            claimed.model_override = None
+            claimed.provider_override = None
+            claimed.reasoning_effort = None
+        else:
+            claimed.skills = list(
+                dict.fromkeys([*(claimed.skills or []), "sdlc-review"])
+            )
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
             import inspect
@@ -12557,6 +12812,8 @@ def _dispatch_once_locked(
                     spawn_kwargs["affinity"] = affinity_lease
                 if "board" in sig.parameters:
                     spawn_kwargs["board"] = board
+                if "session_workspace" in sig.parameters and derived_flow_review:
+                    spawn_kwargs["session_workspace"] = session_workspace
                 pid = _spawn(claimed, str(workspace), **spawn_kwargs)
             except (TypeError, ValueError):
                 pid = _spawn(claimed, str(workspace))
@@ -12881,6 +13138,7 @@ def _default_spawn(
     *,
     board: Optional[str] = None,
     affinity: Optional[AffinityLease] = None,
+    session_workspace: Optional[str] = None,
 ) -> Optional[int]:
     """Fire-and-forget ``hermes -p <profile> chat -q ...`` subprocess.
 
@@ -12901,6 +13159,7 @@ def _default_spawn(
     from hermes_cli.profiles import normalize_profile_name
 
     profile_arg = normalize_profile_name(task.assignee)
+    effective_session_workspace = session_workspace or workspace
 
     prompt = f"work kanban task {task.id}"
     env = dict(os.environ)
@@ -12915,6 +13174,8 @@ def _default_spawn(
         "HERMES_KANBAN_AFFINITY_GENERATION",
         "HERMES_KANBAN_AFFINITY_FLOW_ID",
         "HERMES_KANBAN_AFFINITY_PROJECT_ID",
+        "HERMES_KANBAN_SESSION_WORKSPACE",
+        "HERMES_KANBAN_REVIEW_AFFINITY",
     ):
         env.pop(key, None)
 
@@ -12960,7 +13221,11 @@ def _default_spawn(
     # Only pin a real, absolute directory — file_tools rejects relative /
     # sentinel TERMINAL_CWD values, so a non-dir workspace must NOT be set
     # here (leave the inherited value rather than write a meaningless one).
-    if workspace and os.path.isabs(workspace) and os.path.isdir(workspace):
+    if (
+        workspace
+        and os.path.isabs(workspace)
+        and os.path.isdir(workspace)
+    ):
         env["TERMINAL_CWD"] = workspace
     if task.branch_name:
         env["HERMES_KANBAN_BRANCH"] = task.branch_name
@@ -12969,6 +13234,9 @@ def _default_spawn(
     if task.claim_lock:
         env["HERMES_KANBAN_CLAIM_LOCK"] = task.claim_lock
     if affinity is not None:
+        env["HERMES_KANBAN_SESSION_WORKSPACE"] = effective_session_workspace
+        if task.session_affinity is None and session_workspace is not None:
+            env["HERMES_KANBAN_REVIEW_AFFINITY"] = "1"
         env["HERMES_KANBAN_AFFINITY_TOKEN"] = affinity.token
         env["HERMES_KANBAN_AFFINITY_GENERATION"] = str(affinity.generation)
         env["HERMES_KANBAN_AFFINITY_FLOW_ID"] = affinity.flow_id
@@ -12981,7 +13249,7 @@ def _default_spawn(
             validate_worker_resume_session(
                 affinity.session_id,
                 db_path=Path(env["HERMES_HOME"]) / "state.db",
-                workspace_path=workspace,
+                workspace_path=effective_session_workspace,
                 expected_profile=profile_arg,
             )
     # Goal-loop mode: the worker reads these and wraps its run in the
@@ -13071,10 +13339,12 @@ def _default_spawn(
         "-q", prompt,
     ])
     if affinity is not None:
-        # The task workspace is authoritative. ``--no-restore-cwd`` prevents
-        # the resumed session's historical cwd from overriding that pin.
+        # Resume from the affinity session's canonical workspace while the
+        # task/tool workspace remains independently pinned in the child env.
+        # ``--no-restore-cwd`` prevents CLI resume from replacing this exact
+        # flow binding with a stale historical cwd.
         cmd.extend(["--resume", affinity.session_id] if affinity.session_id else [])
-        cmd.extend(["--in", workspace, "--no-restore-cwd"])
+        cmd.extend(["--in", effective_session_workspace, "--no-restore-cwd"])
     if task.goal_mode:
         # Goal-mode workers must take the fully-quiet single-query path:
         # the kanban goal-loop hook (_run_kanban_goal_loop_q) only runs in
@@ -13097,7 +13367,11 @@ def _default_spawn(
     try:
         proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
             cmd,
-            cwd=workspace if os.path.isdir(workspace) else None,
+            cwd=(
+                effective_session_workspace
+                if os.path.isdir(effective_session_workspace)
+                else None
+            ),
             stdin=subprocess.DEVNULL,
             stdout=log_f,
             stderr=subprocess.STDOUT,
