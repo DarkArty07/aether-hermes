@@ -784,6 +784,28 @@ class TestEnvironmentHints:
         _pb._clear_backend_probe_cache()
         assert f"Current working directory: {configured}" in _pb.build_environment_hints()
 
+    def test_build_environment_hints_affinity_uses_session_workspace(
+        self, monkeypatch, tmp_path
+    ):
+        """A resumed flow keeps prompt identity even while tools target a candidate."""
+        import agent.prompt_builder as _pb
+
+        canonical = tmp_path / "supervisor"
+        candidate = tmp_path / "candidate"
+        canonical.mkdir()
+        candidate.mkdir()
+        monkeypatch.setattr(_pb, "is_wsl", lambda: False)
+        monkeypatch.delenv("TERMINAL_ENV", raising=False)
+        monkeypatch.setenv("HERMES_KANBAN_AFFINITY_TOKEN", "lease")
+        monkeypatch.setenv("HERMES_KANBAN_SESSION_WORKSPACE", str(canonical))
+        monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(candidate))
+        monkeypatch.setenv("TERMINAL_CWD", str(candidate))
+        _pb._clear_backend_probe_cache()
+
+        hints = _pb.build_environment_hints()
+        assert f"Current working directory: {canonical}" in hints
+        assert f"Current working directory: {candidate}" not in hints
+
     def test_build_environment_hints_falls_back_to_launch_dir(self, monkeypatch, tmp_path):
         """The #19242 local-CLI contract: no TERMINAL_CWD → the launch dir."""
         import agent.prompt_builder as _pb

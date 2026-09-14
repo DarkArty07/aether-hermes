@@ -10,6 +10,7 @@ from agent.runtime_cwd import (
     clear_session_cwd,
     resolve_agent_cwd,
     resolve_context_cwd,
+    resolve_session_identity_cwd,
     set_session_cwd,
 )
 
@@ -36,6 +37,32 @@ class TestResolveAgentCwd:
         monkeypatch.setattr(rt.os, "getcwd", _raise_oserror)
         with pytest.raises(OSError):
             resolve_agent_cwd()
+
+
+class TestResolveSessionIdentityCwd:
+    def test_affinity_session_workspace_is_independent_from_task_cwd(
+        self, monkeypatch, tmp_path
+    ):
+        canonical = tmp_path / "supervisor"
+        candidate = tmp_path / "candidate"
+        canonical.mkdir()
+        candidate.mkdir()
+        monkeypatch.setenv("HERMES_KANBAN_AFFINITY_TOKEN", "lease")
+        monkeypatch.setenv("HERMES_KANBAN_SESSION_WORKSPACE", str(canonical))
+        monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(candidate))
+        monkeypatch.setenv("TERMINAL_CWD", str(candidate))
+
+        assert resolve_session_identity_cwd() == canonical
+        assert resolve_agent_cwd() == candidate
+        assert resolve_context_cwd() == candidate
+
+    def test_without_affinity_falls_back_to_normal_agent_cwd(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.delenv("HERMES_KANBAN_AFFINITY_TOKEN", raising=False)
+        monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+        monkeypatch.setenv("HERMES_KANBAN_SESSION_WORKSPACE", "/ignored")
+        assert resolve_session_identity_cwd() == tmp_path
 
 
 class TestResolveContextCwd:

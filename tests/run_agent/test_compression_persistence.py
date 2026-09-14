@@ -326,6 +326,49 @@ class TestFlushAfterCompression:
             )
             db.close()
 
+    def test_affinity_compression_preserves_exact_session_when_rotation_configured(
+        self, monkeypatch
+    ):
+        """Affinity overrides legacy rotate-on-compress without changing session id."""
+        from agent.conversation_compression import compress_context
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = SessionDB(db_path=Path(tmpdir) / "test.db")
+            agent = self._make_agent(db)
+            agent.compression_in_place = False
+            agent._ensure_db_session()
+            exact_session = agent.session_id
+
+            messages = [
+                {
+                    "role": "user" if i % 2 == 0 else "assistant",
+                    "content": f"message {i} " + "x" * 200,
+                }
+                for i in range(40)
+            ]
+            agent._flush_messages_to_session_db(messages, [])
+            monkeypatch.setenv("HERMES_KANBAN_AFFINITY_TOKEN", "lease-token")
+
+            with patch(
+                "agent.context_compressor.call_llm",
+                side_effect=RuntimeError("no provider"),
+            ):
+                compressed, _ = compress_context(
+                    agent,
+                    messages,
+                    approx_tokens=100_000,
+                    system_message="sys",
+                )
+
+            assert compressed
+            assert agent.session_id == exact_session
+            assert getattr(agent, "_last_compaction_in_place", False) is True
+            row = db.get_session(exact_session)
+            assert row is not None
+            assert row.get("ended_at") is None
+            db.close()
+
 
 
 # ---------------------------------------------------------------------------
@@ -437,6 +480,28 @@ class TestStoredPromptCwdDrift:
                 "Expected True when stored cwd matches current cwd"
             )
 
+    def test_affinity_review_keeps_stored_prompt_when_task_cwd_differs(
+        self, monkeypatch, tmp_path
+    ):
+        """Reviewing another worktree must not invalidate the Supervisor prefix."""
+        from agent.conversation_loop import _stored_prompt_matches_runtime
+
+        canonical = tmp_path / "supervisor"
+        candidate = tmp_path / "candidate"
+        canonical.mkdir()
+        candidate.mkdir()
+        agent = self._make_agent()
+        stored_prompt = (
+            self._host_block(str(canonical))
+            + "Model: test/model\n"
+            "Provider: openrouter\n"
+        )
+        monkeypatch.setenv("HERMES_KANBAN_AFFINITY_TOKEN", "lease")
+        monkeypatch.setenv("HERMES_KANBAN_SESSION_WORKSPACE", str(canonical))
+        monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(candidate))
+        monkeypatch.setenv("TERMINAL_CWD", str(candidate))
+
+        assert _stored_prompt_matches_runtime(agent, stored_prompt) is True
     def test_project_context_cannot_force_a_rebuild(self):
         """🔴 CACHE INVARIANT: user project text must never invalidate the prompt.
 
@@ -528,3 +593,17 @@ class TestStoredPromptCwdDrift:
             assert "Platform: cli" in parts["volatile"], (
                 "Built prompt missing 'Platform: cli' — drift detection cannot read it"
             )
+
+
+def test_affinity_worker_forces_in_place_compression(monkeypatch):
+    """Exact flow affinity cannot rotate to a child session id."""
+    from agent.conversation_compression import _compression_in_place_for_agent
+
+    class Agent:
+        compression_in_place = False
+
+    monkeypatch.delenv("HERMES_KANBAN_AFFINITY_TOKEN", raising=False)
+    assert _compression_in_place_for_agent(Agent()) is False
+
+    monkeypatch.setenv("HERMES_KANBAN_AFFINITY_TOKEN", "lease-token")
+    assert _compression_in_place_for_agent(Agent()) is True
