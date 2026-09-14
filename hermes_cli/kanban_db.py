@@ -5017,6 +5017,7 @@ def opt_in_collaboration(
     contract_id: Optional[str] = None,
     contract_version: Optional[str] = None,
     board: Optional[str] = None,
+    origin_route: Optional[dict[str, Any]] = None,
 ) -> bool:
     """Record collaboration opt-in on a new root task."""
     if mode != "advisory":
@@ -5047,20 +5048,88 @@ def opt_in_collaboration(
             or meta.get("project_id")
         )
 
+        event_payload: dict[str, Any] = {
+            "mode": mode,
+            "origin_session_id": session_id or task.session_id,
+            "project_id": resolved_project_id,
+            "contract_id": resolved_contract_id,
+            "contract_version": resolved_contract_version,
+            "created_at": int(time.time()),
+        }
+        if origin_route is not None:
+            if not isinstance(origin_route, dict):
+                raise ValueError(f"origin_route must be a dict, got {type(origin_route).__name__}")
+            route_platform = str(origin_route.get("platform") or "").strip()
+            route_chat_id = str(origin_route.get("chat_id") or "").strip()
+            if not route_platform or not route_chat_id:
+                raise ValueError(
+                    "collaboration origin_route is missing or conflicting; "
+                    "refusing silent opt-in"
+                )
+            event_payload["origin_route"] = dict(origin_route)
+
         _append_event(
             conn,
             root_task_id,
             "collaboration_opted_in",
-            {
-                "mode": mode,
-                "origin_session_id": session_id or task.session_id,
-                "project_id": resolved_project_id,
-                "contract_id": resolved_contract_id,
-                "contract_version": resolved_contract_version,
-                "created_at": int(time.time()),
-            },
+            event_payload,
         )
         return True
+
+
+def get_collaboration_origin_route(
+    conn: sqlite3.Connection, task_id: str
+) -> Optional[dict[str, Any]]:
+    """Return the persisted origin_route for a task or its collaboration root.
+
+    Returns None if collaboration is not opted in, the root is not found,
+    the event lacks origin_route, or the route payload is malformed.
+    """
+    root_id = get_collaboration_root(conn, task_id)
+    if not root_id:
+        return None
+    row = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'collaboration_opted_in' ORDER BY id DESC LIMIT 1",
+        (root_id,),
+    ).fetchone()
+    if not row or not row["payload"]:
+        return None
+    try:
+        raw_payload = row["payload"]
+        payload = raw_payload if isinstance(raw_payload, dict) else json.loads(raw_payload)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    route = payload.get("origin_route")
+    if not isinstance(route, dict):
+        return None
+    if not str(route.get("platform") or "").strip() or not str(route.get("chat_id") or "").strip():
+        return None
+    return dict(route)
+
+
+def _collaboration_route_thread(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def collaboration_origin_route_matches_sub(
+    origin_route: Optional[Mapping[str, Any]],
+    sub: Optional[Mapping[str, Any]],
+) -> bool:
+    """True when a notify subscription is the persisted commissioning origin."""
+    if not isinstance(origin_route, Mapping) or not isinstance(sub, Mapping):
+        return False
+    if str(origin_route.get("platform") or "").strip().lower() != str(
+        sub.get("platform") or ""
+    ).strip().lower():
+        return False
+    if str(origin_route.get("chat_id") or "").strip() != str(sub.get("chat_id") or "").strip():
+        return False
+    return _collaboration_route_thread(origin_route.get("thread_id")) == _collaboration_route_thread(
+        sub.get("thread_id")
+    )
 
 
 def _find_ancestor_roots(conn: sqlite3.Connection, task_id: str) -> set[str]:

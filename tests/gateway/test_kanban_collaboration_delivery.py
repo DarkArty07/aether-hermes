@@ -142,11 +142,29 @@ def _create_opted_in_root(
     chat_id: str = "chat-100",
     thread_id: str | None = None,
     assignee: str = "morfeo",
+    session_id: str | None = None,
+    origin_route: dict[str, Any] | None = None,
 ) -> str:
     conn = _isolated_connect(board)
     try:
-        root_id = kb.create_task(conn, title="gateway root", assignee=assignee)
-        kb.opt_in_collaboration(conn, root_id, mode="advisory", session_id=chat_id)
+        raw_session_id = session_id or f"session-db-raw-{chat_id}"
+        root_id = kb.create_task(
+            conn, title="gateway root", assignee=assignee, session_id=raw_session_id
+        )
+        resolved_route = origin_route or {
+            "platform": platform,
+            "chat_id": chat_id,
+            "thread_id": thread_id,
+            "notifier_profile": "default",
+            "origin_session_id": raw_session_id,
+        }
+        kb.opt_in_collaboration(
+            conn,
+            root_id,
+            mode="advisory",
+            session_id=raw_session_id,
+            origin_route=resolved_route,
+        )
         kb.add_notify_sub(
             conn,
             task_id=root_id,
@@ -549,17 +567,38 @@ def _create_root_with_extra_sub(
     extra_platform: str,
     extra_chat_id: str,
     request_body: str,
+    thread_id: str | None = None,
+    extra_thread_id: str | None = None,
+    session_id: str | None = None,
+    origin_route: dict[str, Any] | None = None,
 ) -> str:
     """Root with two notify routes (origin + another platform) plus one request."""
     conn = _isolated_connect()
     try:
-        root_id = kb.create_task(conn, title="multi-route root", assignee="morfeo")
-        kb.opt_in_collaboration(conn, root_id, mode="advisory", session_id=chat_id)
+        raw_session_id = session_id or f"session-db-raw-{chat_id}"
+        root_id = kb.create_task(
+            conn, title="multi-route root", assignee="morfeo", session_id=raw_session_id
+        )
+        resolved_route = origin_route or {
+            "platform": platform,
+            "chat_id": chat_id,
+            "thread_id": thread_id,
+            "notifier_profile": "default",
+            "origin_session_id": raw_session_id,
+        }
+        kb.opt_in_collaboration(
+            conn,
+            root_id,
+            mode="advisory",
+            session_id=raw_session_id,
+            origin_route=resolved_route,
+        )
         kb.add_notify_sub(
             conn,
             task_id=root_id,
             platform=platform,
             chat_id=chat_id,
+            thread_id=thread_id,
             chat_type="group",
         )
         kb.add_notify_sub(
@@ -567,6 +606,7 @@ def _create_root_with_extra_sub(
             task_id=root_id,
             platform=extra_platform,
             chat_id=extra_chat_id,
+            thread_id=extra_thread_id,
         )
         child_id = kb.create_task(
             conn, title="child implementation", assignee="worker-1", parents=[root_id]
@@ -701,8 +741,12 @@ async def test_gateway_process_loss_redelivers_unconsumed_record(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_gateway_two_telegram_chats_on_one_root_stay_unavailable(monkeypatch):
-    """Two distinct telegram routes on one root stay ambiguous/unavailable."""
-    root_id = _create_opted_in_root()
+    """An extra telegram chat is not a second origin; only the commissioned chat wakes.
+
+    Pre-D5 uniqueness-among-reachable-platforms treated two telegram chats as
+    ambiguous. Extra notify subscribers do not expand the recipient.
+    """
+    root_id = _create_opted_in_root(chat_id="chat-100")
     child_id = _create_child_task(root_id, assignee="worker-1")
 
     conn = _isolated_connect()
@@ -727,16 +771,107 @@ async def test_gateway_two_telegram_chats_on_one_root_stay_unavailable(monkeypat
 
     adapter = FakeTelegramAdapter()
     runner = FakeGatewayRunner(adapter, is_busy=False)
-    wakes_delivered: list[dict[str, Any]] = []
-
-    async def fake_deliver_wake(adapt, *, text, session_id="", source=None):
-        wakes_delivered.append({"text": text})
-
-    monkeypatch.setattr("gateway.wake.deliver_wake", fake_deliver_wake)
     await _run_single_tick(runner, monkeypatch)
 
-    assert wakes_delivered == []
+    assert len(adapter.wakes) == 1
+    assert adapter.wakes[0]["event"].internal is True
+    assert adapter.wakes[0]["event"].source.chat_id == "chat-100"
     assert adapter.sends == []
+    conn = _isolated_connect()
+    try:
+        rows = kb.list_collaboration_for_task(conn, root_id)
+        assert len(rows) == 1
+        assert rows[0]["delivery_state"] == "queued"
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_gateway_same_surface_foreign_chat_ignored(monkeypatch):
+    """An extra telegram sub on the same root for a foreign chat is ignored; only commissioned chat wakes."""
+    root_id = _create_opted_in_root(chat_id="chat-100")
+    child_id = _create_child_task(root_id, assignee="worker-1")
+
+    conn = _isolated_connect()
+    try:
+        kb.add_notify_sub(
+            conn,
+            task_id=root_id,
+            platform="telegram",
+            chat_id="chat-foreign-999",
+            chat_type="group",
+        )
+        res = kb.create_collaboration_request(
+            conn,
+            task_id=child_id,
+            author="worker-1",
+            body="foreign chat ignored test",
+            recipient="origin",
+        )
+        assert res["ok"] is True
+    finally:
+        conn.close()
+
+    adapter = FakeTelegramAdapter()
+    runner = FakeGatewayRunner(adapter, is_busy=False)
+
+    await _run_single_tick(runner, monkeypatch)
+
+    assert len(adapter.wakes) == 1
+    assert adapter.wakes[0]["event"].source.chat_id == "chat-100"
+    assert "foreign chat ignored test" in adapter.wakes[0]["event"].text
+    assert adapter.sends == []
+
+
+@pytest.mark.asyncio
+async def test_origin_route_missing_stays_unavailable(monkeypatch):
+    """A root with collaboration opted in but missing origin_route stays pending/unavailable."""
+    conn = _isolated_connect()
+    try:
+        root_id = kb.create_task(conn, title="legacy opted root", assignee="morfeo")
+        kb.opt_in_collaboration(
+            conn, root_id, mode="advisory", session_id="legacy-sess"
+        )
+        kb.add_notify_sub(
+            conn, task_id=root_id, platform="telegram", chat_id="chat-100"
+        )
+        child_id = kb.create_task(
+            conn, title="child", assignee="worker-1", parents=[root_id]
+        )
+        kb.claim_task(conn, root_id)
+        assert kb.complete_task(conn, root_id)
+        conn.execute(
+            "UPDATE kanban_notify_subs SET last_event_id = "
+            "(SELECT COALESCE(MAX(id), 0) FROM task_events)"
+        )
+        conn.execute("DELETE FROM kanban_collaboration")
+        assert kb.claim_task(conn, child_id)
+        res = kb.create_collaboration_request(
+            conn,
+            task_id=child_id,
+            author="worker-1",
+            body="missing route test",
+            recipient="origin",
+        )
+        assert res["ok"] is True
+    finally:
+        conn.close()
+
+    adapter = FakeTelegramAdapter()
+    runner = FakeGatewayRunner(adapter, is_busy=False)
+    await _run_single_tick(runner, monkeypatch)
+    assert len(adapter.wakes) == 0
+
+    from tui_gateway import server as tui_server
+
+    session = {
+        "session_key": "chat-100",
+        "history_lock": threading.Lock(),
+        "running": False,
+        "_finalized": False,
+    }
+    assert tui_server._collect_kanban_collaboration(session) == []
+
     conn = _isolated_connect()
     try:
         rows = kb.list_collaboration_for_task(conn, root_id)
@@ -783,19 +918,27 @@ async def test_gateway_tui_sub_does_not_make_telegram_origin_ambiguous(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_dual_consumers_compose_without_starvation_gateway_first(monkeypatch):
-    """Gateway ticks first, then TUI collects after lease expiry: neither is starved."""
+async def test_exclusivity_commissioned_telegram_origin_gateway_first(monkeypatch):
+    """Commissioned Telegram origin: gateway delivers 1 wake; extra TUI subscriber receives 0."""
     from tui_gateway import server as tui_server
 
     monkeypatch.setattr(tui_server, "_KANBAN_COLLAB_ENQUEUED", {})
 
-    session_key = "tui-session-dual-1"
+    session_key = "tui-session-extra-1"
     root_id = _create_root_with_extra_sub(
         platform="telegram",
         chat_id="chat-100",
         extra_platform="tui",
         extra_chat_id=session_key,
-        request_body="dual consumer test gateway first",
+        request_body="telegram commissioning origin exclusivity test",
+        session_id="session-db-raw-tg-1",
+        origin_route={
+            "platform": "telegram",
+            "chat_id": "chat-100",
+            "thread_id": None,
+            "notifier_profile": "default",
+            "origin_session_id": "session-db-raw-tg-1",
+        },
     )
 
     conn = _isolated_connect()
@@ -810,13 +953,13 @@ async def test_dual_consumers_compose_without_starvation_gateway_first(monkeypat
     adapter = FakeTelegramAdapter()
     runner = FakeGatewayRunner(adapter, is_busy=False)
 
-    # 1. Gateway ticks first: 1 internal telegram wake, adapter.send == [], row queued with lease
+    # 1. Gateway ticks first: exactly 1 internal telegram wake, adapter.send == [], row queued with lease
     await _run_single_tick(runner, monkeypatch)
     assert len(adapter.wakes) == 1
     wake = adapter.wakes[0]["event"]
     assert wake.internal is True
     assert wake.source.chat_id == "chat-100"
-    assert "dual consumer test gateway first" in wake.text
+    assert "telegram commissioning origin exclusivity test" in wake.text
     assert adapter.sends == []
 
     session = {
@@ -826,13 +969,13 @@ async def test_dual_consumers_compose_without_starvation_gateway_first(monkeypat
         "_finalized": False,
     }
 
-    # Immediate TUI collect while lease is active: 0 items
+    # 2. TUI collects for extra subscriber session_key: 0 items (not commissioned origin)
     assert tui_server._collect_kanban_collaboration(session) == []
 
-    # 2. Expire lease
+    # 3. Expire lease
     _expire_collaboration_leases()
 
-    # 3. Gateway ticks again with the same live runner:
+    # 4. Gateway ticks again with the same live runner:
     # D3 hold: still 1 wake; gateway does NOT re-claim and does NOT refresh lease
     runner._running = True
     runner._ticks = 0
@@ -840,21 +983,8 @@ async def test_dual_consumers_compose_without_starvation_gateway_first(monkeypat
     assert len(adapter.wakes) == 1
     assert adapter.sends == []
 
-    # 4. TUI collects for matching session_key: 1 item, queued, not starved
-    tui_items = tui_server._collect_kanban_collaboration(session)
-    assert len(tui_items) == 1
-    collab_dict, text = tui_items[0]
-    assert collab_dict["recipient_kind"] == "origin"
-    assert collab_dict["delivery_state"] == "queued"
-    assert "dual consumer test gateway first" in text
-
-    # 5. Subsequent collects/ticks: neither consumer re-enqueues or starves
+    # 5. TUI collects again after lease expiry: still 0 items (never eligible)
     assert tui_server._collect_kanban_collaboration(session) == []
-    runner._running = True
-    runner._ticks = 0
-    await _run_single_tick(runner, monkeypatch)
-    assert len(adapter.wakes) == 1
-    assert adapter.sends == []
 
     conn = _isolated_connect()
     try:
@@ -870,19 +1000,107 @@ async def test_dual_consumers_compose_without_starvation_gateway_first(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_dual_consumers_compose_without_starvation_tui_first(monkeypatch):
-    """TUI collects first, then Gateway ticks after lease expiry: neither is starved."""
+async def test_exclusivity_commissioned_telegram_origin_tui_first(monkeypatch):
+    """Commissioned Telegram origin, TUI ticks first: TUI collects 0; gateway delivers 1."""
     from tui_gateway import server as tui_server
 
     monkeypatch.setattr(tui_server, "_KANBAN_COLLAB_ENQUEUED", {})
 
-    session_key = "tui-session-dual-2"
+    session_key = "tui-session-extra-2"
     root_id = _create_root_with_extra_sub(
         platform="telegram",
         chat_id="chat-100",
         extra_platform="tui",
         extra_chat_id=session_key,
-        request_body="dual consumer test tui first",
+        request_body="telegram origin tui first test",
+        session_id="session-db-raw-tg-2",
+        origin_route={
+            "platform": "telegram",
+            "chat_id": "chat-100",
+            "thread_id": None,
+            "notifier_profile": "default",
+            "origin_session_id": "session-db-raw-tg-2",
+        },
+    )
+
+    conn = _isolated_connect()
+    try:
+        pre_cursors = {
+            sub["chat_id"]: sub["last_event_id"]
+            for sub in kb.list_notify_subs(conn, task_id=root_id)
+        }
+    finally:
+        conn.close()
+
+    session = {
+        "session_key": session_key,
+        "history_lock": threading.Lock(),
+        "running": False,
+        "_finalized": False,
+    }
+
+    # 1. TUI collects first: 0 items (origin is Telegram, TUI is extra subscriber)
+    assert tui_server._collect_kanban_collaboration(session) == []
+
+    adapter = FakeTelegramAdapter()
+    runner = FakeGatewayRunner(adapter, is_busy=False)
+
+    # 2. Gateway ticks: exactly 1 internal telegram wake, adapter.send == []
+    await _run_single_tick(runner, monkeypatch)
+    assert len(adapter.wakes) == 1
+    wake = adapter.wakes[0]["event"]
+    assert wake.internal is True
+    assert wake.source.chat_id == "chat-100"
+    assert "telegram origin tui first test" in wake.text
+    assert adapter.sends == []
+
+    # 3. Expire lease
+    _expire_collaboration_leases()
+
+    # 4. TUI collects again: still 0 items
+    assert tui_server._collect_kanban_collaboration(session) == []
+
+    # 5. Gateway ticks again: 0 wakes (D3 hold, still 1 total wake)
+    runner._running = True
+    runner._ticks = 0
+    await _run_single_tick(runner, monkeypatch)
+    assert len(adapter.wakes) == 1
+    assert adapter.sends == []
+
+    conn = _isolated_connect()
+    try:
+        rows = kb.list_collaboration_for_task(conn, root_id)
+        assert len(rows) == 1
+        assert rows[0]["delivery_state"] == "queued"
+        assert rows[0]["acknowledged_at"] is None
+        for sub in kb.list_notify_subs(conn, task_id=root_id):
+            assert sub.get("last_event_id") == pre_cursors[sub["chat_id"]]
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_exclusivity_commissioned_tui_origin_tui_first(monkeypatch):
+    """Commissioned TUI origin, TUI collects first: TUI collects 1; extra Telegram subscriber receives 0."""
+    from tui_gateway import server as tui_server
+
+    monkeypatch.setattr(tui_server, "_KANBAN_COLLAB_ENQUEUED", {})
+
+    session_key = "tui-session-origin-1"
+    root_id = _create_root_with_extra_sub(
+        platform="tui",
+        chat_id=session_key,
+        extra_platform="telegram",
+        extra_chat_id="chat-extra-200",
+        request_body="tui origin exclusivity test",
+        session_id="session-db-raw-tui-1",
+        origin_route={
+            "platform": "tui",
+            "chat_id": session_key,
+            "thread_id": None,
+            "notifier_profile": "default",
+            "origin_session_id": "session-db-raw-tui-1",
+        },
     )
 
     conn = _isolated_connect()
@@ -907,12 +1125,12 @@ async def test_dual_consumers_compose_without_starvation_tui_first(monkeypatch):
     collab_dict, text = tui_items[0]
     assert collab_dict["recipient_kind"] == "origin"
     assert collab_dict["delivery_state"] == "queued"
-    assert "dual consumer test tui first" in text
+    assert "tui origin exclusivity test" in text
 
     adapter = FakeTelegramAdapter()
     runner = FakeGatewayRunner(adapter, is_busy=False)
 
-    # 2. Gateway tick while lease is active: 0 wakes
+    # 2. Gateway ticks while lease is active: 0 wakes (origin is TUI, gateway ignores)
     await _run_single_tick(runner, monkeypatch)
     assert len(adapter.wakes) == 0
     assert adapter.sends == []
@@ -921,26 +1139,14 @@ async def test_dual_consumers_compose_without_starvation_tui_first(monkeypatch):
     _expire_collaboration_leases()
 
     # 4. TUI collects again with the same live process:
-    # TUI already enqueued it, so it does NOT re-claim or refresh lease; returns 0 items
+    # D3 hold: already enqueued, returns 0 items
     assert tui_server._collect_kanban_collaboration(session) == []
 
-    # 5. Gateway ticks: claims and delivers 1 internal wake to telegram
+    # 5. Gateway ticks after lease expiry: still 0 wakes (never eligible)
     runner._running = True
     runner._ticks = 0
     await _run_single_tick(runner, monkeypatch)
-    assert len(adapter.wakes) == 1
-    wake = adapter.wakes[0]["event"]
-    assert wake.internal is True
-    assert wake.source.chat_id == "chat-100"
-    assert "dual consumer test tui first" in wake.text
-    assert adapter.sends == []
-
-    # 6. Subsequent collects/ticks: neither consumer re-enqueues or starves
-    assert tui_server._collect_kanban_collaboration(session) == []
-    runner._running = True
-    runner._ticks = 0
-    await _run_single_tick(runner, monkeypatch)
-    assert len(adapter.wakes) == 1
+    assert len(adapter.wakes) == 0
     assert adapter.sends == []
 
     conn = _isolated_connect()
@@ -949,7 +1155,87 @@ async def test_dual_consumers_compose_without_starvation_tui_first(monkeypatch):
         assert len(rows) == 1
         assert rows[0]["delivery_state"] == "queued"
         assert rows[0]["acknowledged_at"] is None
-        # Verify ordinary notification cursor was untouched
+        for sub in kb.list_notify_subs(conn, task_id=root_id):
+            assert sub.get("last_event_id") == pre_cursors[sub["chat_id"]]
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_exclusivity_commissioned_tui_origin_gateway_first(monkeypatch):
+    """Commissioned TUI origin, Gateway ticks first: Gateway wakes 0; TUI collects 1."""
+    from tui_gateway import server as tui_server
+
+    monkeypatch.setattr(tui_server, "_KANBAN_COLLAB_ENQUEUED", {})
+
+    session_key = "tui-session-origin-2"
+    root_id = _create_root_with_extra_sub(
+        platform="tui",
+        chat_id=session_key,
+        extra_platform="telegram",
+        extra_chat_id="chat-extra-201",
+        request_body="tui origin gateway first test",
+        session_id="session-db-raw-tui-2",
+        origin_route={
+            "platform": "tui",
+            "chat_id": session_key,
+            "thread_id": None,
+            "notifier_profile": "default",
+            "origin_session_id": "session-db-raw-tui-2",
+        },
+    )
+
+    conn = _isolated_connect()
+    try:
+        pre_cursors = {
+            sub["chat_id"]: sub["last_event_id"]
+            for sub in kb.list_notify_subs(conn, task_id=root_id)
+        }
+    finally:
+        conn.close()
+
+    adapter = FakeTelegramAdapter()
+    runner = FakeGatewayRunner(adapter, is_busy=False)
+
+    # 1. Gateway ticks first: 0 wakes (platform is TUI, gateway does not touch)
+    await _run_single_tick(runner, monkeypatch)
+    assert len(adapter.wakes) == 0
+    assert adapter.sends == []
+
+    session = {
+        "session_key": session_key,
+        "history_lock": threading.Lock(),
+        "running": False,
+        "_finalized": False,
+    }
+
+    # 2. TUI collects for matching session_key: 1 item, queued
+    tui_items = tui_server._collect_kanban_collaboration(session)
+    assert len(tui_items) == 1
+    collab_dict, text = tui_items[0]
+    assert collab_dict["recipient_kind"] == "origin"
+    assert collab_dict["delivery_state"] == "queued"
+    assert "tui origin gateway first test" in text
+
+    # 3. Expire lease
+    _expire_collaboration_leases()
+
+    # 4. Gateway ticks again after lease expiry: still 0 wakes
+    runner._running = True
+    runner._ticks = 0
+    await _run_single_tick(runner, monkeypatch)
+    assert len(adapter.wakes) == 0
+    assert adapter.sends == []
+
+    # 5. TUI collects again: 0 items (D3 hold)
+    assert tui_server._collect_kanban_collaboration(session) == []
+
+    conn = _isolated_connect()
+    try:
+        rows = kb.list_collaboration_for_task(conn, root_id)
+        assert len(rows) == 1
+        assert rows[0]["delivery_state"] == "queued"
+        assert rows[0]["acknowledged_at"] is None
         for sub in kb.list_notify_subs(conn, task_id=root_id):
             assert sub.get("last_event_id") == pre_cursors[sub["chat_id"]]
     finally:

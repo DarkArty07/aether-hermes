@@ -786,12 +786,57 @@ class GatewayKanbanWatchersMixin:
                                         if row.get("root_task_id")
                                     }
                                     for _collab_root in sorted(_collab_roots):
-                                        # Filter remembered ids before claim: if
-                                        # all pending rows for this root have
-                                        # already been woken by this live process,
-                                        # skip claiming so we do not refresh the
-                                        # exclusive lease and starve other consumers
-                                        # (e.g. TUI) watching this root.
+                                        # Match origin before claim: recover the trusted commissioning
+                                        # origin route from the root's opt-in event. Other notify
+                                        # subscriptions on this root are not collaboration recipients and
+                                        # must not select the origin or make a unique route ambiguous.
+                                        _origin_route = None
+                                        _get_origin_route = getattr(
+                                            _kb, "get_collaboration_origin_route", None
+                                        )
+                                        if callable(_get_origin_route):
+                                            try:
+                                                _origin_route = _get_origin_route(
+                                                    conn, _collab_root
+                                                )
+                                            except Exception:
+                                                pass
+                                        if not _origin_route or not isinstance(_origin_route, dict):
+                                            # Older opted-in record without origin_route or missing root:
+                                            # stays pending/unavailable; no wake, no fallback, no backfill.
+                                            continue
+
+                                        _route_platform = (
+                                            str(_origin_route.get("platform") or "")
+                                            .strip()
+                                            .lower()
+                                        )
+                                        if not _route_platform or _route_platform not in active_platforms:
+                                            # Not a platform this gateway can reach (e.g. tui, or inactive).
+                                            continue
+
+                                        _matches = getattr(
+                                            _kb,
+                                            "collaboration_origin_route_matches_sub",
+                                            None,
+                                        )
+                                        if not callable(_matches):
+                                            continue
+                                        _matching_subs = [
+                                            sub
+                                            for sub in subs
+                                            if sub.get("task_id") == _collab_root
+                                            and _matches(_origin_route, sub)
+                                        ]
+                                        if len(_matching_subs) != 1:
+                                            # Missing/closed or ambiguous duplicate route:
+                                            # stays pending/unavailable; no wake, no reroute, no guessing.
+                                            continue
+                                        _origin_sub = _matching_subs[0]
+
+                                        # Filter remembered ids before claim: if all pending rows for this
+                                        # root have already been woken by this live process, skip claiming
+                                        # so we do not refresh the exclusive lease.
                                         _pending_for_root = [
                                             row
                                             for row in _collab_rows
@@ -805,59 +850,6 @@ class GatewayKanbanWatchersMixin:
                                         ):
                                             continue
 
-                                        _all_root_subs = [
-                                            sub
-                                            for sub in _kb.list_notify_subs(conn)
-                                            if sub.get("task_id") == _collab_root
-                                        ]
-                                        # The root subscription is the trusted
-                                        # commissioning identity. Inherited child
-                                        # rows are deliberately not a fallback:
-                                        # a missing/closed root must remain
-                                        # visible/unavailable, never rerouted.
-                                        _origin_subs = [
-                                            sub for sub in subs
-                                            if sub.get("task_id") == _collab_root
-                                        ]
-                                        # Uniqueness is scoped to the platforms
-                                        # THIS consumer can deliver to. A root
-                                        # also watched from a platform this
-                                        # gateway has no adapter for (the
-                                        # tui_gateway process owns ``tui``
-                                        # sessions) is not an ambiguity here,
-                                        # while two chat routes on a platform we
-                                        # do host genuinely are: the exact
-                                        # origin chat/thread cannot be inferred,
-                                        # so the message stays unavailable
-                                        # instead of being rerouted.
-                                        _reachable_routes = {
-                                            _collaboration_route_key(sub): sub
-                                            for sub in _all_root_subs
-                                            if str(sub.get("platform") or "").lower()
-                                            in active_platforms
-                                        }
-                                        if len(_reachable_routes) > 1:
-                                            logger.warning(
-                                                "kanban collaboration: origin for root %s is ambiguous on board %s; leaving messages unavailable",
-                                                _collab_root,
-                                                slug,
-                                            )
-                                            continue
-                                        _routes = {
-                                            _collaboration_route_key(_origin_sub): _origin_sub
-                                            for _origin_sub in _origin_subs
-                                            if str(_origin_sub.get("platform") or "").lower()
-                                            in active_platforms
-                                        }
-                                        if len(_routes) != 1:
-                                            # No route this consumer owns and can
-                                            # reach: the origin is missing/closed
-                                            # (or owned by another gateway), so the
-                                            # messages stay visible and unavailable.
-                                            # More than one such route was already
-                                            # left unavailable as ambiguous above.
-                                            continue
-                                        _origin_sub = next(iter(_routes.values()))
                                         _claimed_collab = _collab_claim(
                                             conn,
                                             recipient_kind="origin",

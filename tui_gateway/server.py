@@ -9881,7 +9881,12 @@ def _collect_kanban_collaboration(session: dict) -> list:
     Returns list of (claimed_collab_dict, formatted_text) tuples.
     """
     session_key = str(session.get("session_key") or "")
-    if not session_key or session.get("_finalized"):
+    if (
+        not session_key
+        or session.get("_finalized")
+        or session.get("closed")
+        or session.get("status") == "closed"
+    ):
         return []
     if session.get("running"):
         return []
@@ -9945,6 +9950,7 @@ def _collect_kanban_collaboration(session: dict) -> list:
 
         try:
             subs = _kb.list_notify_subs(conn)
+            seen_roots: set = set()
             for sub in subs:
                 if (sub.get("platform") or "").lower() != "tui":
                     continue
@@ -9952,30 +9958,48 @@ def _collect_kanban_collaboration(session: dict) -> list:
                     continue
                 sub_task_id = sub["task_id"]
                 root_id = _kb.get_collaboration_root(conn, sub_task_id)
-                if not root_id:
+                if not root_id or root_id in seen_roots:
                     continue
+                seen_roots.add(root_id)
+
+                # Match origin before claim using common native route accessor
+                _origin_route = None
+                _get_origin_route = getattr(_kb, "get_collaboration_origin_route", None)
+                if callable(_get_origin_route):
+                    try:
+                        _origin_route = _get_origin_route(conn, root_id)
+                    except Exception:
+                        pass
+                if not _origin_route or not isinstance(_origin_route, dict):
+                    # Older opted-in record without origin_route or missing root:
+                    # stays pending/unavailable; no wake, no fallback, no backfill.
+                    continue
+
+                _matches = getattr(_kb, "collaboration_origin_route_matches_sub", None)
+                if not callable(_matches):
+                    continue
+                if str(_origin_route.get("platform") or "").strip().lower() != "tui":
+                    # Commissioned origin is not TUI (e.g. telegram); TUI must not claim it.
+                    continue
+                if str(_origin_route.get("chat_id") or "").strip() != session_key:
+                    # Commissioned origin is a different TUI session; must not claim it.
+                    continue
+
                 root_subs = [
                     root_sub
                     for root_sub in subs
-                    if (root_sub.get("platform") or "").lower() == "tui"
-                    and root_sub.get("chat_id") == session_key
-                    and root_sub.get("task_id") == root_id
+                    if root_sub.get("task_id") == root_id
+                    and _matches(_origin_route, root_sub)
                 ]
-                root_routes = {
-                    _tui_collaboration_route_key(root_sub): root_sub
-                    for root_sub in root_subs
-                }
-                if len(root_routes) != 1:
-                    # A removed or ambiguous root route is unavailable; never
+                if len(root_subs) != 1:
+                    # A missing or ambiguous duplicate root route is unavailable; never
                     # reroute the message through an inherited child row.
                     continue
-                origin_sub = next(iter(root_routes.values()))
-                if _tui_collaboration_route_key(sub) != _tui_collaboration_route_key(origin_sub):
-                    continue
+                origin_sub = root_subs[0]
+
                 # Filter remembered ids before claim: if all pending rows for this
                 # root have already been enqueued for this live session, skip claim
-                # so we do not hold/refresh the lease and starve other consumers
-                # (e.g. gateway) watching this root.
+                # so we do not hold/refresh the lease and starve other consumers.
                 _collab_list = getattr(_kb, "list_pending_collaboration", None)
                 if callable(_collab_list):
                     try:
@@ -10013,9 +10037,7 @@ def _collect_kanban_collaboration(session: dict) -> list:
                         # Already queued into this live session. CORE's claim
                         # reclaimed an expired lease, but that reclaim is the
                         # process-loss redelivery path — not a second turn for
-                        # a session that already has the record. Rewind immediately
-                        # so this process does not exclusive-hold a row it will
-                        # not deliver.
+                        # a session that already has the record. Rewind immediately.
                         _kanban_rewind_collaboration(conn, c)
                         continue
                     task = _kb.get_task(conn, c.get("task_id") or sub_task_id)

@@ -1574,14 +1574,6 @@ def _handle_create(args: dict, **kw) -> str:
     parents = args.get("parents") or []
     tenant = args.get("tenant") or os.environ.get("HERMES_TENANT")
 
-    collaboration = args.get("collaboration")
-    if collaboration is not None:
-        if collaboration != "advisory":
-            return tool_error(f"collaboration mode must be 'advisory', got {collaboration!r}")
-        if parents:
-            return tool_error("child tasks cannot enable or override collaboration; collaboration opt-in is only valid on a new root task")
-        if os.environ.get("HERMES_KANBAN_TASK"):
-            return tool_error("only the trusted originating session may opt in a root task for collaboration")
     # Stamp the originating session id when the agent loop runs under
     # ACP (which sets HERMES_SESSION_ID before invoking tools). NULL on
     # CLI / dashboard paths and on legacy hosts that don't set the env.
@@ -1595,6 +1587,22 @@ def _handle_create(args: dict, **kw) -> str:
     # context.  Never accept a model-provided session id: doing so would let a
     # task redirect notifications or wakes into an unrelated conversation.
     session_id = _current_origin_session_id() or os.environ.get("HERMES_SESSION_ID")
+
+    collaboration = args.get("collaboration")
+    origin_route = None
+    if collaboration is not None:
+        if collaboration != "advisory":
+            return tool_error(f"collaboration mode must be 'advisory', got {collaboration!r}")
+        if parents:
+            return tool_error("child tasks cannot enable or override collaboration; collaboration opt-in is only valid on a new root task")
+        if os.environ.get("HERMES_KANBAN_TASK"):
+            return tool_error("only the trusted originating session may opt in a root task for collaboration")
+        origin_route = _resolve_commissioning_origin_route(session_id=session_id)
+        if not origin_route:
+            return tool_error(
+                "collaboration opt-in requires trusted commissioning session context "
+                "(platform and chat_id/session_key)"
+            )
     priority = args.get("priority")
     # Resolve workspace. Workspace sharing is always explicit: omitted fields
     # mean a fresh scratch workspace, even when a dispatcher-spawned worker
@@ -1773,7 +1781,14 @@ def _handle_create(args: dict, **kw) -> str:
             )
             new_task = kb.get_task(conn, new_tid)
             if collaboration == "advisory":
-                kb.opt_in_collaboration(conn, new_tid, mode="advisory", session_id=session_id, board=target_board)
+                kb.opt_in_collaboration(
+                    conn,
+                    new_tid,
+                    mode="advisory",
+                    session_id=session_id,
+                    board=target_board,
+                    origin_route=origin_route,
+                )
             subscribed = _maybe_auto_subscribe(conn, new_tid)
             return _ok(
                 task_id=new_tid,
@@ -1793,66 +1808,15 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(f"kanban_create: {e}")
 
 
-def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
-    """Auto-subscribe the calling session to task completion / block events.
+def _resolve_commissioning_origin_route(
+    session_id: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
+    """Resolve trusted commissioning origin route from request/session context.
 
-    Returns True if a subscription row was written, False otherwise (no
-    session context, config gate disabled, or best-effort failure). The
-    caller surfaces this in the ``subscribed`` field of the kanban_create
-    response so an orchestrator can decide whether to fall back to an
-    explicit ``kanban_notify-subscribe`` or to polling.
-
-    Gated by ``kanban.auto_subscribe_on_create`` in config.yaml (default
-    True). Disable to mirror pre-feature behaviour, e.g. when the
-    originating user/chat opted out via the per-platform notification
-    toggle (see ``hermes dashboard``).
-
-    Subscription paths:
-
-    - **Gateway** (telegram/discord/slack/etc): ``HERMES_SESSION_PLATFORM``,
-      ``HERMES_SESSION_CHAT_ID``, and ``HERMES_SESSION_CHAT_TYPE`` are set in
-      ContextVars by the messaging gateway before agent dispatch. The
-      notification poller already keys off these, so we just register a row.
-
-    - **TUI** (herm desktop / herm TUI): the platform/chat_id ContextVars
-      are intentionally cleared (TUI is a single-channel local UI, not
-      a multi-tenant chat surface), but the agent subprocess inherits
-      ``HERMES_SESSION_KEY`` from the parent session. We subscribe with
-      ``platform="tui"`` and ``chat_id=<key>``; the TUI notification
-      poller (``tui_gateway/server.py``) reads ``kanban_notify_subs``
-      for these rows and posts the completion message into the running
-      session.
-
-    - **CLI / cron / test / unattached**: no persistent delivery channel,
-      no-op.
-
-    Failure mode: any exception inside the function is logged at WARNING
-    with the offending exception + diagnostic env vars and swallowed.
-    We never want a notification bookkeeping failure to fail the
-    kanban_create that the agent is mid-conversation about.
+    Returns a dict with minimal identity: platform, chat_id, thread_id, notifier_profile,
+    origin_session_id, plus native chat_type, user_id, user_id_alt, message_id, and
+    delivery_metadata. Returns None if context is missing, empty, or conflicting.
     """
-    try:
-        cfg = load_config()
-        if not cfg_get(cfg, "kanban", "auto_subscribe_on_create", default=True):
-            return False
-    except Exception:
-        # If config can't load we still default to True — this is the
-        # user-friendly behaviour that mirrors the pre-gate implementation.
-        pass
-
-    try:
-        from hermes_cli import kanban_db as _kb
-
-        _task = _kb.get_task(conn, task_id)
-        if _task and _task.session_affinity:
-            _affinity = _kb.normalize_session_affinity(_task.session_affinity)
-            if not _affinity:
-                return False
-    except Exception:
-        # Subscription bookkeeping is best-effort, but a malformed affinity
-        # value must not broaden delivery to an ordinary internal child.
-        return False
-
     platform = ""
     chat_id = ""
     notifier_profile = ""
@@ -1865,15 +1829,26 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
 
     try:
         from gateway.session_context import get_session_env
-        platform = (
+        gw_platform = (
             get_session_env("HERMES_SESSION_PLATFORM", "")
             or os.environ.get("HERMES_SESSION_PLATFORM", "")
         )
-        chat_id = (
+        gw_chat_id = (
             get_session_env("HERMES_SESSION_CHAT_ID", "")
             or os.environ.get("HERMES_SESSION_CHAT_ID", "")
         )
-        if platform and chat_id:
+        tui_session_key = (
+            get_session_env("HERMES_SESSION_KEY", "")
+            or os.environ.get("HERMES_SESSION_KEY", "")
+        )
+
+        # Conflicting context: gateway platform without chat_id or vice versa
+        if (gw_platform and not gw_chat_id) or (gw_chat_id and not gw_platform):
+            return None
+
+        if gw_platform and gw_chat_id:
+            platform = gw_platform.strip()
+            chat_id = gw_chat_id.strip()
             chat_type = (
                 get_session_env("HERMES_SESSION_CHAT_TYPE", "")
                 or os.environ.get("HERMES_SESSION_CHAT_TYPE", "")
@@ -1899,39 +1874,53 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
                 or os.environ.get("HERMES_SESSION_MESSAGE_ID", "")
                 or ""
             )
+        elif tui_session_key:
+            platform = "tui"
+            chat_id = tui_session_key.strip()
         else:
-            session_key = (
-                get_session_env("HERMES_SESSION_KEY", "")
-                or os.environ.get("HERMES_SESSION_KEY", "")
+            from gateway.session_context import get_kanban_notification_origin
+            notif_origin = get_kanban_notification_origin()
+            if not notif_origin or not isinstance(notif_origin, dict):
+                return None
+
+            notif_platform = str(notif_origin.get("platform") or "").strip()
+            notif_chat_id = str(
+                notif_origin.get("chat_id")
+                or notif_origin.get("session_key")
+                or ""
+            ).strip()
+            if not notif_platform or not notif_chat_id:
+                return None
+
+            platform = notif_platform
+            chat_id = notif_chat_id
+            chat_type = (
+                str(notif_origin["chat_type"])
+                if notif_origin.get("chat_type") is not None
+                else None
             )
-            if session_key:
-                platform = "tui"
-                chat_id = session_key
-            else:
-                # Ordinary inbound session routing is absent (e.g. in cron run).
-                # Check for request-local notification origin from cron (#393).
-                from gateway.session_context import get_kanban_notification_origin
-                notif_origin = get_kanban_notification_origin()
-                if not notif_origin or not isinstance(notif_origin, dict):
-                    return False  # CLI / cron / test — no persistent channel
+            thread_id = (
+                str(notif_origin["thread_id"])
+                if notif_origin.get("thread_id") is not None
+                else None
+            )
+            user_id = (
+                str(notif_origin["user_id"])
+                if notif_origin.get("user_id") is not None
+                else None
+            )
+            user_id_alt = (
+                str(notif_origin["user_id_alt"])
+                if notif_origin.get("user_id_alt") is not None
+                else None
+            )
+            message_id = str(notif_origin.get("message_id") or "")
+            notifier_profile = str(notif_origin.get("notifier_profile") or "")
+            ui_session_id = notif_origin.get("ui_session_id")
 
-                notif_platform = str(notif_origin.get("platform") or "").strip()
-                notif_chat_id = str(notif_origin.get("chat_id") or notif_origin.get("session_key") or "").strip()
-                if not notif_platform or not notif_chat_id:
-                    return False
+        if not platform or not chat_id:
+            return None
 
-                platform = notif_platform
-                chat_id = notif_chat_id
-                chat_type = str(notif_origin["chat_type"]) if notif_origin.get("chat_type") is not None else None
-                thread_id = str(notif_origin["thread_id"]) if notif_origin.get("thread_id") is not None else None
-                user_id = str(notif_origin["user_id"]) if notif_origin.get("user_id") is not None else None
-                user_id_alt = str(notif_origin["user_id_alt"]) if notif_origin.get("user_id_alt") is not None else None
-                message_id = str(notif_origin.get("message_id") or "")
-                notifier_profile = str(notif_origin.get("notifier_profile") or "")
-                ui_session_id = notif_origin.get("ui_session_id")
-
-        is_gateway_session = platform != "tui"
-        delivery_mode = "notify+wake" if is_gateway_session else None
         if not notifier_profile:
             notifier_profile = (
                 get_session_env("HERMES_SESSION_PROFILE", "")
@@ -1943,13 +1932,14 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
                 notifier_profile = get_active_profile_name() or "default"
             except Exception:
                 notifier_profile = "default"
+
         delivery_metadata: dict[str, Any] = {}
         if ui_session_id:
             delivery_metadata["ui_session_id"] = ui_session_id
         if thread_id:
-            delivery_metadata["thread_id"] = thread_id
+            delivery_metadata["thread_id"] = str(thread_id)
         if chat_type:
-            delivery_metadata["chat_type"] = chat_type
+            delivery_metadata["chat_type"] = str(chat_type)
         if message_id:
             delivery_metadata["message_id"] = str(message_id)
         if (
@@ -1963,22 +1953,90 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
             if message_id:
                 delivery_metadata["telegram_reply_to_message_id"] = str(message_id)
 
-        # Lazy-import to keep the module-level dependency light
+        return {
+            "platform": platform.lower(),
+            "chat_id": str(chat_id),
+            "thread_id": str(thread_id) if thread_id is not None else None,
+            "notifier_profile": str(notifier_profile or "default"),
+            "origin_session_id": str(session_id) if session_id is not None else None,
+            "chat_type": str(chat_type) if chat_type is not None else None,
+            "user_id": str(user_id) if user_id is not None else None,
+            "user_id_alt": str(user_id_alt) if user_id_alt is not None else None,
+            "message_id": str(message_id) if message_id else None,
+            "delivery_metadata": delivery_metadata or None,
+        }
+    except Exception as exc:
+        logger.warning("Failed to resolve commissioning origin route: %s", exc)
+        return None
+
+
+def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
+    """Auto-subscribe the calling session to task completion / block events.
+
+    Returns True if a subscription row was written, False otherwise (no
+    session context, config gate disabled, or best-effort failure). The
+    caller surfaces this in the ``subscribed`` field of the kanban_create
+    response so an orchestrator can decide whether to fall back to an
+    explicit ``kanban_notify-subscribe`` or to polling.
+
+    Gated by ``kanban.auto_subscribe_on_create`` in config.yaml (default
+    True). Disable to mirror pre-feature behaviour, e.g. when the
+    originating user/chat opted out via the per-platform notification
+    toggle (see ``hermes dashboard``).
+    """
+    try:
+        cfg = load_config()
+        if not cfg_get(cfg, "kanban", "auto_subscribe_on_create", default=True):
+            return False
+    except Exception:
+        # If config can't load we still default to True — this is the
+        # user-friendly behaviour that mirrors the pre-gate implementation.
+        pass
+
+    try:
+        from hermes_cli import kanban_db as _kb
+
+        _task = _kb.get_task(conn, task_id)
+        if _task and _task.session_affinity:
+            _affinity = _kb.normalize_session_affinity(_task.session_affinity)
+            if not _affinity:
+                return False
+    except Exception:
+        # Subscription bookkeeping is best-effort, but a malformed affinity
+        # value must not broaden delivery to an ordinary internal child.
+        return False
+
+    try:
+        route = _resolve_commissioning_origin_route()
+        if not route:
+            return False
+
+        platform = route["platform"]
+        chat_id = route["chat_id"]
+        is_gateway_session = platform != "tui"
+        delivery_mode = "notify+wake" if is_gateway_session else None
+
         from hermes_cli import kanban_db as _kb
         _kb.add_notify_sub(
-            conn, task_id=task_id,
-            platform=platform, chat_id=chat_id,
-            thread_id=thread_id, user_id=user_id, user_id_alt=user_id_alt,
-            chat_type=chat_type,
-            notifier_profile=notifier_profile,
+            conn,
+            task_id=task_id,
+            platform=platform,
+            chat_id=chat_id,
+            thread_id=route.get("thread_id"),
+            user_id=route.get("user_id"),
+            user_id_alt=route.get("user_id_alt"),
+            chat_type=route.get("chat_type"),
+            notifier_profile=route.get("notifier_profile") or "default",
             delivery_mode=delivery_mode,
-            delivery_metadata=delivery_metadata or None,
+            delivery_metadata=route.get("delivery_metadata"),
         )
         return True
     except Exception as _exc:
         logger.warning(
-            "_maybe_auto_subscribe failed: %r (platform=%r key_set=%r)",
-            _exc, platform, bool(chat_id),
+            "_maybe_auto_subscribe failed for task %s: %s",
+            task_id,
+            _exc,
+            exc_info=True,
         )
         return False
 

@@ -10,6 +10,7 @@ Covers:
 - kanban_show includes bounded collaboration list
 - inject_new_comments_from_env peer labeling as non-owner evidence (not operator out-of-band)
 """
+
 from __future__ import annotations
 
 import json
@@ -51,6 +52,9 @@ def isolated_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(kanban_home))
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_home"))
     monkeypatch.setenv("HERMES_PROFILE", "implementer")
+    # Distinct namespaces: raw SessionDB id is not the TUI session key.
+    monkeypatch.setenv("HERMES_SESSION_KEY", "tui-origin-session-tools")
+    monkeypatch.setenv("HERMES_SESSION_ID", "session-db-raw-tools")
     db_path = kb.kanban_db_path()
     assert_isolated_db_path(db_path, tmp_path)
     return kanban_home
@@ -68,14 +72,25 @@ def test_kanban_tools_schema_collaboration_registration() -> None:
     assert comment_params["collaboration"]["type"] == "object"
     collab_props = comment_params["collaboration"].get("properties", {})
     assert "action" in collab_props
-    assert set(collab_props["action"].get("enum", [])) == {"request", "respond", "ack", "resolve"}
+    assert set(collab_props["action"].get("enum", [])) == {
+        "request",
+        "respond",
+        "ack",
+        "resolve",
+    }
 
 
-def test_kanban_create_collaboration_opt_in_and_child_refusal(isolated_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_kanban_create_collaboration_opt_in_and_child_refusal(
+    isolated_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """kanban_create allows advisory on root from origin; rejects child opt-in or non-advisory mode."""
     # 1. Root creation with collaboration="advisory" succeeds
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
-    res_str = kt._handle_create({"title": "Root Task", "assignee": "supervisor", "collaboration": "advisory"})
+    res_str = kt._handle_create({
+        "title": "Root Task",
+        "assignee": "supervisor",
+        "collaboration": "advisory",
+    })
     res = json.loads(res_str)
     assert res.get("ok") is True
     root_id = res["task_id"]
@@ -83,18 +98,31 @@ def test_kanban_create_collaboration_opt_in_and_child_refusal(isolated_env: Path
     conn = kb.connect()
     try:
         assert kb.get_collaboration_root(conn, root_id) == root_id
+        route = kb.get_collaboration_origin_route(conn, root_id)
+        assert route is not None
+        assert route["platform"] == "tui"
+        assert route["chat_id"] == "tui-origin-session-tools"
+        assert route["origin_session_id"] == "session-db-raw-tools"
+        assert route["chat_id"] != route["origin_session_id"]
     finally:
         conn.close()
 
     # 2. Invalid mode fails
-    res_err_str = kt._handle_create({"title": "Bad Mode", "assignee": "supervisor", "collaboration": "invalid_mode"})
+    res_err_str = kt._handle_create({
+        "title": "Bad Mode",
+        "assignee": "supervisor",
+        "collaboration": "invalid_mode",
+    })
     res_err = json.loads(res_err_str)
     assert "error" in res_err
     assert "advisory" in res_err.get("error", "")
 
     # 3. Child cannot enable or override collaboration
     res_child_err_str = kt._handle_create({
-        "title": "Child Task", "assignee": "implementer", "parents": [root_id], "collaboration": "advisory"
+        "title": "Child Task",
+        "assignee": "implementer",
+        "parents": [root_id],
+        "collaboration": "advisory",
     })
     res_child_err = json.loads(res_child_err_str)
     assert "error" in res_child_err
@@ -102,19 +130,57 @@ def test_kanban_create_collaboration_opt_in_and_child_refusal(isolated_env: Path
 
     # 4. Worker process cannot opt in a root
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_some_worker")
-    res_worker_err_str = kt._handle_create({"title": "Worker Root", "assignee": "supervisor", "collaboration": "advisory"})
+    res_worker_err_str = kt._handle_create({
+        "title": "Worker Root",
+        "assignee": "supervisor",
+        "collaboration": "advisory",
+    })
     res_worker_err = json.loads(res_worker_err_str)
     assert "error" in res_worker_err
     assert "originating" in res_worker_err.get("error", "").lower()
 
 
-def test_kanban_comment_request_and_response_tool_flow(isolated_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_kanban_create_advisory_requires_commissioning_context(
+    isolated_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Missing platform/chat/session_key refuses advisory opt-in; no silent fallback."""
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    res = json.loads(
+        kt._handle_create({
+            "title": "No Context Root",
+            "assignee": "supervisor",
+            "collaboration": "advisory",
+        })
+    )
+    assert "error" in res
+    assert "commissioning" in res.get("error", "").lower()
+
+
+def test_kanban_comment_request_and_response_tool_flow(
+    isolated_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """kanban_comment tool executes request -> ack -> respond -> resolve and returns collaboration fields."""
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
-    root_res = json.loads(kt._handle_create({"title": "Root", "assignee": "supervisor", "collaboration": "advisory"}))
+    root_res = json.loads(
+        kt._handle_create({
+            "title": "Root",
+            "assignee": "supervisor",
+            "collaboration": "advisory",
+        })
+    )
     root_id = root_res["task_id"]
 
-    child_res = json.loads(kt._handle_create({"title": "Unit", "assignee": "implementer", "parents": [root_id]}))
+    child_res = json.loads(
+        kt._handle_create({
+            "title": "Unit",
+            "assignee": "implementer",
+            "parents": [root_id],
+        })
+    )
     child_id = child_res["task_id"]
 
     conn = kb.connect()
@@ -198,16 +264,28 @@ def test_kanban_comment_request_and_response_tool_flow(isolated_env: Path, monke
     assert resv_res["status"] == "resolved"
 
 
-def test_kanban_comment_truncation_sentinel_refusal(isolated_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_kanban_comment_truncation_sentinel_refusal(
+    isolated_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Case 6: terminal truncation sentinels are refused before write; zero rows written."""
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
-    root_res = json.loads(kt._handle_create({"title": "Root", "assignee": "supervisor", "collaboration": "advisory"}))
+    root_res = json.loads(
+        kt._handle_create({
+            "title": "Root",
+            "assignee": "supervisor",
+            "collaboration": "advisory",
+        })
+    )
     root_id = root_res["task_id"]
 
     conn = kb.connect()
     try:
-        initial_comments = conn.execute("SELECT COUNT(*) FROM task_comments").fetchone()[0]
-        initial_collab = conn.execute("SELECT COUNT(*) FROM kanban_collaboration").fetchone()[0]
+        initial_comments = conn.execute(
+            "SELECT COUNT(*) FROM task_comments"
+        ).fetchone()[0]
+        initial_collab = conn.execute(
+            "SELECT COUNT(*) FROM kanban_collaboration"
+        ).fetchone()[0]
     finally:
         conn.close()
 
@@ -229,48 +307,76 @@ def test_kanban_comment_truncation_sentinel_refusal(isolated_env: Path, monkeypa
     # Zero writes occurred
     conn = kb.connect()
     try:
-        assert conn.execute("SELECT COUNT(*) FROM task_comments").fetchone()[0] == initial_comments
-        assert conn.execute("SELECT COUNT(*) FROM kanban_collaboration").fetchone()[0] == initial_collab
+        assert (
+            conn.execute("SELECT COUNT(*) FROM task_comments").fetchone()[0]
+            == initial_comments
+        )
+        assert (
+            conn.execute("SELECT COUNT(*) FROM kanban_collaboration").fetchone()[0]
+            == initial_collab
+        )
     finally:
         conn.close()
 
 
-def test_kanban_comment_malformed_metadata_refusal(isolated_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_kanban_comment_malformed_metadata_refusal(
+    isolated_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Case 6: malformed metadata or unknown keys rejected before write."""
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
-    root_res = json.loads(kt._handle_create({"title": "Root", "assignee": "supervisor", "collaboration": "advisory"}))
+    root_res = json.loads(
+        kt._handle_create({
+            "title": "Root",
+            "assignee": "supervisor",
+            "collaboration": "advisory",
+        })
+    )
     root_id = root_res["task_id"]
 
     # Unknown action
-    res1 = json.loads(kt._handle_comment({
-        "task_id": root_id,
-        "body": "Valid body",
-        "collaboration": {"action": "unknown_action"},
-    }))
+    res1 = json.loads(
+        kt._handle_comment({
+            "task_id": root_id,
+            "body": "Valid body",
+            "collaboration": {"action": "unknown_action"},
+        })
+    )
     assert "error" in res1
     assert "action" in res1.get("error", "").lower()
 
     # Unknown key
-    res2 = json.loads(kt._handle_comment({
-        "task_id": root_id,
-        "body": "Valid body",
-        "collaboration": {"action": "request", "recipient": "origin", "rogue_key": 123},
-    }))
+    res2 = json.loads(
+        kt._handle_comment({
+            "task_id": root_id,
+            "body": "Valid body",
+            "collaboration": {
+                "action": "request",
+                "recipient": "origin",
+                "rogue_key": 123,
+            },
+        })
+    )
     assert "error" in res2
     assert "rogue_key" in res2.get("error", "").lower()
 
 
-def test_kanban_comment_author_not_forged_by_caller_args(isolated_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_kanban_comment_author_not_forged_by_caller_args(
+    isolated_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Case 6: caller passing author arg cannot forge author identity."""
     monkeypatch.setenv("HERMES_PROFILE", "implementer")
-    root_res = json.loads(kt._handle_create({"title": "Root", "assignee": "supervisor"}))
+    root_res = json.loads(
+        kt._handle_create({"title": "Root", "assignee": "supervisor"})
+    )
     root_id = root_res["task_id"]
 
-    res = json.loads(kt._handle_comment({
-        "task_id": root_id,
-        "body": "Legitimate comment text",
-        "author": "hermes-system",  # attempt to spoof system/operator
-    }))
+    res = json.loads(
+        kt._handle_comment({
+            "task_id": root_id,
+            "body": "Legitimate comment text",
+            "author": "hermes-system",  # attempt to spoof system/operator
+        })
+    )
     assert res.get("ok") is True
 
     conn = kb.connect()
@@ -283,10 +389,18 @@ def test_kanban_comment_author_not_forged_by_caller_args(isolated_env: Path, mon
         conn.close()
 
 
-def test_kanban_show_includes_bounded_collaboration(isolated_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_kanban_show_includes_bounded_collaboration(
+    isolated_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """kanban_show returns collaboration list with status and refs."""
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
-    root_res = json.loads(kt._handle_create({"title": "Root", "assignee": "supervisor", "collaboration": "advisory"}))
+    root_res = json.loads(
+        kt._handle_create({
+            "title": "Root",
+            "assignee": "supervisor",
+            "collaboration": "advisory",
+        })
+    )
     root_id = root_res["task_id"]
 
     conn = kb.connect()
@@ -306,7 +420,11 @@ def test_kanban_show_includes_bounded_collaboration(isolated_env: Path, monkeypa
     kt._handle_comment({
         "task_id": root_id,
         "body": "Advisory question",
-        "collaboration": {"action": "request", "recipient": "origin", "evidence_refs": ["specs/doc.md"]},
+        "collaboration": {
+            "action": "request",
+            "recipient": "origin",
+            "evidence_refs": ["specs/doc.md"],
+        },
     })
 
     show_str = kt._handle_show({"task_id": root_id})
@@ -319,7 +437,9 @@ def test_kanban_show_includes_bounded_collaboration(isolated_env: Path, monkeypa
     assert item["delivery_state"] == "pending"
 
 
-def test_inject_new_comments_peer_labeling_not_operator_wrapper(isolated_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_inject_new_comments_peer_labeling_not_operator_wrapper(
+    isolated_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Case 6: peer comment injects as labeled peer-evidence block, NOT operator out-of-band wrapper."""
     task_id = "t_test_task"
     monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
@@ -355,7 +475,9 @@ def test_inject_new_comments_peer_labeling_not_operator_wrapper(isolated_env: Pa
     # Add peer comment from "supervisor"
     conn = kb.connect()
     try:
-        kb.add_comment(conn, task_id, author="supervisor", body="Please inspect section 3 of spec")
+        kb.add_comment(
+            conn, task_id, author="supervisor", body="Please inspect section 3 of spec"
+        )
     finally:
         conn.close()
 
@@ -376,7 +498,9 @@ def test_inject_new_comments_peer_labeling_not_operator_wrapper(isolated_env: Pa
     assert "from the operator" not in injected_text
 
 
-def test_kanban_tools_contract_metadata_and_source_run_id(isolated_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_kanban_tools_contract_metadata_and_source_run_id(
+    isolated_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """kanban_create persists contract metadata from board.json and kanban_comment records source_run_id."""
     # Write board.json using canonical board_metadata_path
     meta_path = kb.board_metadata_path("default")
@@ -389,7 +513,11 @@ def test_kanban_tools_contract_metadata_and_source_run_id(isolated_env: Path, mo
     meta_path.write_text(json.dumps(board_meta), encoding="utf-8")
 
     # 1. Create opted-in root
-    res_str = kt._handle_create({"title": "Root Task", "assignee": "supervisor", "collaboration": "advisory"})
+    res_str = kt._handle_create({
+        "title": "Root Task",
+        "assignee": "supervisor",
+        "collaboration": "advisory",
+    })
     res = json.loads(res_str)
     assert res.get("ok") is True
     root_id = res["task_id"]
@@ -398,7 +526,11 @@ def test_kanban_tools_contract_metadata_and_source_run_id(isolated_env: Path, mo
     try:
         events = kb.list_events(conn, root_id)
         opt_ev = [e for e in events if e.kind == "collaboration_opted_in"][0]
-        pl = opt_ev.payload if isinstance(opt_ev.payload, dict) else json.loads(str(opt_ev.payload or "{}"))
+        pl = (
+            opt_ev.payload
+            if isinstance(opt_ev.payload, dict)
+            else json.loads(str(opt_ev.payload or "{}"))
+        )
         assert pl.get("contract_id") == "oc_tools_test_456"
         assert pl.get("contract_version") == "2"
 
@@ -429,5 +561,95 @@ def test_kanban_tools_contract_metadata_and_source_run_id(isolated_env: Path, mo
         assert row["source_run_id"] == 555
         assert row["contract_id"] == "oc_tools_test_456"
         assert row["contract_version"] == "2"
+    finally:
+        conn.close()
+
+
+def test_kanban_create_persists_runtime_derived_origin_route(
+    isolated_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Native root creation with deliberately different raw SessionDB id, chat id, and TUI key."""
+    # 1. Gateway Telegram creation: raw SessionDB id != chat id
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "tg-chat-999")
+    monkeypatch.setenv("HERMES_SESSION_THREAD_ID", "topic-77")
+    monkeypatch.setenv("HERMES_SESSION_ID", "sess-db-raw-1111")
+    monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
+
+    res_str = kt._handle_create({
+        "title": "Telegram Root",
+        "assignee": "supervisor",
+        "collaboration": "advisory",
+    })
+    res = json.loads(res_str)
+    assert res.get("ok") is True
+    root_tg = res["task_id"]
+
+    conn = kb.connect()
+    try:
+        route_tg = kb.get_collaboration_origin_route(conn, root_tg)
+        assert route_tg is not None
+        assert route_tg["platform"] == "telegram"
+        assert route_tg["chat_id"] == "tg-chat-999"
+        assert route_tg["thread_id"] == "topic-77"
+        assert route_tg["origin_session_id"] == "sess-db-raw-1111"
+        assert route_tg["chat_id"] != route_tg["origin_session_id"]
+
+        # 2. TUI creation: raw SessionDB id != session key
+        monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
+        monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
+        monkeypatch.delenv("HERMES_SESSION_THREAD_ID", raising=False)
+        monkeypatch.setenv("HERMES_SESSION_KEY", "tui-key-555")
+        monkeypatch.setenv("HERMES_SESSION_ID", "sess-db-raw-2222")
+
+        res_tui_str = kt._handle_create({
+            "title": "TUI Root",
+            "assignee": "supervisor",
+            "collaboration": "advisory",
+        })
+        res_tui = json.loads(res_tui_str)
+        assert res_tui.get("ok") is True
+        root_tui = res_tui["task_id"]
+
+        route_tui = kb.get_collaboration_origin_route(conn, root_tui)
+        assert route_tui is not None
+        assert route_tui["platform"] == "tui"
+        assert route_tui["chat_id"] == "tui-key-555"
+        assert route_tui["origin_session_id"] == "sess-db-raw-2222"
+        assert route_tui["chat_id"] != route_tui["origin_session_id"]
+
+        # 3. Missing commissioning context rejects collaboration opt-in
+        monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
+        monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+        res_missing_str = kt._handle_create({
+            "title": "Missing Context Root",
+            "assignee": "supervisor",
+            "collaboration": "advisory",
+        })
+        res_missing = json.loads(res_missing_str)
+        assert "error" in res_missing
+        assert "commissioning session context" in res_missing["error"]
+
+        # 4. Conflicting context (platform without chat_id) rejects opt-in
+        monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+        monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
+        res_conflict_str = kt._handle_create({
+            "title": "Conflicting Context Root",
+            "assignee": "supervisor",
+            "collaboration": "advisory",
+        })
+        res_conflict = json.loads(res_conflict_str)
+        assert "error" in res_conflict
+
+        # 5. Plain root creation without collaboration succeeds even without commissioning context
+        res_plain_str = kt._handle_create({
+            "title": "Plain Root Task",
+            "assignee": "supervisor",
+        })
+        res_plain = json.loads(res_plain_str)
+        assert res_plain.get("ok") is True
+        plain_id = res_plain["task_id"]
+        assert kb.get_collaboration_origin_route(conn, plain_id) is None
     finally:
         conn.close()

@@ -90,8 +90,26 @@ def _setup_collab_tree(
 ) -> tuple[str, str]:
     conn = _isolated_connect(board)
     try:
-        root = kb.create_task(conn, title="collaboration root", assignee="morfeo")
-        kb.opt_in_collaboration(conn, root, mode="advisory", session_id=chat_id)
+        raw_session_id = f"session-db-raw-{chat_id}"
+        root = kb.create_task(
+            conn,
+            title="collaboration root",
+            assignee="morfeo",
+            session_id=raw_session_id,
+        )
+        origin_route = {
+            "platform": "tui",
+            "chat_id": chat_id,
+            "origin_session_id": raw_session_id,
+            "notifier_profile": "default",
+        }
+        kb.opt_in_collaboration(
+            conn,
+            root,
+            mode="advisory",
+            session_id=raw_session_id,
+            origin_route=origin_route,
+        )
         kb.add_notify_sub(conn, task_id=root, platform="tui", chat_id=chat_id)
         child = kb.create_task(
             conn, title="child implementation", assignee=assignee, parents=[root]
@@ -572,8 +590,23 @@ class TestTuiCollaborationLeaseAndRouteScope:
         """A telegram watcher on the root must not make the TUI origin ambiguous."""
         conn = _isolated_connect()
         try:
-            root = kb.create_task(conn, title="shared root", assignee="morfeo")
-            kb.opt_in_collaboration(conn, root, mode="advisory", session_id=SESSION_KEY)
+            raw_session_id = f"session-db-raw-{SESSION_KEY}"
+            root = kb.create_task(
+                conn, title="shared root", assignee="morfeo", session_id=raw_session_id
+            )
+            origin_route = {
+                "platform": "tui",
+                "chat_id": SESSION_KEY,
+                "origin_session_id": raw_session_id,
+                "notifier_profile": "default",
+            }
+            kb.opt_in_collaboration(
+                conn,
+                root,
+                mode="advisory",
+                session_id=raw_session_id,
+                origin_route=origin_route,
+            )
             kb.add_notify_sub(conn, task_id=root, platform="tui", chat_id=SESSION_KEY)
             kb.add_notify_sub(
                 conn, task_id=root, platform="telegram", chat_id="chat-100"

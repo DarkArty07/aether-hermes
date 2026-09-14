@@ -11,6 +11,7 @@ Covers CE-01..04, CE-07..08, plan D1..D4, D7:
 - Root-done preservation vs terminal-flow expiration
 - Stale/unavailable handling on ended flows
 """
+
 from __future__ import annotations
 
 import json
@@ -38,7 +39,9 @@ def assert_isolated_db_path(db_path: Path, expected_root: Path) -> None:
 
 
 @pytest.fixture
-def board_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, sqlite3.Connection]:
+def board_db(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Path, sqlite3.Connection]:
     """Isolated temporary board environment with explicit env scrubbing and path assertion."""
     for var in (
         "HERMES_KANBAN_DB",
@@ -57,7 +60,9 @@ def board_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, sql
     return kanban_home, conn
 
 
-def test_board_isolation_and_env_pin_rejection(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_board_isolation_and_env_pin_rejection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Fixture/isolation check fails when HERMES_KANBAN_DB is pinned outside the tmp root."""
     kanban_home = tmp_path / "kanban"
     kanban_home.mkdir(parents=True, exist_ok=True)
@@ -77,13 +82,17 @@ def test_board_isolation_and_env_pin_rejection(tmp_path: Path, monkeypatch: pyte
     assert_isolated_db_path(scrubbed_path, kanban_home)
 
 
-def test_schema_initialization_and_idempotence(board_db: tuple[Path, sqlite3.Connection]) -> None:
+def test_schema_initialization_and_idempotence(
+    board_db: tuple[Path, sqlite3.Connection],
+) -> None:
     """Case 9: fresh DB creates kanban_collaboration table and repeated init is idempotent."""
     _, conn = board_db
     # Check table existence
     tables = {
         r["name"]
-        for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
     }
     assert "kanban_collaboration" in tables
 
@@ -93,13 +102,33 @@ def test_schema_initialization_and_idempotence(board_db: tuple[Path, sqlite3.Con
         for r in conn.execute("PRAGMA table_info(kanban_collaboration)").fetchall()
     }
     required_cols = [
-        "id", "root_task_id", "task_id", "source_kind", "source_id",
-        "source_run_id", "source_event_id", "source_comment_id",
-        "recipient_kind", "recipient_id", "contract_id", "contract_version",
-        "request_id", "action", "disposition", "evidence_refs",
-        "delivery_state", "resolution", "enqueued_at", "acknowledged_at",
-        "resolved_at", "created_at", "lease_token", "lease_expires",
-        "dedup_key", "summary", "body"
+        "id",
+        "root_task_id",
+        "task_id",
+        "source_kind",
+        "source_id",
+        "source_run_id",
+        "source_event_id",
+        "source_comment_id",
+        "recipient_kind",
+        "recipient_id",
+        "contract_id",
+        "contract_version",
+        "request_id",
+        "action",
+        "disposition",
+        "evidence_refs",
+        "delivery_state",
+        "resolution",
+        "enqueued_at",
+        "acknowledged_at",
+        "resolved_at",
+        "created_at",
+        "lease_token",
+        "lease_expires",
+        "dedup_key",
+        "summary",
+        "body",
     ]
     for col in required_cols:
         assert col in cols, f"missing column {col} in kanban_collaboration"
@@ -108,43 +137,61 @@ def test_schema_initialization_and_idempotence(board_db: tuple[Path, sqlite3.Con
     conn2 = kb.connect(board="test_board")
     tables2 = {
         r["name"]
-        for r in conn2.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        for r in conn2.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
     }
     assert "kanban_collaboration" in tables2
     conn2.close()
 
 
-def test_opt_in_binding_and_ancestor_inheritance(board_db: tuple[Path, sqlite3.Connection]) -> None:
+def test_opt_in_binding_and_ancestor_inheritance(
+    board_db: tuple[Path, sqlite3.Connection],
+) -> None:
     """Case 1: opted-in root binds collaboration; descendants inherit; normal root stays legacy."""
     _, conn = board_db
     # 1. Normal root without opt-in
     legacy_root = kb.create_task(conn, title="Legacy root", assignee="worker")
-    legacy_child = kb.create_task(conn, title="Legacy child", assignee="worker", parents=[legacy_root])
+    legacy_child = kb.create_task(
+        conn, title="Legacy child", assignee="worker", parents=[legacy_root]
+    )
     assert kb.get_collaboration_root(conn, legacy_root) is None
     assert kb.get_collaboration_root(conn, legacy_child) is None
 
     # 2. Opted-in root
     opted_root = kb.create_task(conn, title="Opted root", assignee="worker")
-    kb.opt_in_collaboration(conn, opted_root, mode="advisory", session_id="sess-origin-1")
+    kb.opt_in_collaboration(
+        conn, opted_root, mode="advisory", session_id="sess-origin-1"
+    )
 
     # Verify opt-in event recorded
     events = kb.list_events(conn, opted_root)
     opt_events = [e for e in events if e.kind == "collaboration_opted_in"]
     assert len(opt_events) == 1
-    payload = opt_events[0].payload if isinstance(opt_events[0].payload, dict) else json.loads(opt_events[0].payload or "{}")
+    payload = (
+        opt_events[0].payload
+        if isinstance(opt_events[0].payload, dict)
+        else json.loads(opt_events[0].payload or "{}")
+    )
     assert payload.get("mode") == "advisory"
     assert payload.get("origin_session_id") == "sess-origin-1"
 
     # Create descendants
-    child1 = kb.create_task(conn, title="Child 1", assignee="worker", parents=[opted_root])
-    grandchild = kb.create_task(conn, title="Grandchild", assignee="worker", parents=[child1])
+    child1 = kb.create_task(
+        conn, title="Child 1", assignee="worker", parents=[opted_root]
+    )
+    grandchild = kb.create_task(
+        conn, title="Grandchild", assignee="worker", parents=[child1]
+    )
 
     assert kb.get_collaboration_root(conn, opted_root) == opted_root
     assert kb.get_collaboration_root(conn, child1) == opted_root
     assert kb.get_collaboration_root(conn, grandchild) == opted_root
 
 
-def test_mixed_root_and_unrelated_project_rejection(board_db: tuple[Path, sqlite3.Connection]) -> None:
+def test_mixed_root_and_unrelated_project_rejection(
+    board_db: tuple[Path, sqlite3.Connection],
+) -> None:
     """Case 1: child with multiple distinct roots rejects as mixed root; foreign project fails closed."""
     kanban_home, conn = board_db
     root_a = kb.create_task(conn, title="Root A", assignee="worker")
@@ -153,23 +200,40 @@ def test_mixed_root_and_unrelated_project_rejection(board_db: tuple[Path, sqlite
     root_b = kb.create_task(conn, title="Root B", assignee="worker")
     # root_b not opted in or different root
 
-    mixed_child = kb.create_task(conn, title="Mixed Child", assignee="worker", parents=[root_a, root_b])
+    mixed_child = kb.create_task(
+        conn, title="Mixed Child", assignee="worker", parents=[root_a, root_b]
+    )
     # Mixed root ancestry fails closed (returns None)
     assert kb.get_collaboration_root(conn, mixed_child) is None
 
     # Foreign project ancestry check
     from hermes_cli import projects_db
-    with projects_db.connect_closing() as pconn:
-        proj_a = projects_db.create_project(pconn, name="Proj A", primary_path=str(kanban_home / "proj_a"))
-        proj_b = projects_db.create_project(pconn, name="Proj B", primary_path=str(kanban_home / "proj_b"))
 
-    root_proj = kb.create_task(conn, title="Proj Root", assignee="worker", project_id=proj_a)
+    with projects_db.connect_closing() as pconn:
+        proj_a = projects_db.create_project(
+            pconn, name="Proj A", primary_path=str(kanban_home / "proj_a")
+        )
+        proj_b = projects_db.create_project(
+            pconn, name="Proj B", primary_path=str(kanban_home / "proj_b")
+        )
+
+    root_proj = kb.create_task(
+        conn, title="Proj Root", assignee="worker", project_id=proj_a
+    )
     kb.opt_in_collaboration(conn, root_proj, mode="advisory", session_id="sess-proj")
-    child_foreign = kb.create_task(conn, title="Foreign Child", assignee="worker", project_id=proj_b, parents=[root_proj])
+    child_foreign = kb.create_task(
+        conn,
+        title="Foreign Child",
+        assignee="worker",
+        project_id=proj_b,
+        parents=[root_proj],
+    )
     assert kb.get_collaboration_root(conn, child_foreign) is None
 
 
-def test_request_respond_ack_resolve_lifecycle(board_db: tuple[Path, sqlite3.Connection]) -> None:
+def test_request_respond_ack_resolve_lifecycle(
+    board_db: tuple[Path, sqlite3.Connection],
+) -> None:
     """Case 2: full request -> enqueue -> ack -> respond -> resolve lifecycle."""
     _, conn = board_db
     root = kb.create_task(conn, title="Root", assignee="worker")
@@ -184,7 +248,9 @@ def test_request_respond_ack_resolve_lifecycle(board_db: tuple[Path, sqlite3.Con
         (root, int(time.time())),
     )
 
-    task = kb.create_task(conn, title="Implementation unit", assignee="implementer", parents=[root])
+    task = kb.create_task(
+        conn, title="Implementation unit", assignee="implementer", parents=[root]
+    )
     # Complete root task so children become ready
     kb.claim_task(conn, root)
     kb.complete_task(conn, root)
@@ -194,7 +260,9 @@ def test_request_respond_ack_resolve_lifecycle(board_db: tuple[Path, sqlite3.Con
     assert claimed_task is not None
     assert claimed_task.status == "running"
 
-    sibling = kb.create_task(conn, title="Sibling unit", assignee="reviewer", parents=[root])
+    sibling = kb.create_task(
+        conn, title="Sibling unit", assignee="reviewer", parents=[root]
+    )
 
     # 1. Explicit request before completion
     collab_req = kb.create_collaboration_request(
@@ -227,7 +295,9 @@ def test_request_respond_ack_resolve_lifecycle(board_db: tuple[Path, sqlite3.Con
     assert claimed_msgs[0]["delivery_state"] == "queued"
 
     # 3. Explicit acknowledgment
-    ack_ok = kb.advance_collaboration_message(conn, collaboration_id=req_id, delivery_state="acknowledged")
+    ack_ok = kb.advance_collaboration_message(
+        conn, collaboration_id=req_id, delivery_state="acknowledged"
+    )
     assert ack_ok is True
     msg_after_ack = kb.get_collaboration_message(conn, req_id)
     assert msg_after_ack is not None
@@ -310,11 +380,15 @@ def test_idempotency_and_dedup(board_db: tuple[Path, sqlite3.Connection]) -> Non
     )
     assert req1["collaboration_id"] == req2["collaboration_id"]
     # Exactly one row in table
-    rows = conn.execute("SELECT COUNT(*) FROM kanban_collaboration WHERE task_id = ?", (task,)).fetchone()
+    rows = conn.execute(
+        "SELECT COUNT(*) FROM kanban_collaboration WHERE task_id = ?", (task,)
+    ).fetchone()
     assert rows[0] == 1
 
 
-def test_claim_lease_expiration_and_recovery(board_db: tuple[Path, sqlite3.Connection]) -> None:
+def test_claim_lease_expiration_and_recovery(
+    board_db: tuple[Path, sqlite3.Connection],
+) -> None:
     """Case 3: expired lease on queued record recovers back to pending on next claim."""
     _, conn = board_db
     root = kb.create_task(conn, title="Root", assignee="worker")
@@ -339,22 +413,31 @@ def test_claim_lease_expiration_and_recovery(board_db: tuple[Path, sqlite3.Conne
     req_id = req["collaboration_id"]
 
     # Claim with 1-second lease
-    claimed = kb.claim_collaboration_messages(conn, recipient_kind="origin", lease_token="lease-temp", lease_seconds=1)
+    claimed = kb.claim_collaboration_messages(
+        conn, recipient_kind="origin", lease_token="lease-temp", lease_seconds=1
+    )
     assert len(claimed) == 1
     assert claimed[0]["delivery_state"] == "queued"
 
     # Fast-forward time / simulate expired lease
-    conn.execute("UPDATE kanban_collaboration SET lease_expires = ? WHERE id = ?", (int(time.time()) - 10, req_id))
+    conn.execute(
+        "UPDATE kanban_collaboration SET lease_expires = ? WHERE id = ?",
+        (int(time.time()) - 10, req_id),
+    )
 
     # Next claim should reclaim the expired message
-    claimed_again = kb.claim_collaboration_messages(conn, recipient_kind="origin", lease_token="lease-new", lease_seconds=60)
+    claimed_again = kb.claim_collaboration_messages(
+        conn, recipient_kind="origin", lease_token="lease-new", lease_seconds=60
+    )
     assert len(claimed_again) == 1
     assert claimed_again[0]["id"] == req_id
     assert claimed_again[0]["delivery_state"] == "queued"
     assert claimed_again[0]["lease_token"] == "lease-new"
 
 
-def test_proactive_lifecycle_notices_and_coalescing(board_db: tuple[Path, sqlite3.Connection]) -> None:
+def test_proactive_lifecycle_notices_and_coalescing(
+    board_db: tuple[Path, sqlite3.Connection],
+) -> None:
     """Case 4: review_requested, changes_requested, blocked enqueue notices and coalesce."""
     _, conn = board_db
     root = kb.create_task(conn, title="Root", assignee="worker")
@@ -367,9 +450,13 @@ def test_proactive_lifecycle_notices_and_coalescing(board_db: tuple[Path, sqlite
     kb.claim_task(conn, task)
 
     # 1. request_review enqueues notice
-    ok = kb.request_review(conn, task, summary="Completed feature X", reviewer="reviewer", force=True)
+    ok = kb.request_review(
+        conn, task, summary="Completed feature X", reviewer="reviewer", force=True
+    )
     assert ok is True
-    msgs = kb.list_pending_collaboration(conn, recipient_kind="origin", root_task_id=root)
+    msgs = kb.list_pending_collaboration(
+        conn, recipient_kind="origin", root_task_id=root
+    )
     assert len(msgs) == 1
     first_notice = msgs[0]
     assert first_notice["action"] == "notice"
@@ -382,7 +469,9 @@ def test_proactive_lifecycle_notices_and_coalescing(board_db: tuple[Path, sqlite
     assert claimed_rev is not None
     ok, _ = kb.request_changes(conn, task, reason="Missing tests for edge case")
     assert ok is True
-    msgs_after_changes = kb.list_pending_collaboration(conn, recipient_kind="origin", root_task_id=root)
+    msgs_after_changes = kb.list_pending_collaboration(
+        conn, recipient_kind="origin", root_task_id=root
+    )
     assert len(msgs_after_changes) == 1  # Coalesced!
     coalesced = msgs_after_changes[0]
     assert coalesced["id"] == first_notice["id"]
@@ -396,23 +485,34 @@ def test_proactive_lifecycle_notices_and_coalescing(board_db: tuple[Path, sqlite
         body="Clarification question",
         recipient="origin",
     )
-    all_msgs = kb.list_pending_collaboration(conn, recipient_kind="origin", root_task_id=root)
+    all_msgs = kb.list_pending_collaboration(
+        conn, recipient_kind="origin", root_task_id=root
+    )
     assert len(all_msgs) == 2  # 1 notice + 1 explicit request
     assert {m["action"] for m in all_msgs} == {"notice", "request"}
 
 
-def test_controller_flow_attention_collaboration_advisory(board_db: tuple[Path, sqlite3.Connection]) -> None:
+def test_controller_flow_attention_collaboration_advisory(
+    board_db: tuple[Path, sqlite3.Connection],
+) -> None:
     """Case 7: controller-recipient request creates flow_attention tagged as advisory and does not unblock parents."""
     kanban_home, conn = board_db
     from hermes_cli import projects_db
+
     with projects_db.connect_closing() as pconn:
-        project_id = projects_db.create_project(pconn, name="Test Project", primary_path=str(kanban_home))
+        project_id = projects_db.create_project(
+            pconn, name="Test Project", primary_path=str(kanban_home)
+        )
 
     root = kb.create_task(conn, title="Root", assignee="worker", project_id=project_id)
     kb.opt_in_collaboration(conn, root, mode="advisory", session_id="sess-origin")
 
     parent_task = kb.create_task(
-        conn, title="Parent blocked", assignee="worker", project_id=project_id, parents=[root]
+        conn,
+        title="Parent blocked",
+        assignee="worker",
+        project_id=project_id,
+        parents=[root],
     )
     kb.claim_task(conn, root)
     kb.complete_task(conn, root)
@@ -458,10 +558,14 @@ def test_controller_flow_attention_collaboration_advisory(board_db: tuple[Path, 
     assert parent_after.status == "blocked"
 
 
-def test_root_done_preserves_collaboration_vs_terminal_flow_expires(board_db: tuple[Path, sqlite3.Connection]) -> None:
+def test_root_done_preserves_collaboration_vs_terminal_flow_expires(
+    board_db: tuple[Path, sqlite3.Connection],
+) -> None:
     """Case 7 & 8: decomposition root done keeps collaboration active; flow_terminal marks it stale."""
     _, conn = board_db
-    root = kb.create_task(conn, title="Decomp root", assignee="worker", project_id="p_test")
+    root = kb.create_task(
+        conn, title="Decomp root", assignee="worker", project_id="p_test"
+    )
     kb.opt_in_collaboration(conn, root, mode="advisory", session_id="sess-origin")
     conn.execute(
         """
@@ -471,7 +575,9 @@ def test_root_done_preserves_collaboration_vs_terminal_flow_expires(board_db: tu
         """,
         (root, int(time.time())),
     )
-    child = kb.create_task(conn, title="Child task", assignee="worker", project_id="p_test", parents=[root])
+    child = kb.create_task(
+        conn, title="Child task", assignee="worker", project_id="p_test", parents=[root]
+    )
 
     # Decomposition root completes
     kb.claim_task(conn, root)
@@ -480,7 +586,11 @@ def test_root_done_preserves_collaboration_vs_terminal_flow_expires(board_db: tu
 
     # Child can still make collaboration requests!
     req = kb.create_collaboration_request(
-        conn, task_id=child, author="worker", body="Child asking question", recipient="origin"
+        conn,
+        task_id=child,
+        author="worker",
+        body="Child asking question",
+        recipient="origin",
     )
     req_id = req["collaboration_id"]
     msg = kb.get_collaboration_message(conn, req_id)
@@ -494,10 +604,14 @@ def test_root_done_preserves_collaboration_vs_terminal_flow_expires(board_db: tu
     assert msg_after_expire["resolution"] == "stale"
 
 
-def test_archive_task_expires_collaboration_to_stale(board_db: tuple[Path, sqlite3.Connection]) -> None:
+def test_archive_task_expires_collaboration_to_stale(
+    board_db: tuple[Path, sqlite3.Connection],
+) -> None:
     """Case 8: archive_task on an opted-in root stales unresolved collaboration messages."""
     _, conn = board_db
-    root = kb.create_task(conn, title="Archive Root", assignee="worker", project_id="p_test")
+    root = kb.create_task(
+        conn, title="Archive Root", assignee="worker", project_id="p_test"
+    )
     kb.opt_in_collaboration(conn, root, mode="advisory", session_id="sess-origin")
     conn.execute(
         """
@@ -507,7 +621,9 @@ def test_archive_task_expires_collaboration_to_stale(board_db: tuple[Path, sqlit
         """,
         (root, int(time.time())),
     )
-    child = kb.create_task(conn, title="Child Task", assignee="worker", project_id="p_test", parents=[root])
+    child = kb.create_task(
+        conn, title="Child Task", assignee="worker", project_id="p_test", parents=[root]
+    )
 
     req = kb.create_collaboration_request(
         conn, task_id=child, author="worker", body="Pending inquiry", recipient="origin"
@@ -534,17 +650,24 @@ def test_archive_task_expires_collaboration_to_stale(board_db: tuple[Path, sqlit
     assert msg_after["resolved_at"] is not None
 
 
-def test_controller_worker_context_collaboration_advisory(board_db: tuple[Path, sqlite3.Connection]) -> None:
+def test_controller_worker_context_collaboration_advisory(
+    board_db: tuple[Path, sqlite3.Connection],
+) -> None:
     """Case 7: build_worker_context labels collaboration advisory and omits parent-recovery recipe."""
     kanban_home, conn = board_db
     from hermes_cli import projects_db
+
     with projects_db.connect_closing() as pconn:
-        project_id = projects_db.create_project(pconn, name="Context Project", primary_path=str(kanban_home))
+        project_id = projects_db.create_project(
+            pconn, name="Context Project", primary_path=str(kanban_home)
+        )
 
     root = kb.create_task(conn, title="Root", assignee="worker", project_id=project_id)
     kb.opt_in_collaboration(conn, root, mode="advisory", session_id="sess-origin")
 
-    child = kb.create_task(conn, title="Child", assignee="worker", project_id=project_id, parents=[root])
+    child = kb.create_task(
+        conn, title="Child", assignee="worker", project_id=project_id, parents=[root]
+    )
     ctrl = kb.create_task(
         conn,
         title="Supervisor",
@@ -555,7 +678,11 @@ def test_controller_worker_context_collaboration_advisory(board_db: tuple[Path, 
     )
 
     kb.create_collaboration_request(
-        conn, task_id=child, author="worker", body="Advisory query", recipient="controller"
+        conn,
+        task_id=child,
+        author="worker",
+        body="Advisory query",
+        recipient="controller",
     )
 
     ctx = kb.build_worker_context(conn, ctrl)
@@ -567,7 +694,9 @@ def test_controller_worker_context_collaboration_advisory(board_db: tuple[Path, 
     assert 'origin_signal="recovery"' not in ctx
 
 
-def test_opt_in_persists_contract_binding_from_board_metadata(board_db: tuple[Path, sqlite3.Connection]) -> None:
+def test_opt_in_persists_contract_binding_from_board_metadata(
+    board_db: tuple[Path, sqlite3.Connection],
+) -> None:
     """Case 1: opt_in_collaboration populates contract_id and contract_version from board.json metadata."""
     kanban_home, conn = board_db
     # Write board.json with contract metadata in the board directory
@@ -582,13 +711,19 @@ def test_opt_in_persists_contract_binding_from_board_metadata(board_db: tuple[Pa
     meta_path.write_text(json.dumps(board_meta), encoding="utf-8")
 
     root = kb.create_task(conn, title="Contract Root", assignee="worker")
-    kb.opt_in_collaboration(conn, root, mode="advisory", session_id="sess-orig", board="test_board")
+    kb.opt_in_collaboration(
+        conn, root, mode="advisory", session_id="sess-orig", board="test_board"
+    )
 
     events = kb.list_events(conn, root)
     opt_events = [e for e in events if e.kind == "collaboration_opted_in"]
     assert len(opt_events) == 1
     raw_payload = opt_events[0].payload
-    pl = raw_payload if isinstance(raw_payload, dict) else json.loads(str(raw_payload or "{}"))
+    pl = (
+        raw_payload
+        if isinstance(raw_payload, dict)
+        else json.loads(str(raw_payload or "{}"))
+    )
     assert pl.get("contract_id") == "oc_test_contract_abc"
     assert pl.get("contract_version") == "1"
     assert pl.get("project_id") == "proj_aether_uuid_99"
@@ -611,10 +746,14 @@ def test_opt_in_persists_contract_binding_from_board_metadata(board_db: tuple[Pa
     assert msg["contract_version"] == "1"
 
 
-def test_source_run_id_persistence(board_db: tuple[Path, sqlite3.Connection], monkeypatch: pytest.MonkeyPatch) -> None:
+def test_source_run_id_persistence(
+    board_db: tuple[Path, sqlite3.Connection], monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Case 4: source_run_id is persisted on requests, responses, and lifecycle notices when run exists."""
     _, conn = board_db
-    root = kb.create_task(conn, title="Run Root", assignee="worker", project_id="p_test")
+    root = kb.create_task(
+        conn, title="Run Root", assignee="worker", project_id="p_test"
+    )
     kb.opt_in_collaboration(conn, root, mode="advisory", session_id="sess-origin")
     conn.execute(
         """
@@ -624,11 +763,18 @@ def test_source_run_id_persistence(board_db: tuple[Path, sqlite3.Connection], mo
         """,
         (root, int(time.time())),
     )
-    child = kb.create_task(conn, title="Run Child", assignee="worker", project_id="p_test", parents=[root])
+    child = kb.create_task(
+        conn, title="Run Child", assignee="worker", project_id="p_test", parents=[root]
+    )
 
     # 1. Explicit run_id on request
     req = kb.create_collaboration_request(
-        conn, task_id=child, author="worker", body="Request with run", recipient="origin", run_id=123
+        conn,
+        task_id=child,
+        author="worker",
+        body="Request with run",
+        recipient="origin",
+        run_id=123,
     )
     req_row = kb.get_collaboration_message(conn, req["collaboration_id"])
     assert req_row is not None
@@ -636,7 +782,12 @@ def test_source_run_id_persistence(board_db: tuple[Path, sqlite3.Connection], mo
 
     # 2. Explicit run_id on response
     resp = kb.create_collaboration_response(
-        conn, request_id=req["collaboration_id"], author="supervisor", body="Response with run", disposition="advice", run_id=124
+        conn,
+        request_id=req["collaboration_id"],
+        author="supervisor",
+        body="Response with run",
+        disposition="advice",
+        run_id=124,
     )
     resp_row = kb.get_collaboration_message(conn, resp["collaboration_id"])
     assert resp_row is not None
@@ -662,3 +813,47 @@ def test_source_run_id_persistence(board_db: tuple[Path, sqlite3.Connection], mo
         (run_id_val,),
     ).fetchall()
     assert len(notices) >= 1
+
+
+def test_opt_in_origin_route_persist_match_and_refusal(
+    board_db: tuple[Path, sqlite3.Connection],
+) -> None:
+    """origin_route is persisted distinctly from SessionDB id and matches one notify sub."""
+    _, conn = board_db
+    root = kb.create_task(conn, title="Route Root", assignee="worker")
+    with pytest.raises(ValueError, match="origin_route"):
+        kb.opt_in_collaboration(
+            conn,
+            root,
+            mode="advisory",
+            session_id="sess-raw",
+            origin_route={"platform": "telegram"},
+        )
+    kb.opt_in_collaboration(
+        conn,
+        root,
+        mode="advisory",
+        session_id="sess-raw",
+        origin_route={
+            "platform": "telegram",
+            "chat_id": "chat-100",
+            "thread_id": None,
+            "notifier_profile": "default",
+            "origin_session_id": "sess-raw",
+        },
+    )
+    route = kb.get_collaboration_origin_route(conn, root)
+    assert route is not None
+    assert route["platform"] == "telegram"
+    assert route["chat_id"] == "chat-100"
+    assert route["origin_session_id"] == "sess-raw"
+    assert route["chat_id"] != route["origin_session_id"]
+    assert kb.collaboration_origin_route_matches_sub(
+        route, {"platform": "telegram", "chat_id": "chat-100", "thread_id": ""}
+    )
+    assert not kb.collaboration_origin_route_matches_sub(
+        route, {"platform": "tui", "chat_id": "chat-100"}
+    )
+    assert not kb.collaboration_origin_route_matches_sub(
+        route, {"platform": "telegram", "chat_id": "chat-other"}
+    )
