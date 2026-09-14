@@ -452,6 +452,10 @@ class TestTuiCollaborationLeaseAndRouteScope:
             assert row is not None
             assert row["delivery_state"] == "queued"
             assert row["acknowledged_at"] is None
+            # The lease was aged to the past and must not have been refreshed
+            assert row.get("lease_expires") is None or row["lease_expires"] <= int(
+                time.time()
+            )
             assert (
                 kb.list_notify_subs(conn, task_id=root_id)[0]["last_event_id"]
                 == pre_cursor

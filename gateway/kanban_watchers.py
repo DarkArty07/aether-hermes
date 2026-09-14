@@ -325,11 +325,15 @@ class GatewayKanbanWatchersMixin:
         self,
         collab: dict,
         board: Optional[str] = None,
+        conn: Optional[Any] = None,
     ) -> None:
         """Return an unconsumed collaboration claim to pending delivery."""
         from hermes_cli import kanban_db as _kb
 
-        conn = _kb.connect(board=board)
+        close_conn = False
+        if conn is None:
+            conn = _kb.connect(board=board)
+            close_conn = True
         try:
             current = _kb.get_collaboration_message(conn, int(collab["id"]))
             if not current or current.get("delivery_state") != "queued":
@@ -344,7 +348,8 @@ class GatewayKanbanWatchersMixin:
                 lease_token=token,
             )
         finally:
-            conn.close()
+            if close_conn:
+                conn.close()
 
     def _kanban_collaboration_source(
         self,
@@ -770,7 +775,7 @@ class GatewayKanbanWatchersMixin:
                             )
                             if callable(_collab_list) and callable(_collab_claim):
                                 try:
-                                    _collab_rows = _collab_list(
+                                    _collab_rows: Any = _collab_list(
                                         conn,
                                         recipient_kind="origin",
                                         limit=100,
@@ -781,6 +786,25 @@ class GatewayKanbanWatchersMixin:
                                         if row.get("root_task_id")
                                     }
                                     for _collab_root in sorted(_collab_roots):
+                                        # Filter remembered ids before claim: if
+                                        # all pending rows for this root have
+                                        # already been woken by this live process,
+                                        # skip claiming so we do not refresh the
+                                        # exclusive lease and starve other consumers
+                                        # (e.g. TUI) watching this root.
+                                        _pending_for_root = [
+                                            row
+                                            for row in _collab_rows
+                                            if row.get("root_task_id") == _collab_root
+                                        ]
+                                        if _pending_for_root and all(
+                                            self._kanban_collaboration_wake_queued(
+                                                slug, row
+                                            )
+                                            for row in _pending_for_root
+                                        ):
+                                            continue
+
                                         _all_root_subs = [
                                             sub
                                             for sub in _kb.list_notify_subs(conn)
@@ -852,7 +876,13 @@ class GatewayKanbanWatchersMixin:
                                                 # reclaim is the process-loss
                                                 # redelivery path — not a second
                                                 # ping to a session that already
-                                                # has the record queued.
+                                                # has the record queued. Rewind
+                                                # immediately so this process does
+                                                # not exclusive-hold a row it will
+                                                # not deliver.
+                                                self._kanban_rewind_collaboration(
+                                                    _collab, board=slug, conn=conn
+                                                )
                                                 continue
                                             _collab_task = _kb.get_task(
                                                 conn,

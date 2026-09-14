@@ -9847,6 +9847,32 @@ def _remember_kanban_collaboration_enqueue(key: tuple) -> None:
             _KANBAN_COLLAB_ENQUEUED.pop(next(iter(_KANBAN_COLLAB_ENQUEUED)), None)
 
 
+def _kanban_rewind_collaboration(conn, collab: dict) -> None:
+    """Return an unconsumed collaboration claim to pending delivery."""
+    try:
+        from hermes_cli import kanban_db as _kb
+
+        collab_id = int(collab.get("id") or 0)
+        if not collab_id:
+            return
+        current = _kb.get_collaboration_message(conn, collab_id)
+        if not current or current.get("delivery_state") != "queued":
+            return
+        token = collab.get("lease_token")
+        if token and current.get("lease_token") != token:
+            return
+        _advance = getattr(_kb, "advance_collaboration_message", None)
+        if callable(_advance):
+            _advance(
+                conn,
+                collaboration_id=collab_id,
+                delivery_state="pending",
+                lease_token=token,
+            )
+    except Exception:
+        pass
+
+
 def _collect_kanban_collaboration(session: dict) -> list:
     """Claim pending collaboration messages addressed to 'origin' for this TUI session.
 
@@ -9946,6 +9972,30 @@ def _collect_kanban_collaboration(session: dict) -> list:
                 origin_sub = next(iter(root_routes.values()))
                 if _tui_collaboration_route_key(sub) != _tui_collaboration_route_key(origin_sub):
                     continue
+                # Filter remembered ids before claim: if all pending rows for this
+                # root have already been enqueued for this live session, skip claim
+                # so we do not hold/refresh the lease and starve other consumers
+                # (e.g. gateway) watching this root.
+                _collab_list = getattr(_kb, "list_pending_collaboration", None)
+                if callable(_collab_list):
+                    try:
+                        _pending: Any = _collab_list(
+                            conn,
+                            recipient_kind="origin",
+                            root_task_id=root_id,
+                            limit=50,
+                        )
+                        if _pending and all(
+                            _kanban_collaboration_already_enqueued(
+                                _kanban_collaboration_enqueue_key(
+                                    resolved, session_key, r
+                                )
+                            )
+                            for r in _pending
+                        ):
+                            continue
+                    except Exception:
+                        pass
                 claimed = _kb.claim_collaboration_messages(
                     conn,
                     recipient_kind="origin",
@@ -9963,7 +10013,10 @@ def _collect_kanban_collaboration(session: dict) -> list:
                         # Already queued into this live session. CORE's claim
                         # reclaimed an expired lease, but that reclaim is the
                         # process-loss redelivery path — not a second turn for
-                        # a session that already has the record.
+                        # a session that already has the record. Rewind immediately
+                        # so this process does not exclusive-hold a row it will
+                        # not deliver.
+                        _kanban_rewind_collaboration(conn, c)
                         continue
                     task = _kb.get_task(conn, c.get("task_id") or sub_task_id)
                     source_label = _collaboration_source_label(conn, c, task)

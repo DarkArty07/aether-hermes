@@ -15,6 +15,8 @@ CE-07 (no duplicate supervisor), plan D4-D5:
 from __future__ import annotations
 
 import os
+import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Optional
@@ -641,6 +643,11 @@ async def test_gateway_live_origin_not_rewoken_after_lease_reclaim(monkeypatch):
         rows = kb.list_collaboration_for_task(conn, root_id)
         assert len(rows) == 1
         assert rows[0]["delivery_state"] == "queued"
+        assert rows[0]["acknowledged_at"] is None
+        # The lease was aged to the past and must not have been refreshed
+        assert rows[0].get("lease_expires") is None or rows[0]["lease_expires"] <= int(
+            time.time()
+        )
     finally:
         conn.close()
 
@@ -771,5 +778,179 @@ async def test_gateway_tui_sub_does_not_make_telegram_origin_ambiguous(monkeypat
         rows = kb.list_collaboration_for_task(conn, root_id)
         assert len(rows) == 1
         assert rows[0]["delivery_state"] == "queued"
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_dual_consumers_compose_without_starvation_gateway_first(monkeypatch):
+    """Gateway ticks first, then TUI collects after lease expiry: neither is starved."""
+    from tui_gateway import server as tui_server
+
+    monkeypatch.setattr(tui_server, "_KANBAN_COLLAB_ENQUEUED", {})
+
+    session_key = "tui-session-dual-1"
+    root_id = _create_root_with_extra_sub(
+        platform="telegram",
+        chat_id="chat-100",
+        extra_platform="tui",
+        extra_chat_id=session_key,
+        request_body="dual consumer test gateway first",
+    )
+
+    conn = _isolated_connect()
+    try:
+        pre_cursors = {
+            sub["chat_id"]: sub["last_event_id"]
+            for sub in kb.list_notify_subs(conn, task_id=root_id)
+        }
+    finally:
+        conn.close()
+
+    adapter = FakeTelegramAdapter()
+    runner = FakeGatewayRunner(adapter, is_busy=False)
+
+    # 1. Gateway ticks first: 1 internal telegram wake, adapter.send == [], row queued with lease
+    await _run_single_tick(runner, monkeypatch)
+    assert len(adapter.wakes) == 1
+    wake = adapter.wakes[0]["event"]
+    assert wake.internal is True
+    assert wake.source.chat_id == "chat-100"
+    assert "dual consumer test gateway first" in wake.text
+    assert adapter.sends == []
+
+    session = {
+        "session_key": session_key,
+        "history_lock": threading.Lock(),
+        "running": False,
+        "_finalized": False,
+    }
+
+    # Immediate TUI collect while lease is active: 0 items
+    assert tui_server._collect_kanban_collaboration(session) == []
+
+    # 2. Expire lease
+    _expire_collaboration_leases()
+
+    # 3. Gateway ticks again with the same live runner:
+    # D3 hold: still 1 wake; gateway does NOT re-claim and does NOT refresh lease
+    runner._running = True
+    runner._ticks = 0
+    await _run_single_tick(runner, monkeypatch)
+    assert len(adapter.wakes) == 1
+    assert adapter.sends == []
+
+    # 4. TUI collects for matching session_key: 1 item, queued, not starved
+    tui_items = tui_server._collect_kanban_collaboration(session)
+    assert len(tui_items) == 1
+    collab_dict, text = tui_items[0]
+    assert collab_dict["recipient_kind"] == "origin"
+    assert collab_dict["delivery_state"] == "queued"
+    assert "dual consumer test gateway first" in text
+
+    # 5. Subsequent collects/ticks: neither consumer re-enqueues or starves
+    assert tui_server._collect_kanban_collaboration(session) == []
+    runner._running = True
+    runner._ticks = 0
+    await _run_single_tick(runner, monkeypatch)
+    assert len(adapter.wakes) == 1
+    assert adapter.sends == []
+
+    conn = _isolated_connect()
+    try:
+        rows = kb.list_collaboration_for_task(conn, root_id)
+        assert len(rows) == 1
+        assert rows[0]["delivery_state"] == "queued"
+        assert rows[0]["acknowledged_at"] is None
+        # Verify ordinary notification cursor was untouched
+        for sub in kb.list_notify_subs(conn, task_id=root_id):
+            assert sub.get("last_event_id") == pre_cursors[sub["chat_id"]]
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_dual_consumers_compose_without_starvation_tui_first(monkeypatch):
+    """TUI collects first, then Gateway ticks after lease expiry: neither is starved."""
+    from tui_gateway import server as tui_server
+
+    monkeypatch.setattr(tui_server, "_KANBAN_COLLAB_ENQUEUED", {})
+
+    session_key = "tui-session-dual-2"
+    root_id = _create_root_with_extra_sub(
+        platform="telegram",
+        chat_id="chat-100",
+        extra_platform="tui",
+        extra_chat_id=session_key,
+        request_body="dual consumer test tui first",
+    )
+
+    conn = _isolated_connect()
+    try:
+        pre_cursors = {
+            sub["chat_id"]: sub["last_event_id"]
+            for sub in kb.list_notify_subs(conn, task_id=root_id)
+        }
+    finally:
+        conn.close()
+
+    session = {
+        "session_key": session_key,
+        "history_lock": threading.Lock(),
+        "running": False,
+        "_finalized": False,
+    }
+
+    # 1. TUI collects first: 1 item, queued with lease
+    tui_items = tui_server._collect_kanban_collaboration(session)
+    assert len(tui_items) == 1
+    collab_dict, text = tui_items[0]
+    assert collab_dict["recipient_kind"] == "origin"
+    assert collab_dict["delivery_state"] == "queued"
+    assert "dual consumer test tui first" in text
+
+    adapter = FakeTelegramAdapter()
+    runner = FakeGatewayRunner(adapter, is_busy=False)
+
+    # 2. Gateway tick while lease is active: 0 wakes
+    await _run_single_tick(runner, monkeypatch)
+    assert len(adapter.wakes) == 0
+    assert adapter.sends == []
+
+    # 3. Expire lease
+    _expire_collaboration_leases()
+
+    # 4. TUI collects again with the same live process:
+    # TUI already enqueued it, so it does NOT re-claim or refresh lease; returns 0 items
+    assert tui_server._collect_kanban_collaboration(session) == []
+
+    # 5. Gateway ticks: claims and delivers 1 internal wake to telegram
+    runner._running = True
+    runner._ticks = 0
+    await _run_single_tick(runner, monkeypatch)
+    assert len(adapter.wakes) == 1
+    wake = adapter.wakes[0]["event"]
+    assert wake.internal is True
+    assert wake.source.chat_id == "chat-100"
+    assert "dual consumer test tui first" in wake.text
+    assert adapter.sends == []
+
+    # 6. Subsequent collects/ticks: neither consumer re-enqueues or starves
+    assert tui_server._collect_kanban_collaboration(session) == []
+    runner._running = True
+    runner._ticks = 0
+    await _run_single_tick(runner, monkeypatch)
+    assert len(adapter.wakes) == 1
+    assert adapter.sends == []
+
+    conn = _isolated_connect()
+    try:
+        rows = kb.list_collaboration_for_task(conn, root_id)
+        assert len(rows) == 1
+        assert rows[0]["delivery_state"] == "queued"
+        assert rows[0]["acknowledged_at"] is None
+        # Verify ordinary notification cursor was untouched
+        for sub in kb.list_notify_subs(conn, task_id=root_id):
+            assert sub.get("last_event_id") == pre_cursors[sub["chat_id"]]
     finally:
         conn.close()
