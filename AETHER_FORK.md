@@ -263,3 +263,68 @@ Rollback reverts the listed commits in reverse order without restoring whole
 files that also carry other Aether corrections. Retirement requires an adopted
 exact Hermes release to provide equivalent optional collaboration semantics and
 to pass the focused collaboration suites without these commits.
+
+## Supervisor same-card review-flow continuity for the RC (Aether #425/#426)
+
+This correction was developed from maintained-fork baseline
+`bb5e9a422f3135371557e75bcd1db01c5f8fc3ba` on branch
+`fix/425-review-flow-continuity` for Objective Contract
+`oc_3397f9f05d780f8e@v1` (Aether `1.0.0rc1`, tag `v1.0.0-rc.1`). It does not
+activate the live TUI, gateway, profiles, or installation. Inherited GitHub
+Actions remain disabled and are therefore NOT RUN, not green. Portable Aether
+evidence is in `specs/001-aether-v1-productization/evidence/LC-FORK.md`.
+
+Inspectable commits on this branch:
+
+- `10a307bb22cf07dab5025120eee2eacb1424f8ca` — same-card Aether review reuses
+  one existing Supervisor flow session and its canonical session workspace
+  (`_review_flow_session_context`, `_reserve_review_flow_session`), separates
+  session-identity cwd from the candidate tool cwd (`resolve_session_identity_cwd`)
+  and keeps affinity compression in place (`_compression_in_place_for_agent`).
+- `c007cea73f3cfc7106dbdffa95598e0324934a32` — recognized Aether provenance fails
+  closed when it is damaged, ambiguous or mismatched, instead of silently
+  creating a fresh generic reviewer; genuine generic and legacy review paths keep
+  their existing behavior.
+
+Behavior: generic Hermes review remains generic when no corroborated Aether
+opt-in exists. A recognized Aether review requires one consistent collaboration
+root, board/Project/contract binding and one existing same-profile affinity
+session; missing, malformed, ambiguous or mismatched provenance fails through the
+existing lifecycle rather than spawning a reviewer. The implementation card keeps
+its candidate workspace and persistent Implementer pins, the borrowed Supervisor
+lease is ephemeral and resumes the exact stored session and canonical workspace,
+and supported file and terminal work stays on the candidate workspace while prompt
+identity stays stable across the review cwd change. Completely erased provenance
+is never guessed.
+
+Candidate evidence (this branch, sterile `HOME`, `HERMES_TEST_FILE_RETRIES=0`):
+the affected review/session/collaboration selection passed `399 passed, 0 failed,
+1 skipped` across 19 files in 15.9s with 24 workers (exit 0); the blocking
+`ruff check .` passed for the whole tree and `git diff --check` was clean for the
+branch diff. `ruff format --check` reports the same pre-existing repository drift
+at this branch and at its base, so no file changes format-check status.
+
+Rollback reverts the two commits above in reverse order without restoring whole
+files that also carry other Aether corrections. Retirement requires an adopted
+exact Hermes release to distinguish generic from corroborated Aether review, reuse
+one existing reviewer session and canonical workspace without persisting Supervisor
+affinity onto the implementation card, keep task and file tools on the candidate,
+preserve prompt identity across the review cwd change, fail closed on damaged
+recognized provenance, keep legacy and generic controls, and pass the focused
+review/session matrix without these commits.
+
+## Distribution identity and release binding
+
+The fork keeps its own distribution and version identity: `hermes-agent` `0.20.1`
+is declared identically by `pyproject.toml` (`[project].name` and
+`[project].version`), `hermes_cli/__init__.py` (`__version__`) and the editable
+package entry in `uv.lock`, with `requires-python = ">=3.11,<3.14"`. No packaging
+correction is part of this candidate, and `uv.lock` is byte-identical to its base.
+
+Aether binds this fork by repository (`DarkArty07/aether-hermes`, branch
+`aether-main`), exact commit and source-tree digest, not by an upstream tag. The
+repository carries inherited upstream `v2026.*` tags as objects, but none of them
+is an ancestor of `aether-main`: the preserved history starts at the original
+local baseline, so a candidate's identity is its commit, its tree object and its
+deterministic path-and-file-byte projection.
+
