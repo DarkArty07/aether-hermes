@@ -1468,6 +1468,56 @@ def _is_chat_completions_directive(exc: Exception) -> bool:
 # calls to the Codex Responses API so callers don't need any changes.
 
 
+class AuxiliaryResponsesTerminalError(RuntimeError):
+    """A terminal Responses failure (``failed``/``cancelled``) on the auxiliary path.
+
+    The provider ended the response without a usable answer, so the adapter
+    must not report it as a successful ``stop``.  The originating terminal
+    status, ``incomplete_details`` and provider error stay attached so the
+    caller can classify the attempt without parsing the message text.
+    """
+
+    def __init__(
+        self,
+        status: str,
+        incomplete_details: Any = None,
+        error: Any = None,
+    ) -> None:
+        from agent.codex_responses_adapter import _format_responses_error
+
+        self.status = status
+        self.incomplete_details = incomplete_details
+        self.error = error
+        super().__init__(_format_responses_error(error, status))
+
+
+def _responses_tool_choice_shape(tool_choice: Any) -> Any:
+    """Translate a chat.completions ``tool_choice`` into the Responses shape.
+
+    Returns ``None`` when the value has no representation on the Responses
+    wire, so unsupported fields are dropped instead of being sent: the
+    request keeps its default tool selection rather than failing.
+    """
+    if isinstance(tool_choice, str):
+        normalized = tool_choice.strip()
+        return normalized or None
+    if isinstance(tool_choice, dict):
+        choice_type = str(tool_choice.get("type") or "").strip().lower()
+        if choice_type == "function":
+            function = tool_choice.get("function")
+            name = (
+                function.get("name")
+                if isinstance(function, dict)
+                else tool_choice.get("name")
+            )
+            if isinstance(name, str) and name.strip():
+                return {"type": "function", "name": name.strip()}
+            return None
+        if choice_type in {"auto", "required", "none"}:
+            return choice_type
+    return None
+
+
 class _CodexCompletionsAdapter:
     """Drop-in shim that accepts chat.completions.create() kwargs and
     routes them through the Codex Responses streaming API."""
@@ -1629,6 +1679,13 @@ class _CodexCompletionsAdapter:
                 })
             if converted:
                 resp_kwargs["tools"] = converted
+                # ``tool_choice`` is part of the certified Responses subset and
+                # is what makes a forced structured call deterministic (#420).
+                # Only shapes the Responses wire can represent are sent; a
+                # chat-only form degrades to the default tool selection.
+                tool_choice = _responses_tool_choice_shape(kwargs.get("tool_choice"))
+                if tool_choice is not None:
+                    resp_kwargs["tool_choice"] = tool_choice
 
         # Stable prompt-cache routing for the Codex/Responses aux path, mirroring
         # the main transport (agent/transports/codex.py::build_kwargs, which sets
@@ -1894,29 +1951,126 @@ class _CodexCompletionsAdapter:
             if final is None:
                 raise RuntimeError("Codex auxiliary Responses stream did not return a final response")
 
-            # Extract text and tool calls from the Responses output.
-            # Items may be SimpleNamespace (raw-event path) or dicts
-            # (some legacy fallback paths), so handle both shapes.
+            # Extract text and tool calls from the Responses output while
+            # preserving the real terminal/phase shape (#420, AC-07). Items may
+            # be SimpleNamespace (raw-event path) or dicts (some legacy
+            # fallback paths), so handle both shapes.
             def _item_get(obj: Any, key: str, default: Any = None) -> Any:
                 val = getattr(obj, key, None)
                 if val is None and isinstance(obj, dict):
                     val = obj.get(key, default)
                 return val if val is not None else default
 
-            for item in (getattr(final, "output", None) or []):
+            final_status = _item_get(final, "status")
+            final_status = (
+                final_status.strip().lower() if isinstance(final_status, str) else None
+            )
+            incomplete_details = _item_get(final, "incomplete_details")
+            if isinstance(incomplete_details, dict):
+                incomplete_reason = (
+                    str(incomplete_details.get("reason") or "").strip().lower()
+                )
+            elif incomplete_details is not None:
+                incomplete_reason = (
+                    str(getattr(incomplete_details, "reason", "") or "").strip().lower()
+                )
+            else:
+                incomplete_reason = ""
+
+            if final_status in {"failed", "cancelled"}:
+                # The provider ended the response without an answer. Reporting
+                # ``stop`` here would let an unfinished attempt pass as a
+                # complete one, so surface a typed terminal failure instead.
+                raise AuxiliaryResponsesTerminalError(
+                    final_status,
+                    incomplete_details=incomplete_details,
+                    error=_item_get(final, "error"),
+                )
+
+            output_items = _item_get(final, "output", None)
+            if not isinstance(output_items, list):
+                output_items = []
+
+            commentary_text_parts: List[str] = []
+            saw_commentary_phase = False
+            saw_final_answer_phase = False
+            saw_incomplete_item = False
+            # Server-side calls may legitimately stay ``in_progress`` while the
+            # response itself is completed, so they never mark the turn
+            # incomplete — the same guard the main Codex normalizer applies.
+            _server_side_call_types = {
+                "web_search_call",
+                "file_search_call",
+                "code_interpreter_call",
+                "image_generation_call",
+                "computer_call",
+                "local_shell_call",
+                "mcp_call",
+            }
+
+            for item in output_items:
                 item_type = _item_get(item, "type")
+                item_status = _item_get(item, "status")
+                item_status = (
+                    item_status.strip().lower()
+                    if isinstance(item_status, str)
+                    else None
+                )
+                if (
+                    item_status in {"queued", "in_progress", "incomplete"}
+                    and item_type not in _server_side_call_types
+                ):
+                    saw_incomplete_item = True
+
                 if item_type == "message":
-                    for part in (_item_get(item, "content") or []):
-                        ptype = _item_get(part, "type")
-                        if ptype in {"output_text", "text"}:
-                            text_parts.append(_item_get(part, "text", ""))
-                elif item_type == "function_call":
+                    item_phase = _item_get(item, "phase")
+                    normalized_phase = (
+                        item_phase.strip().lower()
+                        if isinstance(item_phase, str)
+                        else None
+                    )
+                    is_commentary_phase = normalized_phase in {"commentary", "analysis"}
+                    if is_commentary_phase:
+                        saw_commentary_phase = True
+                    elif normalized_phase in {"final_answer", "final"}:
+                        saw_final_answer_phase = True
+                    parts = _item_get(item, "content")
+                    if not isinstance(parts, list):
+                        continue
+                    item_text_parts: List[str] = []
+                    for part in parts:
+                        if _item_get(part, "type") not in {"output_text", "text"}:
+                            continue
+                        text = _item_get(part, "text", "")
+                        if isinstance(text, str) and text:
+                            item_text_parts.append(text)
+                    if not item_text_parts:
+                        continue
+                    if is_commentary_phase:
+                        # Mid-turn narration is never the final answer. Keep it
+                        # out of assistant content, matching the main Codex
+                        # normalizer, so it cannot be concatenated into — or
+                        # leak as — the payload the caller parses.
+                        commentary_text_parts.extend(item_text_parts)
+                    else:
+                        text_parts.extend(item_text_parts)
+                elif item_type in {"function_call", "custom_tool_call"}:
+                    if item_status in {"queued", "in_progress", "incomplete"}:
+                        # An unfinished call is not a usable tool call.
+                        continue
+                    arguments = _item_get(
+                        item,
+                        "arguments" if item_type == "function_call" else "input",
+                        "{}",
+                    )
+                    if not isinstance(arguments, str):
+                        arguments = json.dumps(arguments, ensure_ascii=False)
                     tool_calls_raw.append(SimpleNamespace(
                         id=_item_get(item, "call_id", ""),
                         type="function",
                         function=SimpleNamespace(
                             name=_item_get(item, "name", ""),
-                            arguments=_item_get(item, "arguments", "{}"),
+                            arguments=arguments,
                         ),
                     ))
 
@@ -1941,21 +2095,53 @@ class _CodexCompletionsAdapter:
 
         content = "".join(text_parts).strip() or None
 
-        # Build a response that looks like chat.completions
+        # A completed terminal may deliver its answer only through the
+        # top-level ``output_text`` field with an empty ``output`` list, unless
+        # the only visible text was commentary narration.
+        if content is None and not (
+            saw_commentary_phase and not saw_final_answer_phase
+        ):
+            out_text = _item_get(final, "output_text")
+            if isinstance(out_text, str) and out_text.strip():
+                content = out_text.strip()
+
+        if final_status == "incomplete":
+            # Incomplete/max-output is truncation (``length``); a content
+            # filter is a provider safety terminal. Neither is a successful
+            # answer, so neither may be reported as ``stop``.
+            finish_reason = (
+                "content_filter" if incomplete_reason == "content_filter" else "length"
+            )
+        elif final_status in {"queued", "in_progress"} or saw_incomplete_item:
+            finish_reason = "incomplete"
+        elif tool_calls_raw:
+            finish_reason = "tool_calls"
+        elif saw_commentary_phase and not saw_final_answer_phase:
+            # Narration without a final answer is not a finished turn.
+            finish_reason = "incomplete"
+        else:
+            finish_reason = "stop"
+
+        # Build a response that looks like chat.completions while preserving the
+        # Responses terminal shape for callers that classify outcomes.
         message = SimpleNamespace(
             role="assistant",
             content=content,
             tool_calls=tool_calls_raw or None,
+            reasoning="".join(commentary_text_parts).strip() or None,
         )
         choice = SimpleNamespace(
             index=0,
             message=message,
-            finish_reason="stop" if not tool_calls_raw else "tool_calls",
+            finish_reason=finish_reason,
         )
         return SimpleNamespace(
             choices=[choice],
             model=model,
             usage=usage,
+            status=final_status,
+            incomplete_details=incomplete_details,
+            incomplete_reason=incomplete_reason or None,
         )
 
 
@@ -4684,6 +4870,7 @@ def _retry_same_provider_sync(
     effective_extra_body: dict,
     reasoning_config: Optional[dict],
     extra_headers: Optional[Dict[str, str]] = None,
+    tool_choice: Optional[Any] = None,
 ) -> Any:
     if task == "vision":
         effective_provider, retry_client, retry_model = resolve_vision_provider_client(
@@ -4718,6 +4905,7 @@ def _retry_same_provider_sync(
         temperature=temperature,
         max_tokens=max_tokens,
         tools=tools,
+        tool_choice=tool_choice,
         timeout=effective_timeout,
         extra_body=effective_extra_body,
         reasoning_config=reasoning_config,
@@ -8524,6 +8712,7 @@ def _build_call_kwargs(
     temperature: Optional[float] = None,
     max_tokens: Optional[int] = None,
     tools: Optional[list] = None,
+    tool_choice: Optional[Any] = None,
     timeout: float = 30.0,
     extra_body: Optional[dict] = None,
     reasoning_config: Optional[dict] = None,
@@ -8637,6 +8826,12 @@ def _build_call_kwargs(
                 _seen.add(_tname)
             _deduped.append(_t)
         kwargs["tools"] = _deduped
+
+    # A forced/limited tool choice only means something alongside tools;
+    # providers reject it otherwise. The Responses adapter additionally
+    # translates chat-style forms into the wire shape it can carry (#420).
+    if tool_choice is not None and "tools" in kwargs:
+        kwargs["tool_choice"] = tool_choice
 
     # Build provider-aware reasoning kwargs through the same profile hooks used
     # by the standard chat-completions transport. Some providers require
@@ -9250,6 +9445,7 @@ def call_llm(
     temperature: Optional[float] = None,
     max_tokens: int = None,
     tools: list = None,
+    tool_choice: Optional[Any] = None,
     timeout: float = None,
     extra_body: dict = None,
     reasoning_config: Optional[dict] = None,
@@ -9275,6 +9471,7 @@ def call_llm(
             temperature=temperature,
             max_tokens=max_tokens,
             tools=tools,
+            tool_choice=tool_choice,
             timeout=timeout,
             extra_body=extra_body,
             reasoning_config=reasoning_config,
@@ -9321,6 +9518,7 @@ def _call_llm_impl(
     temperature: Optional[float] = None,
     max_tokens: int = None,
     tools: list = None,
+    tool_choice: Optional[Any] = None,
     timeout: float = None,
     extra_body: dict = None,
     reasoning_config: Optional[dict] = None,
@@ -9347,6 +9545,11 @@ def _call_llm_impl(
         temperature: Sampling temperature (None = provider default).
         max_tokens: Max output tokens (handles max_tokens vs max_completion_tokens).
         tools: Tool definitions (for function calling).
+        tool_choice: Optional chat.completions tool_choice ("auto"/"required"/
+              "none" or {"type": "function", "function": {"name": ...}}).
+              Carried to the provider wire on the primary route and its
+              same-provider retry; the emergency fallback chain keeps the
+              route default. Only sent together with ``tools``.
         timeout: Request timeout in seconds (None = read from auxiliary.{task}.timeout config).
         extra_body: Additional request body fields.
         reasoning_config: Optional Hermes reasoning config for direct model calls
@@ -9484,7 +9687,8 @@ def _call_llm_impl(
     kwargs = _build_call_kwargs(
         request_provider, final_model, messages,
         temperature=temperature, max_tokens=max_tokens,
-        tools=tools, timeout=effective_timeout, extra_body=effective_extra_body,
+        tools=tools, tool_choice=tool_choice,
+        timeout=effective_timeout, extra_body=effective_extra_body,
         reasoning_config=reasoning_config,
         base_url=_base_info or resolved_base_url, task=task)
     if extra_headers:
@@ -9812,6 +10016,7 @@ def _call_llm_impl(
                     effective_extra_body=effective_extra_body,
                     reasoning_config=reasoning_config,
                     extra_headers=extra_headers,
+                    tool_choice=tool_choice,
                 )
 
         # ── Same-provider credential-pool recovery ─────────────────────
@@ -9861,6 +10066,7 @@ def _call_llm_impl(
                         effective_extra_body=effective_extra_body,
                         reasoning_config=reasoning_config,
                         extra_headers=extra_headers,
+                        tool_choice=tool_choice,
                     )
                 except Exception as retry2_err:
                     # The rotated key also hit a quota/auth wall.  Mark it
