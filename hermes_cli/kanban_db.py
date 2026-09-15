@@ -10523,6 +10523,16 @@ class DispatchResult:
     DB writes this tick — the lock holder is making progress on the same
     board. This is the steady-state signal that a single-writer guard is
     actively preventing two dispatchers from racing on ``kanban.db``."""
+    superseded_reaped: list[dict] = field(default_factory=list)
+    """Terminal (non-current) runs whose worker process this tick found still
+    alive and terminated, one payload per reap. See
+    :func:`reap_superseded_workers` — a run is only signalled when its
+    recorded ``(pid, start_time)`` fingerprint still matches the live
+    process, so elapsed time is never what makes a worker a candidate."""
+    superseded_held: list[str] = field(default_factory=list)
+    """Task ids whose successor spawn this tick was withheld because a
+    superseded worker process survived termination. Retried on a later tick,
+    never spawned beside the process that still holds the workspace."""
 
 
 # Bounded registry of recently-reaped worker child exits, populated by the
@@ -10753,6 +10763,155 @@ def _terminate_reclaimed_worker(
 
     info["terminated"] = not _pid_alive(pid)
     return info
+
+
+def _process_start_time(pid: int) -> Optional[int]:
+    """Return the ``start_time`` PID-reuse fingerprint of ``pid``.
+
+    Delegates to the gateway's existing fingerprint helper so the Kanban reap
+    below shares the runtime's one ``(pid, start_time)`` identity convention
+    (Linux: field 22 of ``/proc/<pid>/stat``; elsewhere psutil's creation
+    time). ``None`` means the platform could not provide one.
+    """
+    try:
+        from gateway.status import get_process_start_time
+        return get_process_start_time(int(pid))
+    except Exception:
+        return None
+
+
+def reap_superseded_workers(
+    conn: sqlite3.Connection,
+    *,
+    signal_fn=None,
+) -> list[dict]:
+    """Terminate live worker processes whose run has already ended.
+
+    A run's process identity survives only in its ``spawned`` event:
+    ``_end_run`` — and every block/reclaim transition — clears
+    ``tasks.worker_pid`` / ``task_runs.worker_pid``, so the moment a run
+    reaches a terminal state the board can no longer name its process. When
+    that end came from outside the worker itself (a controller or operator
+    ``kanban_block``, a triage escalation, a flow rule), nothing else signals
+    the process either: the worker keeps running against the same workspace
+    while the dispatcher spawns its successor beside it (#450).
+
+    This pass rebuilds the identity from the spawn record and terminates any
+    process still alive for a run that has ended and is no longer the task's
+    current run. Elapsed time is never a criterion — a long-running but
+    *current* worker is not a candidate — so duration alone never kills live
+    work.
+
+    A candidate is signalled only when every half of the recorded identity
+    still agrees: same pid, same start-time fingerprint, same claiming host.
+    A recycled pid therefore never gets mistaken for the worker, and a spawn
+    record that predates the fingerprint is left alone rather than guessed
+    at.
+
+    SIGTERM is followed by a bounded 5 s wait and then SIGKILL, matching
+    :func:`_terminate_reclaimed_worker` and :func:`enforce_max_runtime`. Each
+    reap is durable as a ``superseded_worker_termination`` event so the action
+    is inspectable in ``hermes kanban tail`` even when the tick did nothing
+    else. Returns one payload per signalled run.
+    """
+    import signal
+
+    host = _claimer_id().split(":", 1)[0]
+    rows = conn.execute(
+        """
+        SELECT e.task_id AS task_id, e.run_id AS run_id, e.payload AS payload,
+               r.outcome AS run_outcome, t.status AS task_status
+          FROM task_events e
+          JOIN task_runs r ON r.id = e.run_id
+          JOIN tasks t ON t.id = e.task_id
+         WHERE e.kind = 'spawned'
+           AND e.run_id IS NOT NULL
+           AND r.ended_at IS NOT NULL
+           AND (t.current_run_id IS NULL OR t.current_run_id <> e.run_id)
+        """,
+    ).fetchall()
+    if not rows:
+        return []
+
+    kill = signal_fn if signal_fn is not None else (
+        os.kill if hasattr(os, "kill") else None
+    )
+    reaped: list[dict] = []
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        raw_pid = payload.get("pid")
+        recorded_start = payload.get("start_time")
+        recorded_host = payload.get("claimer_host")
+        if not raw_pid or recorded_start is None or recorded_host != host:
+            continue
+        pid = int(raw_pid)
+        if not _pid_alive(pid):
+            continue
+        if _process_start_time(pid) != int(recorded_start):
+            continue
+
+        info: dict[str, Any] = {
+            "task_id": row["task_id"],
+            "run_id": int(row["run_id"]),
+            "run_outcome": row["run_outcome"],
+            "task_status": row["task_status"],
+            "prev_pid": pid,
+            "recorded_start_time": int(recorded_start),
+            "termination_attempted": kill is not None,
+            "terminated": False,
+            "sigkill": False,
+        }
+        if kill is not None:
+            try:
+                kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                # Already gone between the liveness check and the signal:
+                # that is a successful reap, not a survival.
+                info["terminated"] = True
+            except OSError:
+                pass
+            else:
+                for _ in range(10):
+                    if not _pid_alive(pid):
+                        info["terminated"] = True
+                        break
+                    time.sleep(0.5)
+                if not info["terminated"] and _pid_alive(pid):
+                    try:
+                        kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+                        info["sigkill"] = True
+                    except (ProcessLookupError, OSError):
+                        pass
+                    info["terminated"] = not _pid_alive(pid)
+        with write_txn(conn):
+            _append_event(
+                conn, row["task_id"], "superseded_worker_termination",
+                info, run_id=int(row["run_id"]),
+            )
+        reaped.append(info)
+    return reaped
+
+
+def _record_superseded_hold(
+    conn: sqlite3.Connection,
+    task_id: str,
+    payload: dict,
+) -> None:
+    """Record that this tick withheld a spawn for a surviving stale worker."""
+    with write_txn(conn):
+        _append_event(
+            conn, task_id, "superseded_worker_hold",
+            {
+                "run_id": payload.get("run_id"),
+                "prev_pid": payload.get("prev_pid"),
+                "run_outcome": payload.get("run_outcome"),
+            },
+        )
 
 
 def _worker_survived_termination(termination: dict) -> bool:
@@ -11829,6 +11988,14 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
     The event's payload carries the pid so a human reading ``hermes kanban
     tail`` can correlate log lines with OS-level traces without opening
     the drawer.
+
+    It also carries the ``(pid, start_time)`` fingerprint and the claiming
+    host of the process we just spawned. A terminal run's ``worker_pid`` is
+    cleared by every terminal transition (``_end_run`` and the block/reclaim
+    paths), so once a run ends the board can no longer name its process —
+    this event is the only durable identity left for a worker that outlives
+    its own run. ``start_time`` is what makes that identity reused-PID-safe
+    when :func:`reap_superseded_workers` acts on it later.
     """
     with write_txn(conn):
         conn.execute(
@@ -11841,7 +12008,15 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
                 "UPDATE task_runs SET worker_pid = ? WHERE id = ?",
                 (int(pid), run_id),
             )
-        _append_event(conn, task_id, "spawned", {"pid": int(pid)}, run_id=run_id)
+        _append_event(
+            conn, task_id, "spawned",
+            {
+                "pid": int(pid),
+                "start_time": _process_start_time(int(pid)),
+                "claimer_host": _claimer_id().split(":", 1)[0],
+            },
+            run_id=run_id,
+        )
 
 
 def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
@@ -12287,6 +12462,11 @@ def _dispatch_once_locked(
     """Run one dispatcher tick.
 
     Steps:
+      0. Terminate worker processes whose run already ended and is no longer
+         current (see :func:`reap_superseded_workers`), and withhold the spawn
+         of any task whose superseded worker survived that termination. Runs
+         first so nothing below can start a successor beside a terminal
+         non-current worker on the same workspace.
       1. Reclaim stale running tasks (TTL expired).
       2. Reclaim stale running tasks (no recent heartbeat).
       3. Reclaim crashed running tasks (host-local PID no longer alive).
@@ -12317,6 +12497,19 @@ def _dispatch_once_locked(
     reap_worker_zombies()
 
     result = DispatchResult()
+    if not dry_run:
+        # A worker whose run was terminalized from outside (controller or
+        # operator block, triage escalation, flow rule) was never signalled by
+        # that transition; it can still be running against the same workspace
+        # when this tick spawns a successor. Terminate it here — before any
+        # spawn below — so the successor never shares the workspace with a
+        # process whose run is already over (#450).
+        result.superseded_reaped = reap_superseded_workers(conn)
+    _superseded_held = {
+        entry["task_id"]: entry
+        for entry in result.superseded_reaped
+        if not entry.get("terminated")
+    }
     result.reclaimed = release_stale_claims(conn)
     if reconcile_orphans:
         # Orphaned-card reconciliation: requeue 'running' cards whose claim
@@ -12542,6 +12735,14 @@ def _dispatch_once_locked(
                     _per_profile_running.get(row_assignee, 0) + 1
                 )
             continue
+        _superseded_hold = _superseded_held.get(row["id"])
+        if _superseded_hold is not None:
+            # This task's previous worker outlived its run and survived
+            # termination. Spawning a successor now would put two workers on
+            # one workspace; withhold it and retry on a later tick.
+            _record_superseded_hold(conn, row["id"], _superseded_hold)
+            result.superseded_held.append(row["id"])
+            continue
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             continue
@@ -12710,6 +12911,13 @@ def _dispatch_once_locked(
                 _per_profile_running[row["assignee"]] = (
                     _per_profile_running.get(row["assignee"], 0) + 1
                 )
+            continue
+        _superseded_hold = _superseded_held.get(row["id"])
+        if _superseded_hold is not None:
+            # Same rule as the ready lane: no review worker starts while the
+            # superseded worker of this task still holds the workspace.
+            _record_superseded_hold(conn, row["id"], _superseded_hold)
+            result.superseded_held.append(row["id"])
             continue
         claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
