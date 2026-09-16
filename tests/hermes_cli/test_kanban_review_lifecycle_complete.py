@@ -400,6 +400,71 @@ def test_review_retry_still_trips_the_failure_breaker(conn) -> None:
     assert unblocked.status == "review"
 
 
+def test_routed_recovery_does_not_mask_exhausted_review_phase(conn) -> None:
+    task_id, _review = _claimed_review(conn, "Routed recovery preserves review")
+    assert kb._record_spawn_failure(
+        conn,
+        task_id,
+        "reviewer cannot start",
+        failure_limit=1,
+    )
+    with kb.write_txn(conn):
+        kb._append_event(
+            conn,
+            task_id,
+            "origin_signal",
+            {
+                "reason": "review recovery requires operator attention",
+                "origin_signal": "recovery",
+            },
+        )
+
+    assert kb.unblock_task(conn, task_id)
+    unblocked = kb.get_task(conn, task_id)
+    assert unblocked is not None
+    assert unblocked.status == "review"
+    assert unblocked.assignee == "reviewer"
+
+    claimed = kb.claim_review_task(conn, task_id, claimer="reviewer:recovered")
+    assert claimed is not None
+    event = kb.list_events(conn, task_id=task_id)[-1]
+    assert event.kind == "claimed"
+    assert event.payload is not None
+    assert event.payload["source_status"] == "review"
+
+
+def test_routed_recovery_preserves_exhausted_ready_phase(conn) -> None:
+    task_id = kb.create_task(
+        conn,
+        title="Routed recovery preserves ready",
+        assignee="builder",
+    )
+    implementation = kb.claim_task(conn, task_id, claimer="builder:failed")
+    assert implementation is not None
+    assert kb._record_spawn_failure(
+        conn,
+        task_id,
+        "implementation worker cannot start",
+        failure_limit=1,
+    )
+    with kb.write_txn(conn):
+        kb._append_event(
+            conn,
+            task_id,
+            "origin_signal",
+            {
+                "reason": "implementation recovery requires operator attention",
+                "origin_signal": "recovery",
+            },
+        )
+
+    assert kb.unblock_task(conn, task_id)
+    unblocked = kb.get_task(conn, task_id)
+    assert unblocked is not None
+    assert unblocked.status == "ready"
+    assert unblocked.assignee == "builder"
+
+
 def test_review_escalation_unblocks_back_to_review(conn) -> None:
     task_id, review = _claimed_review(conn, "External review escalation")
     assert kb.block_task(

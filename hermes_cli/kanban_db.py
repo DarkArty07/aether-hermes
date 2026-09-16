@@ -6503,27 +6503,32 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
 
     Events written by review workers carry ``source_status``/``retry_status``;
     an explicit unblock that must wait for parents carries ``resume_status``.
-    Legacy events omit these fields and therefore retain the historical
-    ``ready`` behavior.
+    A routed recovery may append an administrative ``origin_signal`` without
+    phase metadata after the event that recorded the real retry phase.  Skip
+    only those phase-less routing events; every other legacy event retains the
+    historical ``ready`` behavior.
     """
-    row = conn.execute(
-        "SELECT payload FROM task_events "
+    rows = conn.execute(
+        "SELECT kind, payload FROM task_events "
         "WHERE task_id = ? AND kind IN ("
         "'blocked', 'block_loop_detected', 'dependency_wait', 'gave_up', "
         "'unblocked', 'changes_requested', 'review_reopened', 'status', 'reclaimed', "
         "'stale', 'timed_out', 'crashed', 'spawn_failed', 'rate_limited', 'origin_signal'"
-        ") ORDER BY id DESC LIMIT 1",
+        ") ORDER BY id DESC",
         (task_id,),
-    ).fetchone()
-    try:
-        payload = json.loads(row["payload"]) if row and row["payload"] else {}
-    except (json.JSONDecodeError, TypeError):
-        payload = {}
-    if not isinstance(payload, dict):
-        payload = {}
-    for key in ("resume_status", "retry_status", "source_status"):
-        if payload.get(key) == "review":
-            return "review"
+    ).fetchall()
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"]) if row["payload"] else {}
+        except (json.JSONDecodeError, TypeError):
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        for key in ("resume_status", "retry_status", "source_status"):
+            if key in payload:
+                return "review" if payload.get(key) == "review" else "ready"
+        if row["kind"] != "origin_signal":
+            return "ready"
     return "ready"
 
 
