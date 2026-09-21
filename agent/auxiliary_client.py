@@ -5810,13 +5810,15 @@ def _candidate_context_window(
     return None
 
 
-def _try_configured_fallback_chain(
+def _try_configured_fallback_chain_from_index(
     task: str,
     failed_provider: str,
     reason: str = "error",
     failed_model: Optional[str] = None,
+    *,
+    start_index: int = 0,
 ) -> Tuple[Optional[Any], Optional[str], str]:
-    """Try user-configured fallback_chain for a specific auxiliary task.
+    """Resolve the first viable configured fallback at or after ``start_index``.
 
     Reads auxiliary.<task>.fallback_chain from config.yaml and tries each
     entry in order.  Each entry must have at least ``provider``; ``model``,
@@ -5874,10 +5876,17 @@ def _try_configured_fallback_chain(
     min_ctx = _task_minimum_context_length(task)
 
     for i, entry in enumerate(chain):
+        if i < max(0, start_index):
+            continue
         if not isinstance(entry, dict):
             continue
         fb_provider = str(entry.get("provider", "")).strip()
         if not fb_provider:
+            continue
+        health_label = _normalize_chain_label(fb_provider)
+        if _is_provider_unhealthy(health_label):
+            _log_skip_unhealthy(health_label, task)
+            tried.append(f"fallback_chain[{i}]({fb_provider}) (unhealthy)")
             continue
         fb_model_raw = str(entry.get("model", "")).strip()
         if should_skip_candidate(
@@ -5927,6 +5936,235 @@ def _try_configured_fallback_chain(
             task, ", ".join(tried),
         )
     return None, None, ""
+
+
+def _try_configured_fallback_chain(
+    task: str,
+    failed_provider: str,
+    reason: str = "error",
+    failed_model: Optional[str] = None,
+) -> Tuple[Optional[Any], Optional[str], str]:
+    """Try the user-configured fallback chain from its first entry.
+
+    Resolution and request execution are deliberately separate: callers use
+    :func:`_try_configured_fallback_chain_from_index` after a resolved
+    candidate fails at request time so every later configured entry gets its
+    turn in the declared order.
+    """
+    return _try_configured_fallback_chain_from_index(
+        task,
+        failed_provider,
+        reason=reason,
+        failed_model=failed_model,
+        start_index=0,
+    )
+
+
+def _has_configured_fallback_chain(task: Optional[str]) -> bool:
+    """Return whether an auxiliary task explicitly declares a fallback."""
+    if not task:
+        return False
+    try:
+        chain = _get_auxiliary_task_config(task).get("fallback_chain")
+    except Exception:
+        return False
+    return isinstance(chain, list) and any(isinstance(entry, dict) for entry in chain)
+
+
+def _configured_fallback_index(label: str) -> Optional[int]:
+    """Return the configured-chain index encoded in a fallback label."""
+    match = re.match(r"fallback_chain\[(\d+)\]", label or "")
+    return int(match.group(1)) if match else None
+
+
+def _fallback_failure_reason(exc: Exception) -> Optional[str]:
+    """Classify request failures that may advance an explicit fallback chain."""
+    if _is_auth_error(exc):
+        return "auth error"
+    if _is_payment_error(exc):
+        return "payment error"
+    if _is_rate_limit_error(exc):
+        return "rate limit"
+    if _is_model_incompatible_error(exc):
+        return "model incompatible with route"
+    if _is_invalid_aux_response_error(exc):
+        return "invalid provider response"
+    if _is_connection_error(exc):
+        return "connection error"
+    if _is_model_not_found_error(exc):
+        return "model unavailable"
+    status = getattr(exc, "status_code", None) or getattr(
+        getattr(exc, "response", None), "status_code", None
+    )
+    if isinstance(status, int) and 400 <= status < 600:
+        # An explicitly configured chain is an operator declaration that a
+        # later backend may recover from a candidate-specific HTTP failure.
+        # Keep local programming errors fail-fast, but do not let an upstream
+        # 403/5xx (plan gate, outage, bad deployment) strand the next entry.
+        return f"provider HTTP {status}"
+    return None
+
+
+def _call_configured_fallback_chain_sync(
+    fb_client: Any,
+    fb_model: Optional[str],
+    fb_label: str,
+    *,
+    task: Optional[str],
+    failed_provider: str,
+    failed_model: Optional[str],
+    reason: str,
+    messages: list,
+    temperature: Optional[float],
+    max_tokens: Optional[int],
+    tools: Optional[list],
+    effective_timeout: float,
+    effective_extra_body: dict,
+    reasoning_config: Optional[dict],
+    extra_headers: Optional[Dict[str, str]],
+    route_info: Optional[Dict[str, str]],
+) -> Optional[Any]:
+    """Call every viable configured fallback in order until one succeeds."""
+    current_client, current_model, current_label = fb_client, fb_model, fb_label
+    next_reason = reason
+    while current_client is not None:
+        _record_route_info(
+            route_info,
+            _fallback_provider_from_label(current_label),
+            current_model,
+        )
+        try:
+            response = _call_fallback_candidate_sync(
+                current_client,
+                current_model,
+                current_label,
+                task=task,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                tools=tools,
+                effective_timeout=effective_timeout,
+                effective_extra_body=effective_extra_body,
+                reasoning_config=reasoning_config,
+                extra_headers=extra_headers,
+            )
+        except Exception as candidate_error:
+            next_reason = _fallback_failure_reason(candidate_error) or ""
+            if not next_reason:
+                raise
+            if next_reason == "payment error":
+                _mark_provider_unhealthy(
+                    _fallback_provider_from_label(current_label)
+                )
+            logger.warning(
+                "Auxiliary %s: configured fallback %s failed with %s; "
+                "trying the next configured entry",
+                task or "call",
+                current_label,
+                next_reason,
+            )
+        else:
+            if response is not None:
+                return response
+            next_reason = "stale fallback credential"
+
+        current_index = _configured_fallback_index(current_label)
+        if current_index is None:
+            return None
+        current_client, current_model, current_label = (
+            _try_configured_fallback_chain_from_index(
+                task or "",
+                failed_provider,
+                reason=next_reason,
+                failed_model=failed_model,
+                start_index=current_index + 1,
+            )
+        )
+    return None
+
+
+async def _call_configured_fallback_chain_async(
+    fb_client: Any,
+    fb_model: Optional[str],
+    fb_label: str,
+    *,
+    task: Optional[str],
+    failed_provider: str,
+    failed_model: Optional[str],
+    reason: str,
+    messages: list,
+    temperature: Optional[float],
+    max_tokens: Optional[int],
+    tools: Optional[list],
+    effective_timeout: float,
+    effective_extra_body: dict,
+    reasoning_config: Optional[dict],
+    extra_headers: Optional[Dict[str, str]],
+    route_info: Optional[Dict[str, str]],
+) -> Optional[Any]:
+    """Async mirror of :func:`_call_configured_fallback_chain_sync`."""
+    current_client, current_model, current_label = fb_client, fb_model, fb_label
+    next_reason = reason
+    while current_client is not None:
+        async_client, async_model = _to_async_client(
+            current_client,
+            current_model or "",
+            is_vision=(task == "vision"),
+        )
+        attempted_model = async_model or current_model
+        _record_route_info(
+            route_info,
+            _fallback_provider_from_label(current_label),
+            attempted_model,
+        )
+        try:
+            response = await _call_fallback_candidate_async(
+                async_client,
+                attempted_model,
+                current_label,
+                task=task,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                tools=tools,
+                effective_timeout=effective_timeout,
+                effective_extra_body=effective_extra_body,
+                reasoning_config=reasoning_config,
+                extra_headers=extra_headers,
+            )
+        except Exception as candidate_error:
+            next_reason = _fallback_failure_reason(candidate_error) or ""
+            if not next_reason:
+                raise
+            if next_reason == "payment error":
+                _mark_provider_unhealthy(
+                    _fallback_provider_from_label(current_label)
+                )
+            logger.warning(
+                "Auxiliary %s (async): configured fallback %s failed with %s; "
+                "trying the next configured entry",
+                task or "call",
+                current_label,
+                next_reason,
+            )
+        else:
+            if response is not None:
+                return response
+            next_reason = "stale fallback credential"
+
+        current_index = _configured_fallback_index(current_label)
+        if current_index is None:
+            return None
+        current_client, current_model, current_label = (
+            _try_configured_fallback_chain_from_index(
+                task or "",
+                failed_provider,
+                reason=next_reason,
+                failed_model=failed_model,
+                start_index=current_index + 1,
+            )
+        )
+    return None
 
 
 def _try_configured_fallback_for_unavailable_client(
@@ -10104,8 +10342,9 @@ def _call_llm_impl(
         # refresh path nor explicit provider credential refresh applies,
         # fall back to an alternative provider instead of dropping the
         # auxiliary task on the floor (silent compression failure /
-        # message loss). Auth is NOT a capacity error: it only bypasses
-        # the explicit-provider gate when the user is in auto mode.
+        # message loss). Auth is NOT a capacity error: it bypasses the
+        # explicit-provider gate only in auto mode or when the operator
+        # explicitly declared a per-task fallback chain.
         should_fallback = (
             _is_auth_error(first_err)
             or _is_payment_error(first_err)
@@ -10137,7 +10376,10 @@ def _call_llm_impl(
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
         )
-        if should_fallback and (is_auto or is_capacity_error):
+        has_configured_fallbacks = _has_configured_fallback_chain(task)
+        if should_fallback and (
+            is_auto or is_capacity_error or has_configured_fallbacks
+        ):
             if _is_auth_error(first_err):
                 reason = "auth error"
             elif _is_payment_error(first_err):
@@ -10174,25 +10416,49 @@ def _call_llm_impl(
             #   2. For auto: top-level main fallback_providers/fallback_model
             #   3. For auto: built-in auxiliary discovery chain
             #   4. For explicit aux providers: main agent model safety net
-            fb_client, fb_model, fb_label = (None, None, "")
+            fb_client, fb_model, fb_label = _try_configured_fallback_chain(
+                task,
+                resolved_provider or "auto",
+                reason=reason,
+                failed_model=_chain_failed_model,
+            )
+            if fb_client is not None:
+                fb_resp = _call_configured_fallback_chain_sync(
+                    fb_client,
+                    fb_model,
+                    fb_label,
+                    task=task,
+                    failed_provider=resolved_provider or "auto",
+                    failed_model=_chain_failed_model,
+                    reason=reason,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    tools=tools,
+                    effective_timeout=effective_timeout,
+                    effective_extra_body=effective_extra_body,
+                    reasoning_config=reasoning_config,
+                    extra_headers=extra_headers,
+                    route_info=route_info,
+                )
+                if fb_resp is not None:
+                    return fb_resp
+
+            # The entire explicit task chain is exhausted before any broader
+            # discovery or main-model safety net is considered.
             if is_auto:
-                fb_client, fb_model, fb_label = _try_configured_fallback_chain(
-                    task, resolved_provider or "auto", reason=reason,
-                    failed_model=_chain_failed_model)
-                if fb_client is None:
-                    fb_client, fb_model, fb_label = _try_main_fallback_chain(
-                        task, resolved_provider or "auto", reason=reason)
+                fb_client, fb_model, fb_label = _try_main_fallback_chain(
+                    task, resolved_provider or "auto", reason=reason)
                 if fb_client is None:
                     fb_client, fb_model, fb_label = _try_payment_fallback(
                         resolved_provider, task, reason=reason)
             else:
-                fb_client, fb_model, fb_label = _try_configured_fallback_chain(
-                    task, resolved_provider or "auto", reason=reason,
-                    failed_model=_chain_failed_model)
-                if fb_client is None:
-                    fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
-                        resolved_provider, task, reason=reason,
-                        failed_model=_chain_failed_model)
+                fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
+                    resolved_provider,
+                    task,
+                    reason=reason,
+                    failed_model=_chain_failed_model,
+                )
 
             if fb_client is not None:
                 _record_route_info(
@@ -10208,8 +10474,8 @@ def _call_llm_impl(
                     extra_headers=extra_headers)
                 if fb_resp is not None:
                     return fb_resp
-                # The candidate had a stale/unrefreshable credential and was
-                # quarantined — walk the discovery chain once more; unhealthy
+                # The broader candidate had a stale/unrefreshable credential
+                # and was quarantined — walk discovery once more; unhealthy
                 # entries are skipped so the next viable candidate serves.
                 fb_client, fb_model, fb_label = _try_payment_fallback(
                     resolved_provider, task, reason="stale fallback credential")
@@ -10788,9 +11054,9 @@ async def _async_call_llm_impl(
 
         # ── Payment / connection / rate-limit fallback (mirrors sync call_llm) ──
         # Auth error fallback (#21165): a 401 that survived the refresh path
-        # falls back in auto mode just like the sync call_llm() path. Auth is
-        # NOT a capacity error, so on an explicit provider it still respects
-        # the user's choice (handled by the is_auto/is_capacity_error gate).
+        # falls back in auto mode just like the sync call_llm() path. An
+        # explicit provider remains pinned unless the operator also declared
+        # a per-task fallback chain.
         should_fallback = (
             _is_auth_error(first_err)
             or _is_payment_error(first_err)
@@ -10814,7 +11080,10 @@ async def _async_call_llm_impl(
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
         )
-        if should_fallback and (is_auto or is_capacity_error):
+        has_configured_fallbacks = _has_configured_fallback_chain(task)
+        if should_fallback and (
+            is_auto or is_capacity_error or has_configured_fallbacks
+        ):
             if _is_auth_error(first_err):
                 reason = "auth error"
             elif _is_payment_error(first_err):
@@ -10847,28 +11116,52 @@ async def _async_call_llm_impl(
             #   2. For auto: top-level main fallback_providers/fallback_model
             #   3. For auto: built-in auxiliary discovery chain
             #   4. For explicit aux providers: main agent model safety net
-            fb_client, fb_model, fb_label = (None, None, "")
+            fb_client, fb_model, fb_label = _try_configured_fallback_chain(
+                task,
+                resolved_provider or "auto",
+                reason=reason,
+                failed_model=_chain_failed_model,
+            )
+            if fb_client is not None:
+                fb_resp = await _call_configured_fallback_chain_async(
+                    fb_client,
+                    fb_model,
+                    fb_label,
+                    task=task,
+                    failed_provider=resolved_provider or "auto",
+                    failed_model=_chain_failed_model,
+                    reason=reason,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    tools=tools,
+                    effective_timeout=effective_timeout,
+                    effective_extra_body=effective_extra_body,
+                    reasoning_config=reasoning_config,
+                    extra_headers=extra_headers,
+                    route_info=route_info,
+                )
+                if fb_resp is not None:
+                    return fb_resp
+
+            # Only leave the explicit task chain after every later entry has
+            # either failed at request time or proved unavailable.
             if is_auto:
-                fb_client, fb_model, fb_label = _try_configured_fallback_chain(
-                    task, resolved_provider or "auto", reason=reason,
-                    failed_model=_chain_failed_model)
-                if fb_client is None:
-                    fb_client, fb_model, fb_label = _try_main_fallback_chain(
-                        task, resolved_provider or "auto", reason=reason)
+                fb_client, fb_model, fb_label = _try_main_fallback_chain(
+                    task, resolved_provider or "auto", reason=reason)
                 if fb_client is None:
                     fb_client, fb_model, fb_label = _try_payment_fallback(
                         resolved_provider, task, reason=reason)
             else:
-                fb_client, fb_model, fb_label = _try_configured_fallback_chain(
-                    task, resolved_provider or "auto", reason=reason,
-                    failed_model=_chain_failed_model)
-                if fb_client is None:
-                    fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
-                        resolved_provider, task, reason=reason,
-                        failed_model=_chain_failed_model)
+                fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
+                    resolved_provider,
+                    task,
+                    reason=reason,
+                    failed_model=_chain_failed_model,
+                )
 
             if fb_client is not None:
-                # Convert sync fallback client to async
+                # Convert the broader fallback client to async.
                 async_fb, async_fb_model = _to_async_client(
                     fb_client, fb_model or "", is_vision=(task == "vision")
                 )
@@ -10887,8 +11180,8 @@ async def _async_call_llm_impl(
                     extra_headers=extra_headers)
                 if fb_resp is not None:
                     return fb_resp
-                # Stale/unrefreshable candidate credential — quarantined; walk
-                # the discovery chain once more (unhealthy entries skipped).
+                # Stale/unrefreshable broader candidate credential —
+                # quarantined; walk discovery again (unhealthy entries skip).
                 fb_client, fb_model, fb_label = _try_payment_fallback(
                     resolved_provider, task, reason="stale fallback credential")
                 if fb_client is not None:
