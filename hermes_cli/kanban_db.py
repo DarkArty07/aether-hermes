@@ -3951,18 +3951,20 @@ def _project_from_board_binding(
     project_id: Optional[str],
     *,
     board: Optional[str] = None,
+    conn: Optional[sqlite3.Connection] = None,
+    parents: Optional[Iterable[str]] = None,
 ) -> Optional[Any]:
-    """HLP-226c: recover a Project from the current board's own binding.
+    """HLP-226c / HLP-428: recover a Project from the current board's own binding.
 
-    A project/affinity worker may deliberately share a canonical worktree
-    created for an **earlier** board — ``<repo>/.worktrees/<prior-board-leaf>``
-    — so the worktree leaf names no task in this board. Recovery is
-    conjunctive and board-bound:
+    A project/affinity worker or non-affinity direct parent may share a canonical
+    worktree created under ``<repo>/.worktrees/<leaf>``. Recovery is conjunctive
+    and board-bound:
 
     * the current source task carries the exact requested Project, an absolute
-      ``dir`` workspace and session affinity;
-    * the current board metadata carries the same Hermes Project and a
-      ``default_workdir`` that resolves to the repository holding it; and
+      ``dir`` workspace, and either session affinity or is an explicit direct parent
+      in ``parents``;
+    * the current board metadata carries the same Hermes Project and an
+      absolute ``default_workdir`` that resolves to the repository holding it; and
     * the shared path resolves to exactly one opaque leaf under
       ``<board default_workdir>/.worktrees/``.
 
@@ -3977,13 +3979,37 @@ def _project_from_board_binding(
         return None
     if source_task.workspace_kind != "dir":
         return None
-    if not source_task.workspace_path or not source_task.session_affinity:
+    if not source_task.workspace_path:
         return None
+
+    meta = (
+        _read_board_meta_for_conn(conn, board)
+        if conn is not None
+        else read_board_metadata(board if board else get_current_board())
+    )
+    is_aether_board = bool(
+        str(
+            meta.get("aether_contract_id")
+            or meta.get("contract_id")
+            or meta.get("aether_project_id")
+            or ""
+        ).strip()
+    )
+
+    # Recovery authority stays conjunctive: explicit direct parent on a
+    # recognized Aether board, or proven session affinity ancestry.
+    is_direct_parent = parents is not None and str(source_task.id) in [str(p) for p in parents]
+    has_affinity = bool(source_task.session_affinity)
+    if has_affinity:
+        pass
+    elif is_aether_board and is_direct_parent:
+        pass
+    else:
+        return None
+
     shared_path = Path(source_task.workspace_path)
     if not shared_path.is_absolute():
         return None
-
-    meta = read_board_metadata(board if board else get_current_board())
     board_project = str(meta.get("project_id") or "").strip()
     if board_project != project_id:
         return None
@@ -4009,6 +4035,16 @@ def _project_from_board_binding(
         return None
 
     from hermes_cli import projects_db as _pdb
+
+    # Check for contradictory registry values in the active profile's registry
+    try:
+        with _pdb.connect_closing() as _pconn:
+            existing_proj = _pdb.get_project(_pconn, project_id)
+            if existing_proj and existing_proj.primary_path:
+                if Path(existing_proj.primary_path).resolve(strict=False) != resolved_repo:
+                    return None
+    except Exception:
+        pass
 
     try:
         project_slug = _pdb.normalize_slug(project_id)
@@ -4122,6 +4158,7 @@ def create_task(
     # Inherit the board's scoped project when the caller didn't name one, so a
     # project-scoped board anchors every new task to that project's repo
     # (deterministic worktree + branch) without each surface repeating it.
+    explicit_project_supplied = project_id is not None
     if project_id is None:
         try:
             _bmeta = read_board_metadata(board if board else get_current_board())
@@ -4130,6 +4167,25 @@ def create_task(
                 project_id = _board_project
         except Exception:
             pass
+
+    _bmeta_for_board = _read_board_meta_for_conn(conn, board)
+    _is_aether_board = bool(
+        str(
+            _bmeta_for_board.get("aether_contract_id")
+            or _bmeta_for_board.get("contract_id")
+            or _bmeta_for_board.get("aether_project_id")
+            or ""
+        ).strip()
+    )
+
+    if project_id and parents:
+        for p in parents:
+            parent_task = get_task(conn, str(p))
+            if parent_task and parent_task.project_id and parent_task.project_id != project_id:
+                raise ValueError(
+                    f"project_id {project_id!r} does not match parent task {parent_task.id} "
+                    f"project_id {parent_task.project_id!r}"
+                )
 
     # Resolve an optional first-class Project link. A project-linked task is
     # anchored to the project's primary repo as a git worktree, so its branch
@@ -4152,110 +4208,116 @@ def create_task(
                 project_obj = _pdb.get_project(_pconn, project_id)
         except Exception:
             project_obj = None
-        if project_obj is None and project_source_task_id:
+
+        if project_obj is not None and project_obj.primary_path:
+            try:
+                _b_proj = str(_bmeta_for_board.get("project_id") or "").strip()
+                _b_workdir = str(_bmeta_for_board.get("default_workdir") or "").strip()
+                if _b_proj == project_id and _b_workdir:
+                    _b_repo = Path(_b_workdir).expanduser().resolve(strict=False)
+                    _p_repo = Path(project_obj.primary_path).resolve(strict=False)
+                    if _b_repo != _p_repo:
+                        project_obj = None
+            except Exception:
+                pass
+
+        if project_obj is None:
             # Worker profiles have their own projects.db, while the Kanban DB is
             # intentionally shared. Recover routing only from a canonical
             # project-linked source task in this same board. This carries the
             # repo + project branch convention forward without copying or
             # opening the creator profile's project store, and without reusing
             # the source task's literal worktree path.
-            source_task = get_task(conn, str(project_source_task_id))
-            source_anchor = source_task
-            # HLP-226c: set only when the source is a project-linked ``dir``
-            # task whose ``.worktrees/<leaf>`` names no task in this board —
-            # i.e. the leaf is an opaque prior-board name.
-            shared_leaf_unresolved = False
-            if (
-                source_task is not None
-                and source_task.project_id == project_id
-                and source_task.workspace_kind == "dir"
-                and source_task.workspace_path
-                and source_task.session_affinity
-            ):
-                # A terminal affinity Supervisor intentionally persists the
-                # shared root worktree as ``dir``. Resolve that root task as
-                # the canonical anchor rather than rejecting the Project
-                # merely because the terminal task id differs from the
-                # worktree leaf. Every field below must agree, so an arbitrary
-                # directory can never become a Project source.
-                shared_path = Path(source_task.workspace_path)
-                root_task = (
-                    get_task(conn, shared_path.name)
-                    if shared_path.is_absolute()
-                    and shared_path.parent.name == ".worktrees"
-                    else None
-                )
-                source_affinity = source_task.session_affinity
-                root_affinity = root_task.session_affinity if root_task else None
-                if (
-                    root_task is not None
-                    and root_task.project_id == project_id
-                    and root_task.assignee == source_task.assignee
-                    and root_task.workspace_kind == "worktree"
-                    and root_task.workspace_path == source_task.workspace_path
-                    and root_affinity
-                    and root_affinity.get("flow_id") == source_affinity.get("flow_id")
-                ):
-                    source_anchor = root_task
-                elif root_task is None:
-                    # The leaf is opaque here: it need not resolve in this
-                    # board. A leaf that *does* resolve but conflicts keeps the
-                    # strict HLP-226b fail-closed behavior instead.
-                    shared_leaf_unresolved = True
-            if (
-                source_anchor is not None
-                and source_anchor.project_id == project_id
-                and source_anchor.workspace_kind == "worktree"
-                and source_anchor.workspace_path
-            ):
-                source_path = Path(source_anchor.workspace_path)
-                if (
-                    source_path.is_absolute()
-                    and source_path.name == source_anchor.id
-                    and source_path.parent.name == ".worktrees"
-                ):
-                    project_slug = None
-                    if source_anchor.branch_name:
-                        prefix, separator, leaf = source_anchor.branch_name.partition("/")
-                        if separator and (
-                            leaf == source_anchor.id
-                            or leaf.startswith(f"{source_anchor.id}-")
-                        ):
-                            try:
-                                project_slug = _pdb.normalize_slug(prefix)
-                            except ValueError:
-                                project_slug = None
-                    if project_slug is None:
-                        try:
-                            project_slug = _pdb.normalize_slug(project_id)
-                        except ValueError:
-                            project_slug = None
-                    if project_slug:
-                        project_repo = str(source_path.parent.parent)
-                        project_obj = _pdb.Project(
-                            id=project_id,
-                            slug=project_slug,
-                            name=project_slug,
-                            created_at=0,
-                            primary_path=project_repo,
+            source_id = project_source_task_id
+            parents_tuple = tuple(parents)
+            if not source_id and len(parents_tuple) == 1:
+                source_id = parents_tuple[0]
+
+            if source_id:
+                source_task = get_task(conn, str(source_id))
+                if source_task is not None and source_task.project_id == project_id:
+                    source_anchor = source_task
+                    shared_leaf_unresolved = False
+                    if (
+                        source_task.workspace_kind == "dir"
+                        and source_task.workspace_path
+                    ):
+                        shared_path = Path(source_task.workspace_path)
+                        root_task = (
+                            get_task(conn, shared_path.name)
+                            if shared_path.is_absolute()
+                            and shared_path.parent.name == ".worktrees"
+                            else None
                         )
-                        if workspace_kind == "scratch":
-                            workspace_kind = "worktree"
-            elif shared_leaf_unresolved:
-                # HLP-226c: the shared worktree belongs to a prior board, so
-                # the leaf names no task here. Recover Project/repository
-                # identity from the current board's own Project binding — and
-                # only when every conjunctive relation still holds. A rejected
-                # recovery stays rejected: no cross-board lookup, no registry
-                # read/copy, no fallback to scratch for an affinity request.
-                project_obj = _project_from_board_binding(
-                    source_task, project_id, board=board
-                )
+                        source_affinity = source_task.session_affinity
+                        root_affinity = root_task.session_affinity if root_task else None
+                        if (
+                            root_task is not None
+                            and root_task.project_id == project_id
+                            and root_task.assignee == source_task.assignee
+                            and root_task.workspace_kind == "worktree"
+                            and root_task.workspace_path == source_task.workspace_path
+                            and root_affinity
+                            and source_affinity
+                            and root_affinity.get("flow_id") == source_affinity.get("flow_id")
+                        ):
+                            source_anchor = root_task
+                        elif root_task is None:
+                            shared_leaf_unresolved = True
+
+                    if (
+                        source_anchor is not None
+                        and source_anchor.project_id == project_id
+                        and source_anchor.workspace_kind == "worktree"
+                        and source_anchor.workspace_path
+                    ):
+                        source_path = Path(source_anchor.workspace_path)
+                        if (
+                            source_path.is_absolute()
+                            and source_path.name == source_anchor.id
+                            and source_path.parent.name == ".worktrees"
+                        ):
+                            project_slug = None
+                            if source_anchor.branch_name:
+                                prefix, separator, leaf = source_anchor.branch_name.partition("/")
+                                if separator and (
+                                    leaf == source_anchor.id
+                                    or leaf.startswith(f"{source_anchor.id}-")
+                                ):
+                                    try:
+                                        project_slug = _pdb.normalize_slug(prefix)
+                                    except ValueError:
+                                        project_slug = None
+                            if project_slug is None:
+                                try:
+                                    project_slug = _pdb.normalize_slug(project_id)
+                                except ValueError:
+                                    project_slug = None
+                            if project_slug:
+                                project_repo = str(source_path.parent.parent)
+                                project_obj = _pdb.Project(
+                                    id=project_id,
+                                    slug=project_slug,
+                                    name=project_slug,
+                                    created_at=0,
+                                    primary_path=project_repo,
+                                )
+                                if workspace_kind == "scratch":
+                                    workspace_kind = "worktree"
+                    elif (
+                        source_task.workspace_kind == "dir"
+                        and shared_leaf_unresolved
+                    ):
+                        project_obj = _project_from_board_binding(
+                            source_task, project_id, board=board, conn=conn, parents=parents
+                        )
 
         if project_obj is None:
-            # A project id/slug that doesn't resolve must not crash task
-            # creation or persist a dangling reference — drop the link and
-            # create the task as an ordinary (scratch) task.
+            if _is_aether_board and (explicit_project_supplied or project_id):
+                raise ValueError(
+                    f"Cannot safely resolve project {project_id!r} on Aether board: "
+                    "safe recovery failed (missing, mismatched, or ambiguous board binding / parent edge)"
+                )
             project_id = None
         else:
             # Canonicalise (a slug may have been passed) and anchor the
@@ -4736,7 +4798,10 @@ def _route_affinity_terminal(
         )
         signal = None
         if controller is None and not task.session_affinity:
-            signal = _default_flow_block_signal(conn, task_id, "capability")
+            try:
+                signal = _default_flow_block_signal(conn, task_id, "capability")
+            except ValueError:
+                signal = None
             if signal is None:
                 return False  # Genuine non-flow task: preserve legacy routing.
         _append_event(conn, task_id, "flow_failure_routed", {
@@ -5182,24 +5247,23 @@ def list_comments_after(
 def _read_board_meta_for_conn(conn: sqlite3.Connection, board: Optional[str] = None) -> dict[str, Any]:
     meta: dict[str, Any] = {}
     target_board = board
-    if not target_board:
-        try:
-            for row in conn.execute("PRAGMA database_list").fetchall():
-                if row["name"] == "main" and row["file"]:
-                    db_p = Path(row["file"])
-                    cand = db_p.parent / "board.json"
-                    if cand.exists():
-                        try:
-                            raw = json.loads(cand.read_text(encoding="utf-8"))
-                            if isinstance(raw, dict):
-                                meta.update(raw)
-                        except Exception:
-                            pass
-                    if db_p.parent.parent.name == "boards":
-                        target_board = db_p.parent.name
-                    break
-        except Exception:
-            pass
+    try:
+        for row in conn.execute("PRAGMA database_list").fetchall():
+            if row["name"] == "main" and row["file"]:
+                db_p = Path(row["file"])
+                cand = db_p.parent / "board.json"
+                if cand.exists():
+                    try:
+                        raw = json.loads(cand.read_text(encoding="utf-8"))
+                        if isinstance(raw, dict):
+                            meta.update(raw)
+                    except Exception:
+                        pass
+                if not target_board and db_p.parent.parent.name == "boards":
+                    target_board = db_p.parent.name
+                break
+    except Exception:
+        pass
     if not (meta.get("aether_contract_id") or meta.get("contract_id")):
         try:
             meta.update(read_board_metadata(target_board))
@@ -6718,7 +6782,10 @@ def _escalate_expired_flow_attentions(conn: sqlite3.Connection) -> None:
                 blocked = get_task(conn, attention["blocked_task_id"])
                 if blocked is None or blocked.status not in ('blocked', 'triage'):
                     continue
-                _default_flow_block_signal(conn, tid, "capability")
+                try:
+                    _default_flow_block_signal(conn, tid, "capability")
+                except ValueError:
+                    continue
                 _append_event(conn, tid, "origin_signal", {
                     "origin_signal": "recovery",
                     "reason": "Flow recovery attention has remained unresolved for 300 seconds",
@@ -8716,9 +8783,13 @@ def block_task(
                 kind=kind,
                 origin_signal=origin_signal,
             )
-            effective_origin_signal = None if controller_id else (
-                origin_signal or _default_flow_block_signal(conn, task_id, kind)
-            )
+            try:
+                flow_signal = (
+                    origin_signal or _default_flow_block_signal(conn, task_id, kind)
+                )
+            except ValueError:
+                flow_signal = None
+            effective_origin_signal = None if controller_id else flow_signal
             if effective_origin_signal:
                 _inherit_origin_signal_subs(conn, task_id)
             _append_event(
@@ -8793,9 +8864,13 @@ def block_task(
                 kind=kind,
                 origin_signal=origin_signal,
             )
-            effective_origin_signal = None if controller_id else (
-                origin_signal or _default_flow_block_signal(conn, task_id, kind)
-            )
+            try:
+                flow_signal = (
+                    origin_signal or _default_flow_block_signal(conn, task_id, kind)
+                )
+            except ValueError:
+                flow_signal = None
+            effective_origin_signal = None if controller_id else flow_signal
             if effective_origin_signal:
                 _inherit_origin_signal_subs(conn, task_id)
             _append_event(
