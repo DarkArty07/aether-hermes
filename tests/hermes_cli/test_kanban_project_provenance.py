@@ -461,11 +461,20 @@ def test_ac3_mismatch_matrix(disposable_env, monkeypatch):
             assert gtask.workspace_kind == "scratch"
 
             # 6b. Non-Aether board cross-project parent mismatch does not raise early (C1)
+            # Both projects must be resolvable in the active registry so parent's
+            # project_id is preserved on the generic board, making the mismatch constructible.
+            parent_repo = disposable_env["base"] / "generic_parent_repo"
+            parent_repo.mkdir(exist_ok=True)
             other_repo = disposable_env["base"] / "other_repo"
             other_repo.mkdir(exist_ok=True)
             with pdb.connect_closing(
                 db_path=disposable_env["home_implementer"] / "projects.db"
             ) as pconn:
+                generic_parent_pid = pdb.create_project(
+                    pconn,
+                    name="Generic Parent Proj",
+                    primary_path=str(parent_repo),
+                )
                 other_pid = pdb.create_project(
                     pconn,
                     name="Other Proj",
@@ -474,9 +483,12 @@ def test_ac3_mismatch_matrix(disposable_env, monkeypatch):
             gt_parent = kb.create_task(
                 gconn,
                 title="Generic parent",
-                project_id=disposable_env["canonical_pid"],
+                project_id=generic_parent_pid,
                 board="generic-board",
             )
+            gt_parent_task = kb.get_task(gconn, gt_parent)
+            assert gt_parent_task is not None
+            assert gt_parent_task.project_id == generic_parent_pid
             gt_child = kb.create_task(
                 gconn,
                 title="Generic cross-project child",
@@ -484,7 +496,9 @@ def test_ac3_mismatch_matrix(disposable_env, monkeypatch):
                 parents=[gt_parent],
                 board="generic-board",
             )
-            assert kb.get_task(gconn, gt_child).project_id == other_pid
+            gt_child_task = kb.get_task(gconn, gt_child)
+            assert gt_child_task is not None
+            assert gt_child_task.project_id == other_pid
 
             # 6c. Iterable (generator) parents with project_id links properly (C2)
             gt_gen_child = kb.create_task(
