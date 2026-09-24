@@ -369,6 +369,53 @@ recognized Aether boards while keeping generic board semantics, bound review-lan
 failure containment without unverified notifications or claim retention, and pass
 `tests/hermes_cli/test_kanban_project_provenance.py` without these commits.
 
+## Auxiliary Responses reasoning usage preservation (Aether #433)
+
+This correction was developed from maintained-fork baseline
+`58f8c37a49b341f25b8fdd6310542fe932031b8d` on branch
+`fix/433-reasoning-usage` for Objective Contract `oc_3fdf70ccc94e14b1@v1`. It does not
+activate the live TUI, gateway, profiles, or installation. Inherited GitHub Actions
+remain disabled and are therefore NOT RUN, not green. Portable Aether evidence is in
+`specs/issue-433-reasoning-usage/evidence/HLP-433.md`.
+
+Inspectable commit on this branch:
+
+- `c31bd6ca149d6d23ebe5678b4a3d91aa17b5de91` — the auxiliary Codex/Responses adapter
+  carries a completed response's provider-reported nested reasoning detail onto the
+  chat-compatible `usage` object.
+
+Behavior: when a completed auxiliary Responses response reports usage with
+`output_tokens_details.reasoning_tokens` — as a typed object or a plain mapping, and
+by the same rule when a `response.completed` SSE stream supplies the terminal usage —
+`_CodexCompletionsAdapter` in `agent/auxiliary_client.py` preserves that nested detail
+on the reconstructed chat-compatible `usage`. `normalize_usage` already reads that
+shape, so the provider's reasoning subcount reaches `_validate_llm_response`, the
+existing auxiliary accounting chokepoint and the existing `session_model_usage` row
+without changing `prompt`/`completion`/`total` tokens and without counting reasoning a
+second time into output or total. An explicit provider zero stays zero, an absent or
+malformed optional detail stays absent/zero without raising or fabricating a value, and
+a missing usage object still produces no accounting row and no call failure. Terminal,
+phase, tool-call, output-text-fallback, `tool_choice`, timeout and cancellation
+behavior are unchanged.
+
+Candidate evidence (this branch, `HERMES_TEST_FILE_RETRIES=0`): the delivered
+regression module reproduces RED on the unchanged baseline (`5 failed, 10 passed`) and
+passes `15/15` on the candidate; the affected auxiliary/accounting battery passed `238
+passed, 0 failed` across 5 files. The preserved consumer paths
+(`agent/usage_pricing.py`, `agent/aux_accounting.py`, `agent/codex_runtime.py`,
+`tests/agent/test_auxiliary_client_responses_terminal_420.py`,
+`tests/hermes_state/test_aux_usage_accounting.py`) are byte-identical to the baseline.
+`ruff check` passes for the whole tree and `git diff --check` is clean for the branch
+diff; `ruff format --check` reports the same pre-existing repository drift at this
+branch and at its base, so no file changes format-check status. The wider suite
+reports only baseline failures plus one ambient-load flake that passes on re-run.
+
+Rollback reverts the commit above. Retirement requires an adopted exact Hermes release
+to preserve provider reasoning tokens across the Responses adapter boundary into
+chat-compatible usage and SessionDB accounting without altering input/output/total
+tokens or double-counting, and to pass
+`tests/agent/test_auxiliary_client_responses_reasoning_433.py` without this commit.
+
 ## Distribution identity and release binding
 
 The fork keeps its own distribution and version identity: `hermes-agent` `0.20.1`

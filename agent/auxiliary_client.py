@@ -47,6 +47,7 @@ Payment / credit exhaustion fallback:
 import contextlib
 import contextvars
 import copy
+from collections.abc import Mapping
 import functools
 import hashlib
 import inspect
@@ -1518,6 +1519,28 @@ def _responses_tool_choice_shape(tool_choice: Any) -> Any:
     return None
 
 
+def _extract_responses_output_tokens_details(resp_usage: Any) -> Any:
+    """Extract nested output_tokens_details from Responses provider usage.
+
+    Responses API reports reasoning under ``output_tokens_details.reasoning_tokens``.
+    Normalizes access across object and mapping representations while leaving
+    absent, null, or empty details without a key so normalization yields zero
+    (issue #433).
+    """
+    if resp_usage is None:
+        return None
+    val = getattr(resp_usage, "output_tokens_details", None)
+    if val is None and isinstance(resp_usage, dict):
+        val = resp_usage.get("output_tokens_details")
+    if val is None:
+        return None
+    if isinstance(val, (Mapping, list, tuple, set, str)) and len(val) == 0:
+        return None
+    if isinstance(val, SimpleNamespace) and not vars(val):
+        return None
+    return val
+
+
 class _CodexCompletionsAdapter:
     """Drop-in shim that accepts chat.completions.create() kwargs and
     routes them through the Codex Responses streaming API."""
@@ -2076,14 +2099,18 @@ class _CodexCompletionsAdapter:
 
             resp_usage = getattr(final, "usage", None)
             if resp_usage:
-                usage = SimpleNamespace(
-                    prompt_tokens=getattr(resp_usage, "input_tokens", 0)
+                usage_kwargs: Dict[str, Any] = {
+                    "prompt_tokens": getattr(resp_usage, "input_tokens", 0)
                         or (resp_usage.get("input_tokens", 0) if isinstance(resp_usage, dict) else 0),
-                    completion_tokens=getattr(resp_usage, "output_tokens", 0)
+                    "completion_tokens": getattr(resp_usage, "output_tokens", 0)
                         or (resp_usage.get("output_tokens", 0) if isinstance(resp_usage, dict) else 0),
-                    total_tokens=getattr(resp_usage, "total_tokens", 0)
+                    "total_tokens": getattr(resp_usage, "total_tokens", 0)
                         or (resp_usage.get("total_tokens", 0) if isinstance(resp_usage, dict) else 0),
-                )
+                }
+                output_details = _extract_responses_output_tokens_details(resp_usage)
+                if output_details is not None:
+                    usage_kwargs["output_tokens_details"] = output_details
+                usage = SimpleNamespace(**usage_kwargs)
         except Exception as exc:
             if timed_out.is_set():
                 raise TimeoutError(_timeout_message()) from exc
