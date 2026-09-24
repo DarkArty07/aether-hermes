@@ -313,6 +313,62 @@ preserve prompt identity across the review cwd change, fail closed on damaged
 recognized provenance, keep legacy and generic controls, and pass the focused
 review/session matrix without these commits.
 
+## Project provenance recovery, early refusal, and bounded failure containment (Aether #494)
+
+This correction was developed from maintained-fork baseline
+`aed6591a69f453a1867b73628603e7b53ba40ffc` on branch
+`fix/494-project-provenance-and-bounded-failure` for Objective Contract
+`oc_bc27d75a1165818f@v1`. It does not activate the live TUI, gateway, profiles, or
+installation. Inherited GitHub Actions remain disabled and are therefore NOT RUN,
+not green. Portable Aether evidence is in
+`specs/issue-494-project-provenance/evidence/HLP-428.md`.
+
+Inspectable commits on this branch:
+
+- `e97c1be0695cfcfabce4d9dfaaa9a3eff1a817e9` — recovers canonical Project
+  provenance for a non-affinity child created under a project-bound `dir` parent
+  on a recognized Aether board, refuses actionably before persisting any row when
+  safe recovery fails, and contains the malformed same-card review-spawn failure
+  in `_route_affinity_terminal` and `block_task`.
+- `b0371537c0a6d02d8fd6a9cbc528ae7741507938` — scopes the cross-Project parent
+  mismatch refusal to recognized Aether boards so generic board collaboration
+  semantics stay constructible, and normalizes the `parents` iterable before its
+  first consumption.
+- `184a6d03bcab8964fa507ada4d02edc13cdcfb9f` — pins the generic cross-project
+  parent-mismatch case as a constructible fail-before control in the AC3 matrix.
+
+Behavior: when an explicit Project is supplied for a child of a direct
+project-bound `dir` parent on the current board, creation recovers the board's
+canonical Project and materializes a fresh `<repo>/.worktrees/<child-id>` worktree
+instead of silently persisting a null-Project scratch directory. Recovery stays
+conjunctive on the board binding, and traversal, symlink, absent-parent-edge and
+unbound-Project cases refuse before any task, run or event row exists. Refusal is
+scoped to recognized Aether boards, so ordinary non-Aether boards keep creating
+cross-project children and the pre-existing collaboration fail-closed state stays
+constructible. A deterministic review-spawn failure reaches the configured bounded
+breaker and a durable `blocked` receipt with `consecutive_failures`, cleared worker
+and claim state and `gave_up`, without emitting an unverified origin signal or
+copying a notification subscription.
+
+Candidate evidence (this branch, sterile `HOME`, `HERMES_TEST_FILE_RETRIES=0`): the
+delivered regression module reproduces RED on the unchanged baseline (`4 failed,
+1 passed`, including `Expected canonical project …, got None`) and passes `5/5` on
+the candidate; the touched Kanban selection passed `100 passed, 0 failed` across
+5 files; the wider affected surface passed `208 passed` across 11 modules; `ruff
+check` passes on the touched paths and `git diff --check` is clean. `ruff format
+--check` reports the same pre-existing repository drift at this branch and at its
+base, so no file changes format-check status. One containment site
+(`_escalate_expired_flow_attentions`) shares the guarded defect class but has no
+delivered test coverage and is named by no acceptance criterion.
+
+Rollback reverts the three commits above in reverse order without restoring whole
+files that also carry other Aether corrections. Retirement requires an adopted exact
+Hermes release to recover canonical Project provenance for a non-affinity direct
+parent worktree child, refuse cross-project mismatches before task insertion on
+recognized Aether boards while keeping generic board semantics, bound review-lane
+failure containment without unverified notifications or claim retention, and pass
+`tests/hermes_cli/test_kanban_project_provenance.py` without these commits.
+
 ## Distribution identity and release binding
 
 The fork keeps its own distribution and version identity: `hermes-agent` `0.20.1`
