@@ -4178,7 +4178,8 @@ def create_task(
         ).strip()
     )
 
-    if project_id and parents:
+    parents = tuple(p for p in parents if p)
+    if _is_aether_board and project_id and parents:
         for p in parents:
             parent_task = get_task(conn, str(p))
             if parent_task and parent_task.project_id and parent_task.project_id != project_id:
@@ -4229,9 +4230,8 @@ def create_task(
             # opening the creator profile's project store, and without reusing
             # the source task's literal worktree path.
             source_id = project_source_task_id
-            parents_tuple = tuple(parents)
-            if not source_id and len(parents_tuple) == 1:
-                source_id = parents_tuple[0]
+            if not source_id and len(parents) == 1:
+                source_id = parents[0]
 
             if source_id:
                 source_task = get_task(conn, str(source_id))
@@ -4337,7 +4337,6 @@ def create_task(
     if session_affinity is not None and not project_id:
         raise ValueError("session-affinity tasks require a canonical project_id")
 
-    parents = tuple(p for p in parents if p)
     if session_affinity is not None and parents:
         parent_rows = conn.execute(
             f"""SELECT project_id, assignee, session_affinity FROM tasks

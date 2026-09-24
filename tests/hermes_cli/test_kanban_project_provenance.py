@@ -459,6 +459,42 @@ def test_ac3_mismatch_matrix(disposable_env, monkeypatch):
             assert gtask is not None
             assert gtask.project_id is None
             assert gtask.workspace_kind == "scratch"
+
+            # 6b. Non-Aether board cross-project parent mismatch does not raise early (C1)
+            other_repo = disposable_env["base"] / "other_repo"
+            other_repo.mkdir(exist_ok=True)
+            with pdb.connect_closing(
+                db_path=disposable_env["home_implementer"] / "projects.db"
+            ) as pconn:
+                other_pid = pdb.create_project(
+                    pconn,
+                    name="Other Proj",
+                    primary_path=str(other_repo),
+                )
+            gt_parent = kb.create_task(
+                gconn,
+                title="Generic parent",
+                project_id=disposable_env["canonical_pid"],
+                board="generic-board",
+            )
+            gt_child = kb.create_task(
+                gconn,
+                title="Generic cross-project child",
+                project_id=other_pid,
+                parents=[gt_parent],
+                board="generic-board",
+            )
+            assert kb.get_task(gconn, gt_child).project_id == other_pid
+
+            # 6c. Iterable (generator) parents with project_id links properly (C2)
+            gt_gen_child = kb.create_task(
+                gconn,
+                title="Generic gen child",
+                project_id=disposable_env["canonical_pid"],
+                parents=(p for p in [gt_parent]),
+                board="generic-board",
+            )
+            assert kb.parent_ids(gconn, gt_gen_child) == [gt_parent]
         finally:
             gconn.close()
 
@@ -509,7 +545,7 @@ def test_ac3_mismatch_matrix(disposable_env, monkeypatch):
         conn.close()
 
 
-def test_ac4_bounded_failure_containment(disposable_env):
+def test_ac4_bounded_failure_containment(disposable_env, monkeypatch):
     """AC4: Pre-existing malformed child (project_id=None with affinity ancestor)
 
     reaches configured bounded breaker and durable blocked receipt without claim/reclaim
@@ -625,5 +661,94 @@ def test_ac4_bounded_failure_containment(disposable_env):
         assert after_block.status == "blocked"
         assert after_block.claim_lock is None
         assert after_block.worker_pid is None
+
+        # 3. Real review-lane spawn failure through dispatch_once (AC4 review lane)
+        from hermes_cli import profiles as profiles_mod
+
+        monkeypatch.setattr(profiles_mod, "profile_exists", lambda _p: True)
+
+        review_child_id = kb.create_task(
+            conn,
+            title="Review child unit",
+            assignee="implementer",
+            project_id=disposable_env["canonical_pid"],
+            parents=[root_id],
+            workspace_kind="worktree",
+            board=disposable_env["board_slug"],
+        )
+        conn.execute(
+            "UPDATE tasks SET project_id = NULL WHERE id = ?", (review_child_id,)
+        )
+        conn.commit()
+
+        kb.recompute_ready(conn)
+        claimed_review = kb.claim_task(conn, review_child_id)
+        assert claimed_review is not None
+        assert claimed_review.status == "running"
+
+        req_ok = kb.request_review(
+            conn,
+            review_child_id,
+            summary="Review request probe",
+            reviewer="supervisor",
+            expected_run_id=claimed_review.current_run_id,
+        )
+        assert req_ok is True
+        assert kb.get_task(conn, review_child_id).status == "review"
+
+        def failing_spawn(*_a, **_k):
+            raise RuntimeError("deterministic review spawn failure")
+
+        # Tick 1: dispatch_once encounters deterministic review spawn failure
+        res = kb.dispatch_once(
+            conn,
+            spawn_fn=failing_spawn,
+            max_spawn=1,
+            failure_limit=1,
+            board=disposable_env["board_slug"],
+            reconcile_orphans=False,
+        )
+        assert review_child_id in res.auto_blocked
+
+        after_review_task = kb.get_task(conn, review_child_id)
+        assert after_review_task is not None
+        assert after_review_task.status == "blocked"
+        assert after_review_task.consecutive_failures == 1
+        assert after_review_task.claim_lock is None
+        assert after_review_task.worker_pid is None
+
+        # Check events: gave_up present, no origin_signal
+        review_events = [
+            row["kind"]
+            for row in conn.execute(
+                "SELECT kind FROM task_events WHERE task_id = ? ORDER BY id",
+                (review_child_id,),
+            ).fetchall()
+        ]
+        assert "gave_up" in review_events
+        assert "origin_signal" not in review_events
+
+        # No inherited or copied notify subs
+        review_subs_count = conn.execute(
+            "SELECT count(*) FROM kanban_notify_subs WHERE task_id = ?",
+            (review_child_id,),
+        ).fetchone()[0]
+        assert review_subs_count == 0
+
+        # Ticks 2-3: verify stable blocked state without claim/reclaim loop
+        for _ in range(2):
+            res_subsequent = kb.dispatch_once(
+                conn,
+                spawn_fn=failing_spawn,
+                max_spawn=1,
+                failure_limit=1,
+                board=disposable_env["board_slug"],
+                reconcile_orphans=False,
+            )
+            assert review_child_id not in [x[0] for x in res_subsequent.spawned]
+            assert review_child_id not in res_subsequent.auto_blocked
+            t_subsequent = kb.get_task(conn, review_child_id)
+            assert t_subsequent.status == "blocked"
+            assert t_subsequent.consecutive_failures == 1
     finally:
         conn.close()
