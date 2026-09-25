@@ -13789,6 +13789,12 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     lines.append("")
     lines.append(f"Assignee: {task.assignee or '(unassigned)'}")
     lines.append(f"Status:   {task.status}")
+    # Count durable returns, not the capped event window or failed tool calls.
+    review_returns = conn.execute(
+        "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'changes_requested'",
+        (task.id,),
+    ).fetchone()[0]
+    lines.append(f"Previous review returns (this task): {review_returns}")
     if task.tenant:
         lines.append(f"Tenant:   {task.tenant}")
     lines.append(f"Workspace: {task.workspace_kind} @ {task.workspace_path or '(unresolved)'}")
