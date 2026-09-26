@@ -416,6 +416,44 @@ chat-compatible usage and SessionDB accounting without altering input/output/tot
 tokens or double-counting, and to pass
 `tests/agent/test_auxiliary_client_responses_reasoning_433.py` without this commit.
 
+## Hardline quoted-grep correction (Aether #435)
+
+[PR #19](https://github.com/DarkArty07/aether-hermes/pull/19) merged implementation
+`f459cfa0ad27705e2b27ce91c5658648372f307c` as
+`b287195d63d47d73788653bdd012c2fbfe00c0ac`; both carry tree
+`cac4313200eb7a3359cb435622da17060494af8a`. Raw shell quoting is checked before
+deobfuscation, while protected patterns and malformed-input refusal remain intact.
+The reviewed Aether HLP-435 patch/evidence retains the exact-base RED/GREEN,
+199-test hardline module and reversible tree-reconstruction receipts; these are
+reused evidence, not another execution in this change. Source integration does not
+activate the fix. Aether's release pin remains separately owned.
+
+## Routed background-review authentication (Aether #474)
+
+From base `b287195d63d47d73788653bdd012c2fbfe00c0ac`, implementation
+`7755f82df15786285378732ef17544b4736c4b81` preserves an already-bound parent key
+when a different-model review resolves to the same provider and exact base URL
+but produces empty authentication or `no-key-required`. Null per-task keys remain
+unset rather than becoming the literal string `None`. Explicit task/resolved keys
+and credential pools take precedence; a changed host, port, scheme, path, provider
+or requested/resolved destination mismatch never receives the parent key.
+
+This corrects the routed case left outside the older main-model inheritance fix
+([upstream #15645](https://github.com/NousResearch/hermes-agent/pull/15645)). The
+selector inspected at upstream `d0288be5b3330d2442e3907185b8e9d0958297bb`,
+`agent/background_review.py:222-257`, still re-resolves without this fallback.
+The new fallback uses only the already-bound in-memory runtime; it adds no
+credential lookup, acquisition or widening.
+
+Evidence: four original same-endpoint assertions and the actual custom-resolver
+path were RED before the fix. The hermetic per-file runner then passed all **50
+tests across four background-review modules**, including destination and explicit
+auth controls; Ruff and diff checks passed. No live model or router request ran.
+Revert the implementation commit to roll back. Retirement requires an adopted
+upstream release to pass these regression boundaries without the downstream fix.
+Inherited Actions remain disabled (NOT RUN, never green). No installed-runtime,
+release, configuration, credential-store or primary-task lifecycle change is claimed.
+
 ## Distribution identity and release binding
 
 The fork keeps its own distribution and version identity: `hermes-agent` `0.20.1`
