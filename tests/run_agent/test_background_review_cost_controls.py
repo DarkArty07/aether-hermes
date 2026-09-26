@@ -11,6 +11,8 @@ Pure-function / config-driven; no live model calls.
 from typing import Any
 from unittest.mock import patch
 
+import pytest
+
 from agent import background_review as br
 
 
@@ -109,6 +111,108 @@ def test_routing_resolution_failure_falls_back_to_parent():
         rt = br._resolve_review_runtime(agent)
     assert rt["routed"] is False
     assert rt["provider"] == "openai-codex"
+
+
+def _proxy_parent():
+    agent = _FakeAgent(provider="custom", model="main-model")
+    agent._current_main_runtime = lambda: {
+        "api_key": "synthetic-parent-key",
+        "base_url": "https://router.invalid/v1",
+        "api_mode": "chat_completions",
+    }
+    return agent
+
+
+def test_routed_review_recovers_auth_through_real_custom_resolver():
+    cfg = {"auxiliary": {"background_review": {
+        "provider": "custom", "model": "review-model",
+        "base_url": "https://router.invalid/v1",
+    }}}
+    with patch("hermes_cli.config.load_config_readonly", return_value=cfg), \
+         patch("hermes_cli.config.load_config", return_value=cfg), \
+         patch("hermes_cli.runtime_provider._try_resolve_from_custom_pool", return_value=None), \
+         patch("hermes_cli.runtime_provider._host_derived_api_key", return_value=""):
+        result = br._resolve_review_runtime(_proxy_parent())
+    assert result["routed"] is True
+    assert result["model"] == "review-model"
+    assert result["api_key"] == "synthetic-parent-key"
+
+
+@pytest.mark.parametrize("requested_provider", ["custom", "named-proxy"])
+@pytest.mark.parametrize("task_key", [None, ""])
+@pytest.mark.parametrize("resolved_key", [None, "", "no-key-required"])
+def test_routed_same_endpoint_recovers_live_parent_auth(requested_provider, task_key, resolved_key):
+    agent = _proxy_parent()
+    cfg = {"auxiliary": {"background_review": {
+        "provider": requested_provider, "model": "review-model",
+        "base_url": "https://router.invalid/v1/", "api_key": task_key,
+    }}}
+    resolved = {
+        "provider": "custom", "base_url": "https://router.invalid/v1",
+        "api_mode": "chat_completions", "api_key": resolved_key,
+    }
+    with patch("hermes_cli.config.load_config_readonly", return_value=cfg), \
+         patch("hermes_cli.runtime_provider.resolve_runtime_provider", return_value=resolved):
+        result = br._resolve_review_runtime(agent)
+    assert result["api_key"] == "synthetic-parent-key"
+    assert result["model"] == "review-model"
+    assert result["routed"] is True
+    assert resolved["api_key"] == resolved_key
+
+
+@pytest.mark.parametrize("destination", [
+    "https://other.invalid/v1", "https://router.invalid:444/v1",
+    "http://router.invalid/v1", "https://router.invalid/other",
+])
+def test_routed_review_does_not_send_parent_auth_to_other_endpoint(destination):
+    cfg = {"auxiliary": {"background_review": {
+        "provider": "custom", "model": "review-model", "base_url": destination,
+    }}}
+    resolved = {"provider": "custom", "base_url": destination, "api_key": "no-key-required"}
+    with patch("hermes_cli.config.load_config_readonly", return_value=cfg), \
+         patch("hermes_cli.runtime_provider.resolve_runtime_provider", return_value=resolved):
+        result = br._resolve_review_runtime(_proxy_parent())
+    assert result["api_key"] == "no-key-required"
+
+
+@pytest.mark.parametrize("task_key,resolved_key,pool,provider", [
+    ("explicit-review-key", "explicit-review-key", None, "custom"),
+    (None, "configured-review-key", None, "custom"),
+    (None, "no-key-required", "configured-pool", "custom"),
+    (None, "no-key-required", None, "other-provider"),
+    ("no-key-required", "no-key-required", None, "custom"),
+])
+def test_routed_review_preserves_explicit_auth_and_provider_boundary(
+    task_key, resolved_key, pool, provider,
+):
+    task = {"provider": "custom", "model": "review-model"}
+    if task_key is not None:
+        task["api_key"] = task_key
+    cfg = {"auxiliary": {"background_review": task}}
+    resolved = {
+        "provider": provider, "base_url": "https://router.invalid/v1",
+        "api_key": resolved_key, "credential_pool": pool,
+    }
+    with patch("hermes_cli.config.load_config_readonly", return_value=cfg), \
+         patch("hermes_cli.runtime_provider.resolve_runtime_provider", return_value=resolved):
+        result = br._resolve_review_runtime(_proxy_parent())
+    assert result["api_key"] == resolved_key
+    assert result["credential_pool"] == pool
+
+
+def test_routed_review_does_not_inherit_when_requested_endpoint_differs_from_resolved():
+    cfg = {"auxiliary": {"background_review": {
+        "provider": "custom", "model": "review-model",
+        "base_url": "https://other.invalid/v1",
+    }}}
+    resolved = {
+        "provider": "custom", "base_url": "https://router.invalid/v1",
+        "api_key": "no-key-required",
+    }
+    with patch("hermes_cli.config.load_config_readonly", return_value=cfg), \
+         patch("hermes_cli.runtime_provider.resolve_runtime_provider", return_value=resolved):
+        result = br._resolve_review_runtime(_proxy_parent())
+    assert result["api_key"] == "no-key-required"
 
 
 # ---------------------------------------------------------------------------
