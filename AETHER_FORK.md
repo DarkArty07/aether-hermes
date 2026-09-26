@@ -454,6 +454,27 @@ upstream release to pass these regression boundaries without the downstream fix.
 Inherited Actions remain disabled (NOT RUN, never green). No installed-runtime,
 release, configuration, credential-store or primary-task lifecycle change is claimed.
 
+## Telegram lazy-load TypeHandler binding (Aether #473)
+
+From base `54abacd1c38ce6300997289628fe2f2a7569df18`, rebind `TypeHandler` when
+the Telegram SDK becomes available after the adapter was initially imported
+without it. Otherwise the global remains `typing.Any` and handler registration
+raises the exact `Any cannot be instantiated` error despite a successful loader.
+An SDK lacking TypeHandler must leave the dependency unavailable rather than
+publishing a false ready flag. The source correction restores import parity,
+without changing transport, DNS, TLS, retry policy or Telegram credentials.
+
+The same rebinding is present in upstream `plugins/platforms/telegram/adapter.py` at
+`4f22543509d1b91dc45bcb369447126c5eb14fb7:337-391` and
+`d0288be5b3330d2442e3907185b8e9d0958297bb:306-334`.
+Two regressions were RED, including the exact TypeError through real adapter
+handler registration with SDK stubs. The corrected hermetic runner passes **38
+tests across connect, fallback-network and reconnect modules**. No package was
+installed into a live profile and no Telegram request or message was sent.
+Rollback reverts this scoped source commit. Retire after an adopted exact upstream
+release passes the loader/registration regressions without the downstream fix;
+source tests do not establish installed reconnection or delivery.
+
 ## Distribution identity and release binding
 
 The fork keeps its own distribution and version identity: `hermes-agent` `0.20.1`

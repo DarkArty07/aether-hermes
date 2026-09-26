@@ -6,6 +6,8 @@ background reconnection (#31049).
 """
 
 import sys
+from types import ModuleType
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -53,4 +55,67 @@ class TestTelegramUnconfiguredNonRetryable:
         assert adapter.has_fatal_error is True
         assert adapter.fatal_error_retryable is False
         assert adapter.fatal_error_code == "missing_dependency"
+
+
+def _lazy_telegram_sdk(monkeypatch):
+    sdk = ModuleType("telegram")
+    ext = ModuleType("telegram.ext")
+    constants = ModuleType("telegram.constants")
+    request = ModuleType("telegram.request")
+    for name in ("Update", "Bot", "Message", "InlineKeyboardButton", "InlineKeyboardMarkup"):
+        setattr(sdk, name, type(name, (), {}))
+    setattr(sdk, "LinkPreviewOptions", None)
+    for name in ("Application", "CommandHandler", "CallbackQueryHandler", "MessageHandler"):
+        setattr(ext, name, MagicMock())
+    setattr(ext, "ContextTypes", MagicMock())
+    setattr(ext, "filters", MagicMock())
+    setattr(constants, "ParseMode", MagicMock())
+    setattr(constants, "ChatType", MagicMock())
+    setattr(request, "HTTPXRequest", MagicMock())
+
+    class FakeTypeHandler:
+        def __init__(self, update_type, callback):
+            self.update_type = update_type
+            self.callback = callback
+
+    setattr(ext, "TypeHandler", FakeTypeHandler)
+    # Restore every global that the lazy-loader rebinds, not just the flag.
+    for name in (
+        "Update", "Bot", "Message", "InlineKeyboardButton", "InlineKeyboardMarkup",
+        "LinkPreviewOptions", "Application", "CommandHandler", "CallbackQueryHandler",
+        "TelegramMessageHandler", "TypeHandler", "ContextTypes", "filters", "ParseMode",
+        "ChatType", "HTTPXRequest",
+    ):
+        monkeypatch.setattr(telegram_mod, name, getattr(telegram_mod, name))
+    monkeypatch.setattr(telegram_mod, "TELEGRAM_AVAILABLE", False)
+    monkeypatch.setattr(telegram_mod, "TypeHandler", Any)
+    for name, module in (
+        ("telegram", sdk), ("telegram.ext", ext),
+        ("telegram.constants", constants), ("telegram.request", request),
+    ):
+        monkeypatch.setitem(sys.modules, name, module)
+    ensure = MagicMock()
+    monkeypatch.setattr("tools.lazy_deps.ensure", ensure)
+    return sdk, ext, ensure
+
+
+def test_lazy_install_rebinds_type_handler_before_registering_handlers(monkeypatch):
+    sdk, ext, ensure = _lazy_telegram_sdk(monkeypatch)
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="fake"))
+    assert telegram_mod.check_telegram_requirements() is True
+    app = MagicMock()
+    adapter._register_handlers(app)
+    handler = app.add_handler.call_args.args[0]
+    assert isinstance(handler, getattr(ext, "TypeHandler"))
+    assert handler.update_type is getattr(sdk, "Update")
+    assert app.add_handler.call_args.kwargs == {"group": 99}
+    ensure.assert_called_once_with("platform.telegram", prompt=False)
+
+
+def test_lazy_install_without_type_handler_stays_unavailable(monkeypatch):
+    _, ext, _ = _lazy_telegram_sdk(monkeypatch)
+    delattr(ext, "TypeHandler")
+    assert telegram_mod.check_telegram_requirements() is False
+    assert telegram_mod.TELEGRAM_AVAILABLE is False
+    assert telegram_mod.TypeHandler is Any
 
