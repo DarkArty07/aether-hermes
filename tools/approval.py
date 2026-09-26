@@ -583,8 +583,8 @@ def detect_hardline_command(command: str) -> tuple:
     """
     if _command_parser_limit_exceeded(command):
         return (True, _PARSER_LIMIT_DESCRIPTION)
-    normalized = _normalize_command_for_detection(command)
-    _, malformed_grep = _grep_safe_detection_variant(normalized)
+    raw_syntax = _mask_quoted_newlines(command)
+    _, malformed_grep = _grep_safe_detection_variant(raw_syntax)
     if malformed_grep:
         return (True, _MALFORMED_EXEC_DESCRIPTION)
     for command_variant in _command_detection_variants(command):
@@ -2203,7 +2203,9 @@ def _command_detection_variants(command: str):
     # unterminated quote), so masking the normalized text could swallow a
     # REAL unquoted newline separator that follows. The raw command carries
     # faithful shell quote state.
-    normalized = _normalize_command_for_detection(_mask_quoted_newlines(command))
+    raw_syntax = _mask_quoted_newlines(command)
+    grep_masked_raw, _ = _grep_safe_detection_variant(raw_syntax)
+    normalized = _normalize_command_for_detection(grep_masked_raw)
     # Quote-aware grep parsing hides only structurally identified pattern
     # operands. Malformed/ambiguous input remains byte-for-byte intact.
     grep_safe, _ = _grep_safe_detection_variant(normalized)
