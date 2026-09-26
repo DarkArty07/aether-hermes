@@ -211,7 +211,7 @@ def _resolve_review_runtime(agent: Any) -> Dict[str, Any]:
     task_provider = (str(task.get("provider", "")).strip() or None)
     task_model = (str(task.get("model", "")).strip() or None)
     task_base_url = (str(task.get("base_url", "")).strip() or None)
-    task_api_key = (str(task.get("api_key", "")).strip() or None)
+    task_api_key = (str(task.get("api_key") or "").strip() or None)
     if not (task_provider and task_provider != "auto" and task_model):
         return parent
     if task_provider == (agent.provider or "") and task_model == (agent.model or ""):
@@ -224,6 +224,22 @@ def _resolve_review_runtime(agent: Any) -> Dict[str, Any]:
             explicit_api_key=task_api_key,
             explicit_base_url=task_base_url,
         )
+        # A model-only review route can lose session-scoped proxy auth during
+        # re-resolution. Reuse it only after the resolved destination is known;
+        # never transfer it to another provider/origin/path or override task auth.
+        parent_url = str(parent.get("base_url") or "").strip().rstrip("/")
+        review_url = str(rp.get("base_url") or "").strip().rstrip("/")
+        if (
+            not task_api_key
+            and rp.get("api_key") in (None, "", "no-key-required")
+            and rp.get("credential_pool") is None
+            and (rp.get("provider") or task_provider) == parent["provider"]
+            and parent.get("api_key")
+            and parent_url
+            and review_url == parent_url
+            and (not task_base_url or task_base_url.rstrip("/") == parent_url)
+        ):
+            rp = {**rp, "api_key": parent["api_key"]}
         return {
             "provider": rp.get("provider") or task_provider,
             "model": rp.get("model") or task_model,
