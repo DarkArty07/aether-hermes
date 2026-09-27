@@ -517,6 +517,16 @@ the original root; unrelated generic Hermes multi-root DAGs remain valid. No his
 edge is synthesized or rewritten, and the existing reviewer fail-closed guard remains
 responsible for pre-damaged graphs.
 
+The invariant is per node, not per graph: an affected node's corroborated root set must
+be unchanged — exactly one, the same one — rather than the final graph merely reaching
+at most one recognized root. A previously rootless node may be promoted under the
+canonical root (the supported root-to-decision-to-unit insertion), but an already
+rooted node may not be substituted: attaching a generic root or a second corroborated
+root above an existing opted-in root is refused before any link, status change, event or
+notification-subscription write, because either would give existing descendants a
+different collaboration root and leave the flow pre-damaged for the fail-closed review
+guard.
+
 The scoped regression surface is `tests/hermes_cli/test_kanban_collaboration.py` and
 `tests/hermes_cli/test_kanban_session_affinity.py`, alongside
 `hermes_cli/kanban_db.py`. This is fork-source behavior only: it does not change an

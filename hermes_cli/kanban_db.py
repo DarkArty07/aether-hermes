@@ -1601,6 +1601,13 @@ def _validate_prospective_aether_parentage(
     ``affected_task_id`` is omitted. For ``link_tasks``, the proposed parent is
     passed in ``parents`` and the child plus all of its current descendants are
     checked before any row, event, status, or subscription is written.
+
+    The invariant is per node, not per graph: an opted-in node must keep the
+    one corroborated canonical root it already had. Adding the child's first
+    parent is legitimate promotion (a rootless decision joining the canonical
+    root); adding a second root, or attaching an existing rooted flow under a
+    different root, is root substitution and is refused. Generic multi-root
+    DAGs never contain a corroborated root, so they stay usable.
     """
     aether_roots, invalid_claims, board_project_id = _aether_root_identity_for_conn(
         conn
@@ -1630,6 +1637,13 @@ def _validate_prospective_aether_parentage(
                 new_parent_ids=parent_ids_to_check,
             )
         participating_aether_roots = prospective_roots & aether_roots
+        # The root this node already carries in the committed graph. A node
+        # that is not yet part of a corroborated flow has none.
+        current_aether_roots: set[str] = (
+            set()
+            if task_id is None
+            else _find_ancestor_roots(conn, task_id) & aether_roots
+        )
         existing_ancestors = (
             set() if task_id is None else _ancestor_task_ids(conn, task_id)
         )
@@ -1638,7 +1652,9 @@ def _validate_prospective_aether_parentage(
                 "prospective parentage touches a malformed or mismatched Aether "
                 "collaboration claim; refusing to create an unreviewable flow"
             )
-        if not participating_aether_roots:
+        if not current_aether_roots and not participating_aether_roots:
+            # Neither the current nor the prospective graph reaches a
+            # corroborated root: this branch stays generic.
             continue
         if task_id is None:
             node_project_id = prospective_project_id
@@ -1653,15 +1669,29 @@ def _validate_prospective_aether_parentage(
                 f"Project for {task_id or 'new task'}; expected {board_project_id!r}, "
                 f"got {node_project_id!r}"
             )
-        if (
-            len(participating_aether_roots) != 1
-            or prospective_roots != participating_aether_roots
-        ):
+        # An already rooted node keeps exactly the corroborated root it had: no
+        # substitution, no demotion to a generic or second root, no extra root.
+        # A node that was not yet part of a corroborated flow may be promoted
+        # under that one root and only that root, which is the supported
+        # root -> decision -> unit insertion.
+        preserved = (
+            current_aether_roots
+            and participating_aether_roots == current_aether_roots
+            and len(current_aether_roots) == 1
+            and prospective_roots == participating_aether_roots
+        )
+        promoted = (
+            not current_aether_roots
+            and len(participating_aether_roots) == 1
+            and prospective_roots == participating_aether_roots
+        )
+        if not (preserved or promoted):
             affected = repr(task_id) if task_id is not None else "new task"
             raise ValueError(
                 "prospective parentage would change the canonical Aether collaboration "
                 f"root for {affected}; expected exactly one corroborated Aether root "
-                f"but found {sorted(prospective_roots)!r}"
+                f"but found {sorted(prospective_roots)!r} (existing "
+                f"{sorted(current_aether_roots)!r})"
             )
 
 

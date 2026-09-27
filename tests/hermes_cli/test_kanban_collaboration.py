@@ -1362,3 +1362,174 @@ def test_isolated_aether_key_and_ambient_default_board_do_not_corroborate(
         parents=(root, independent),
     )
     assert kb.get_collaboration_root(conn, child) is None
+
+
+@pytest.mark.parametrize("attach_second_aether_root", [False, True])
+def test_aether_link_tasks_refuses_root_substitution_atomically(
+    board_db: tuple[Path, sqlite3.Connection],
+    attach_second_aether_root: bool,
+) -> None:
+    """An opted-in root keeps its exact canonical root under every new edge.
+
+    ``attach_second_aether_root=False`` attaches a generic root above the
+    corroborated root; ``True`` attaches a second corroborated root. Both are
+    root substitution: they would give existing descendants a different
+    collaboration root and leave the flow pre-damaged for review (#475).
+    """
+    kanban_home, conn = board_db
+    project_id, _canonical, candidate = _aether_parentage_fixture(kanban_home, conn)
+    Path(candidate).mkdir()
+    canonical_root = kb.create_task(
+        conn,
+        title="canonical root",
+        assignee="supervisor",
+        project_id=project_id,
+        workspace_kind="dir",
+        workspace_path=str(Path(candidate) / "canonical"),
+    )
+    assert kb.opt_in_collaboration(
+        conn,
+        canonical_root,
+        contract_id="oc_hf460",
+        contract_version="1",
+        session_id="origin-session",
+        board="test_board",
+    )
+    decision = kb.create_task(
+        conn,
+        title="decision",
+        assignee="supervisor",
+        project_id=project_id,
+        parents=(canonical_root,),
+    )
+    unit = kb.create_task(
+        conn,
+        title="unit",
+        assignee="implementer",
+        project_id=project_id,
+        parents=(decision,),
+        workspace_kind="dir",
+        workspace_path=candidate,
+    )
+
+    if attach_second_aether_root:
+        intruder = kb.create_task(
+            conn,
+            title="second corroborated root",
+            assignee="supervisor",
+            project_id=project_id,
+        )
+        assert kb.opt_in_collaboration(
+            conn,
+            intruder,
+            contract_id="oc_hf460",
+            contract_version="1",
+            session_id="other-session",
+            board="test_board",
+        )
+    else:
+        intruder = kb.create_task(
+            conn,
+            title="generic independent root",
+            assignee="supervisor",
+            project_id=project_id,
+        )
+    unit_2 = kb.create_task(
+        conn,
+        title="intruder unit",
+        assignee="implementer",
+        project_id=project_id,
+        parents=(intruder,),
+    )
+    kb.add_notify_sub(
+        conn,
+        task_id=unit_2,
+        platform="tui",
+        chat_id="intruder-chat",
+        delivery_mode="notify",
+    )
+    conn.execute("UPDATE tasks SET status='done' WHERE id=?", (intruder,))
+    conn.execute("UPDATE tasks SET status='running' WHERE id=?", (unit_2,))
+    conn.commit()
+
+    before = _parentage_snapshot(conn)
+    with pytest.raises(ValueError, match="canonical Aether collaboration root"):
+        kb.link_tasks(conn, intruder, canonical_root)
+    assert _parentage_snapshot(conn) == before
+    assert kb.get_collaboration_root(conn, decision) == canonical_root
+    assert kb.get_collaboration_root(conn, unit) == canonical_root
+    assert kb.get_collaboration_root(conn, canonical_root) == canonical_root
+
+
+def test_aether_create_task_refuses_second_corroborated_root_atomically(
+    board_db: tuple[Path, sqlite3.Connection],
+) -> None:
+    """A new child cannot be born under two corroborated or two mixed roots."""
+    kanban_home, conn = board_db
+    project_id, canonical, candidate = _aether_parentage_fixture(kanban_home, conn)
+    Path(canonical).mkdir()
+    Path(candidate).mkdir()
+    canonical_root = kb.create_task(
+        conn,
+        title="canonical root",
+        assignee="supervisor",
+        project_id=project_id,
+        workspace_kind="dir",
+        workspace_path=canonical,
+    )
+    assert kb.opt_in_collaboration(
+        conn,
+        canonical_root,
+        contract_id="oc_hf460",
+        contract_version="1",
+        session_id="origin-session",
+        board="test_board",
+    )
+    second_root = kb.create_task(
+        conn,
+        title="second corroborated root",
+        assignee="supervisor",
+        project_id=project_id,
+    )
+    assert kb.opt_in_collaboration(
+        conn,
+        second_root,
+        contract_id="oc_hf460",
+        contract_version="1",
+        session_id="other-session",
+        board="test_board",
+    )
+    unit = kb.create_task(
+        conn,
+        title="unit",
+        assignee="implementer",
+        project_id=project_id,
+        parents=(canonical_root,),
+        workspace_kind="dir",
+        workspace_path=candidate,
+    )
+    generic_root = kb.create_task(
+        conn,
+        title="generic root",
+        assignee="worker",
+        project_id=project_id,
+    )
+
+    before = _parentage_snapshot(conn)
+    for parents in ((canonical_root, second_root), (canonical_root, generic_root)):
+        rejected_workspace = Path(candidate) / f"must-not-exist-{len(parents)}"
+        with pytest.raises(ValueError, match="canonical Aether collaboration root"):
+            kb.create_task(
+                conn,
+                title="ambiguous child",
+                assignee="implementer",
+                project_id=project_id,
+                parents=parents,
+                workspace_kind="dir",
+                workspace_path=str(rejected_workspace),
+            )
+        assert not rejected_workspace.exists()
+    assert _parentage_snapshot(conn) == before
+    assert kb.get_collaboration_root(conn, unit) == canonical_root
+    assert kb.get_collaboration_root(conn, canonical_root) == canonical_root
+    assert kb.get_collaboration_root(conn, second_root) == second_root
