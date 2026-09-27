@@ -2251,3 +2251,741 @@ def test_controller_requeues_when_a_second_attention_is_pending(tmp_path, monkey
         assert any(event.kind == "flow_attention_requeued" for event in kb.list_events(conn, controller))
     finally:
         conn.close()
+
+
+def test_affinity_bound_supervisor_card_cross_profile_review_dispatch(tmp_path, monkeypatch):
+    """A direct-affinity Supervisor card dispatches an independent reviewer without leaking affinity."""
+    kanban_home = tmp_path / "kanban"
+    profile_home = tmp_path / "profile"
+    supervisor_root = tmp_path / "supervisor-root"
+    candidate = tmp_path / "candidate-worktree"
+    supervisor_root.mkdir()
+    candidate.mkdir()
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(kanban_home))
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    project_id = _project(tmp_path)
+
+    conn = kb.connect()
+    try:
+        root = kb.create_task(
+            conn,
+            title="decompose",
+            assignee="supervisor",
+            project_id=project_id,
+            workspace_kind="dir",
+            workspace_path=str(supervisor_root),
+            session_affinity={"flow_id": "flow-review", "terminal": False},
+        )
+        _opt_in_aether_review(conn, root, project_id)
+        claimed_root = kb.claim_task(conn, root)
+        assert claimed_root is not None
+        root_lease = kb.reserve_session_affinity(
+            conn, claimed_root, workspace_path=str(supervisor_root)
+        )
+        assert root_lease is not None
+        assert kb.register_session_affinity(
+            conn, claimed_root, root_lease, session_id="supervisor-session"
+        )
+        assert kb.complete_task(conn, root, summary="decomposed")
+
+        card = kb.create_task(
+            conn,
+            title="integration",
+            assignee="supervisor",
+            project_id=project_id,
+            parents=(root,),
+            workspace_kind="dir",
+            workspace_path=str(candidate),
+            skills=("supervisor-skill",),
+            model_override="supervisor-model",
+            provider_override="custom:supervisor-provider",
+            reasoning_effort="high",
+            session_affinity={"flow_id": "flow-review", "terminal": True},
+        )
+        claimed_card = kb.claim_task(conn, card)
+        assert claimed_card is not None
+        card_lease = kb.reserve_session_affinity(
+            conn, claimed_card, workspace_path=str(supervisor_root)
+        )
+        assert card_lease is not None
+        assert kb.request_review(
+            conn,
+            card,
+            summary="candidate ready for review",
+            reviewer="reviewer",
+            expected_run_id=claimed_card.current_run_id,
+        )
+    finally:
+        conn.close()
+
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _profile: True)
+    captured = {}
+
+    def fake_spawn(task, workspace, *, board=None, affinity=None, session_workspace=None):
+        captured.update(
+            task=task,
+            workspace=workspace,
+            board=board,
+            affinity=affinity,
+            session_workspace=session_workspace,
+        )
+        return 999
+
+    conn = kb.connect()
+    try:
+        result = kb.dispatch_once(conn, spawn_fn=fake_spawn, max_spawn=1)
+        assert [row[0] for row in result.spawned] == [card]
+        assert captured["workspace"] == str(candidate)
+        assert captured["session_workspace"] is None or captured["session_workspace"] == str(candidate)
+        assert captured["affinity"] is None
+        assert captured["task"].id == card
+        assert captured["task"].assignee == "reviewer"
+        assert captured["task"].skills == ["sdlc-review"]
+        assert captured["task"].model_override is None
+        assert captured["task"].provider_override is None
+        assert captured["task"].reasoning_effort is None
+
+        persisted = kb.get_task(conn, card)
+        assert persisted is not None
+        assert persisted.workspace_path == str(candidate)
+        assert persisted.session_affinity == {"flow_id": "flow-review", "terminal": True}
+        assert persisted.skills == ["supervisor-skill"]
+        assert persisted.model_override == "supervisor-model"
+        assert persisted.provider_override == "custom:supervisor-provider"
+        assert persisted.reasoning_effort == "high"
+
+        # No reviewer row or lease was created
+        reviewer_row = conn.execute(
+            "SELECT * FROM kanban_session_affinity "
+            "WHERE project_id = ? AND flow_id = ? AND assignee = ?",
+            (project_id, "flow-review", "reviewer"),
+        ).fetchone()
+        assert reviewer_row is None
+
+        # Supervisor's registered row remains intact
+        supervisor_row = conn.execute(
+            "SELECT session_id, workspace_path, owner_task_id, lease_token FROM kanban_session_affinity "
+            "WHERE project_id = ? AND flow_id = ? AND assignee = ?",
+            (project_id, "flow-review", "supervisor"),
+        ).fetchone()
+        assert supervisor_row is not None
+        assert supervisor_row["session_id"] == "supervisor-session"
+        assert supervisor_row["workspace_path"] == str(supervisor_root)
+        assert supervisor_row["owner_task_id"] is None
+        assert supervisor_row["lease_token"] is None
+
+        # Reviewer has an active claimed review run and can issue a verdict
+        claimed_review = kb.get_task(conn, card)
+        assert claimed_review is not None
+        assert claimed_review.status == "running"
+        assert claimed_review.current_run_id is not None
+        assert kb.complete_task(
+            conn,
+            card,
+            summary="approved",
+            expected_run_id=claimed_review.current_run_id,
+        )
+        approved = kb.get_task(conn, card)
+        assert approved is not None
+        assert approved.status == "done"
+    finally:
+        conn.close()
+
+
+def test_affinity_bound_supervisor_card_rework_rereview_and_approval(tmp_path, monkeypatch):
+    """Reviewer request_changes restores Supervisor, ready run resumes session, and second review qualifies."""
+    kanban_home = tmp_path / "kanban"
+    profile_home = tmp_path / "profile"
+    flow_workspace = tmp_path / "flow-worktree"
+    flow_workspace.mkdir()
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(kanban_home))
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    project_id = _project(tmp_path)
+
+    conn = kb.connect()
+    try:
+        root = kb.create_task(
+            conn,
+            title="decompose",
+            assignee="supervisor",
+            project_id=project_id,
+            workspace_kind="dir",
+            workspace_path=str(flow_workspace),
+            session_affinity={"flow_id": "flow-review", "terminal": False},
+        )
+        _opt_in_aether_review(conn, root, project_id)
+        claimed_root = kb.claim_task(conn, root)
+        assert claimed_root is not None
+        root_lease = kb.reserve_session_affinity(
+            conn, claimed_root, workspace_path=str(flow_workspace)
+        )
+        assert root_lease is not None
+        assert kb.register_session_affinity(
+            conn, claimed_root, root_lease, session_id="supervisor-session"
+        )
+        assert kb.complete_task(conn, root, summary="decomposed")
+
+        card = kb.create_task(
+            conn,
+            title="integration",
+            assignee="supervisor",
+            project_id=project_id,
+            parents=(root,),
+            workspace_kind="dir",
+            workspace_path=str(flow_workspace),
+            skills=("supervisor-skill",),
+            model_override="supervisor-model",
+            provider_override="custom:supervisor-provider",
+            reasoning_effort="high",
+            session_affinity={"flow_id": "flow-review", "terminal": True},
+        )
+        downstream = kb.create_task(
+            conn,
+            title="downstream-release",
+            assignee="supervisor",
+            project_id=project_id,
+            parents=(card,),
+            workspace_kind="dir",
+            workspace_path=str(flow_workspace),
+        )
+        downstream_before = kb.get_task(conn, downstream)
+        assert downstream_before is not None
+        assert downstream_before.status == "todo"
+
+        claimed_card = kb.claim_task(conn, card)
+        assert claimed_card is not None
+        card_lease = kb.reserve_session_affinity(
+            conn, claimed_card, workspace_path=str(flow_workspace)
+        )
+        assert card_lease is not None
+        assert kb.request_review(
+            conn,
+            card,
+            summary="candidate ready for review",
+            reviewer="reviewer-1",
+            expected_run_id=claimed_card.current_run_id,
+        )
+    finally:
+        conn.close()
+
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _profile: True)
+    spawn_calls = []
+
+    def fake_spawn(task, workspace, *, board=None, affinity=None, session_workspace=None):
+        spawn_calls.append(
+            {
+                "task": task,
+                "workspace": workspace,
+                "affinity": affinity,
+                "session_workspace": session_workspace,
+            }
+        )
+        return 999
+
+    conn = kb.connect()
+    try:
+        # First review dispatch: reviewer-1 launches fresh
+        res1 = kb.dispatch_once(conn, spawn_fn=fake_spawn, max_spawn=1)
+        assert [r[0] for r in res1.spawned] == [card]
+        call1 = spawn_calls[-1]
+        assert call1["task"].assignee == "reviewer-1"
+        assert call1["affinity"] is None
+        assert call1["task"].skills == ["sdlc-review"]
+
+        # Reviewer requests changes
+        review_task = kb.get_task(conn, card)
+        assert review_task is not None and review_task.status == "running"
+        ok, reason = kb.request_changes(
+            conn,
+            card,
+            reason="add missing regression tests",
+            expected_run_id=review_task.current_run_id,
+        )
+        assert ok, f"request_changes failed: {reason}"
+
+        # Card is returned to ready, assignee restored to supervisor
+        rework_task = kb.get_task(conn, card)
+        assert rework_task is not None
+        assert rework_task.status == "ready"
+        assert rework_task.assignee == "supervisor"
+        assert rework_task.session_affinity == {"flow_id": "flow-review", "terminal": True}
+        assert rework_task.skills == ["supervisor-skill"]
+
+        # Ready dispatch: Supervisor claims card and resumes exact supervisor session
+        res2 = kb.dispatch_once(conn, spawn_fn=fake_spawn, max_spawn=1)
+        assert [r[0] for r in res2.spawned] == [card]
+        call2 = spawn_calls[-1]
+        assert call2["task"].assignee == "supervisor"
+        assert call2["affinity"] is not None
+        assert call2["affinity"].session_id == "supervisor-session"
+        assert call2["affinity"].flow_id == "flow-review"
+        assert call2["task"].skills == ["supervisor-skill"]
+
+        # Supervisor completes rework and requests review again
+        supervisor_rework = kb.get_task(conn, card)
+        assert supervisor_rework is not None and supervisor_rework.status == "running"
+        assert kb.request_review(
+            conn,
+            card,
+            summary="regression tests added",
+            reviewer="reviewer-2",
+            expected_run_id=supervisor_rework.current_run_id,
+        )
+
+        # Second review dispatch: fresh independent launch qualifies again
+        res3 = kb.dispatch_once(conn, spawn_fn=fake_spawn, max_spawn=1)
+        assert [r[0] for r in res3.spawned] == [card]
+        call3 = spawn_calls[-1]
+        assert call3["task"].assignee == "reviewer-2"
+        assert call3["affinity"] is None
+        assert call3["task"].skills == ["sdlc-review"]
+
+        # Second reviewer approves
+        second_review = kb.get_task(conn, card)
+        assert second_review is not None and second_review.status == "running"
+        assert kb.complete_task(
+            conn,
+            card,
+            summary="approved on second review",
+            expected_run_id=second_review.current_run_id,
+        )
+
+        completed_card = kb.get_task(conn, card)
+        assert completed_card is not None and completed_card.status == "done"
+
+        # Downstream task promoted to ready
+        downstream_task = kb.get_task(conn, downstream)
+        assert downstream_task is not None and downstream_task.status == "ready"
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    "tamper_kind,expected_err",
+    [
+        ("corrupt_review_event", "corrupt"),
+        ("missing_review_event", "review_requested event"),
+        ("missing_implementer", "implementer provenance"),
+        ("self_review_event", None),
+        ("contract_mismatch", "inconsistent"),
+        ("deleted_supervisor_row", "missing or stale"),
+        ("unregistered_session", "no registered session"),
+        ("unavailable_workspace", "workspace is unavailable"),
+        ("flow_mismatch", "does not match supervisor flow"),
+        ("corrupt_affinity", "corrupt"),
+    ],
+)
+def test_affinity_bound_supervisor_card_cross_profile_review_fails_closed_on_damaged_identity(
+    tmp_path, monkeypatch, tamper_kind, expected_err
+):
+    """Damaged Aether or review identity fails closed through existing lifecycle without fresh fallback."""
+    kanban_home = tmp_path / "kanban"
+    profile_home = tmp_path / "profile"
+    supervisor_root = tmp_path / "supervisor-root"
+    candidate = tmp_path / "candidate-worktree"
+    supervisor_root.mkdir()
+    candidate.mkdir()
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(kanban_home))
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    project_id = _project(tmp_path)
+
+    conn = kb.connect()
+    try:
+        root = kb.create_task(
+            conn,
+            title="decompose",
+            assignee="supervisor",
+            project_id=project_id,
+            workspace_kind="dir",
+            workspace_path=str(supervisor_root),
+            session_affinity={"flow_id": "flow-review", "terminal": False},
+        )
+        _opt_in_aether_review(conn, root, project_id)
+        claimed_root = kb.claim_task(conn, root)
+        assert claimed_root is not None
+        root_lease = kb.reserve_session_affinity(
+            conn, claimed_root, workspace_path=str(supervisor_root)
+        )
+        assert root_lease is not None
+        assert kb.register_session_affinity(
+            conn, claimed_root, root_lease, session_id="supervisor-session"
+        )
+        assert kb.complete_task(conn, root, summary="decomposed")
+
+        card = kb.create_task(
+            conn,
+            title="integration",
+            assignee="supervisor",
+            project_id=project_id,
+            parents=(root,),
+            workspace_kind="dir",
+            workspace_path=str(candidate),
+            skills=("supervisor-skill",),
+            session_affinity={"flow_id": "flow-review", "terminal": True},
+        )
+        claimed_card = kb.claim_task(conn, card)
+        assert claimed_card is not None
+        card_lease = kb.reserve_session_affinity(
+            conn, claimed_card, workspace_path=str(supervisor_root)
+        )
+        assert card_lease is not None
+        assert kb.request_review(
+            conn,
+            card,
+            summary="candidate ready for review",
+            reviewer="reviewer",
+            expected_run_id=claimed_card.current_run_id,
+        )
+
+        # Apply specific tampering
+        if tamper_kind == "corrupt_review_event":
+            conn.execute(
+                "UPDATE task_events SET payload = 'not-valid-json' "
+                "WHERE task_id = ? AND kind = 'review_requested'",
+                (card,),
+            )
+        elif tamper_kind == "missing_review_event":
+            conn.execute(
+                "DELETE FROM task_events WHERE task_id = ? AND kind = 'review_requested'",
+                (card,),
+            )
+        elif tamper_kind == "missing_implementer":
+            conn.execute(
+                "UPDATE task_events SET payload = json_set(payload, '$.implementer', '') "
+                "WHERE task_id = ? AND kind = 'review_requested'",
+                (card,),
+            )
+        elif tamper_kind == "self_review_event":
+            conn.execute(
+                "UPDATE task_events SET payload = json_set(payload, '$.reviewer', 'supervisor') "
+                "WHERE task_id = ? AND kind = 'review_requested'",
+                (card,),
+            )
+        elif tamper_kind == "contract_mismatch":
+            meta_path = kb.board_metadata_path()
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            meta["aether_contract_id"] = "different-contract"
+            meta_path.write_text(json.dumps(meta), encoding="utf-8")
+        elif tamper_kind == "deleted_supervisor_row":
+            conn.execute(
+                "DELETE FROM kanban_session_affinity WHERE flow_id = 'flow-review' AND assignee = 'supervisor'"
+            )
+        elif tamper_kind == "unregistered_session":
+            conn.execute(
+                "UPDATE kanban_session_affinity SET session_id = NULL WHERE flow_id = 'flow-review' AND assignee = 'supervisor'"
+            )
+        elif tamper_kind == "unavailable_workspace":
+            conn.execute(
+                "UPDATE kanban_session_affinity SET workspace_path = '/nonexistent/path/here' WHERE flow_id = 'flow-review' AND assignee = 'supervisor'"
+            )
+        elif tamper_kind == "flow_mismatch":
+            conn.execute(
+                "UPDATE tasks SET session_affinity = json_set(session_affinity, '$.flow_id', 'different-flow') WHERE id = ?",
+                (card,),
+            )
+        elif tamper_kind == "corrupt_affinity":
+            conn.execute(
+                "UPDATE tasks SET session_affinity = 'corrupt-not-json' WHERE id = ?",
+                (card,),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _profile: True)
+
+    conn = kb.connect()
+    try:
+        result = kb.dispatch_once(conn, spawn_fn=lambda *a, **k: 999, max_spawn=1)
+        assert result.spawned == []
+
+        if tamper_kind == "self_review_event":
+            # Self-review is refused by claim_review_task before spawn attempt
+            card_state = kb.get_task(conn, card)
+            assert card_state is not None
+            assert card_state.status == "review"
+        else:
+            events = kb.list_events(conn, card)
+            spawn_failed = [e for e in events if e.kind == "spawn_failed"]
+            assert len(spawn_failed) == 1
+            payload = spawn_failed[0].payload
+            assert payload is not None
+            assert "error" in payload
+            assert "session affinity:" in payload["error"]
+            if expected_err:
+                assert expected_err in payload["error"]
+
+        # No reviewer lease was ever created
+        reviewer_row = conn.execute(
+            "SELECT * FROM kanban_session_affinity WHERE flow_id = 'flow-review' AND assignee = 'reviewer'"
+        ).fetchone()
+        assert reviewer_row is None
+    finally:
+        conn.close()
+
+
+def test_affinity_bound_supervisor_card_cross_profile_review_busy_owner_defers(
+    tmp_path, monkeypatch
+):
+    """When a live worker currently holds the Supervisor affinity flow, review dispatch defers."""
+    kanban_home = tmp_path / "kanban"
+    profile_home = tmp_path / "profile"
+    supervisor_root = tmp_path / "supervisor-root"
+    candidate = tmp_path / "candidate-worktree"
+    supervisor_root.mkdir()
+    candidate.mkdir()
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(kanban_home))
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    project_id = _project(tmp_path)
+
+    conn = kb.connect()
+    try:
+        root = kb.create_task(
+            conn,
+            title="decompose",
+            assignee="supervisor",
+            project_id=project_id,
+            workspace_kind="dir",
+            workspace_path=str(supervisor_root),
+            session_affinity={"flow_id": "flow-review", "terminal": False},
+        )
+        _opt_in_aether_review(conn, root, project_id)
+        claimed_root = kb.claim_task(conn, root)
+        assert claimed_root is not None
+        root_lease = kb.reserve_session_affinity(
+            conn, claimed_root, workspace_path=str(supervisor_root)
+        )
+        assert root_lease is not None
+        assert kb.register_session_affinity(
+            conn, claimed_root, root_lease, session_id="supervisor-session"
+        )
+        assert kb.complete_task(conn, root, summary="decomposed")
+
+        card = kb.create_task(
+            conn,
+            title="integration",
+            assignee="supervisor",
+            project_id=project_id,
+            parents=(root,),
+            workspace_kind="dir",
+            workspace_path=str(candidate),
+            session_affinity={"flow_id": "flow-review", "terminal": True},
+        )
+        claimed_card = kb.claim_task(conn, card)
+        assert claimed_card is not None
+        card_lease = kb.reserve_session_affinity(
+            conn, claimed_card, workspace_path=str(supervisor_root)
+        )
+        assert card_lease is not None
+        assert kb.request_review(
+            conn,
+            card,
+            summary="candidate ready for review",
+            reviewer="reviewer",
+            expected_run_id=claimed_card.current_run_id,
+        )
+
+        # Another task is currently running and holds the supervisor lease
+        other = kb.create_task(
+            conn,
+            title="other-supervisor-task",
+            assignee="supervisor",
+            project_id=project_id,
+            workspace_kind="dir",
+            workspace_path=str(supervisor_root),
+            session_affinity={"flow_id": "flow-review", "terminal": False},
+        )
+        claimed_other = kb.claim_task(conn, other)
+        assert claimed_other is not None
+        other_lease = kb.reserve_session_affinity(
+            conn, claimed_other, workspace_path=str(supervisor_root)
+        )
+        assert other_lease is not None
+    finally:
+        conn.close()
+
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _profile: True)
+
+    conn = kb.connect()
+    try:
+        # max_spawn=2 so dispatch_once considers review rows even with 1 worker already running
+        result = kb.dispatch_once(conn, spawn_fn=lambda *a, **k: 999, max_spawn=2)
+        assert result.spawned == []
+        assert [r[0] for r in result.affinity_deferred] == [card]
+
+        deferred_card = kb.get_task(conn, card)
+        assert deferred_card is not None
+        assert deferred_card.status == "review"
+        assert deferred_card.consecutive_failures == 0
+
+        # No spawn_failed event recorded
+        events = kb.list_events(conn, card)
+        assert not any(e.kind == "spawn_failed" for e in events)
+    finally:
+        conn.close()
+
+
+def test_affinity_bound_supervisor_card_generic_hermes_review_unchanged(tmp_path, monkeypatch):
+    """Generic Hermes review with direct affinity does not qualify cross-profile exception."""
+    kanban_home = tmp_path / "kanban"
+    profile_home = tmp_path / "profile"
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(kanban_home))
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    project_id = _project(tmp_path)
+
+    conn = kb.connect()
+    try:
+        # NO Aether opt-in
+        card = kb.create_task(
+            conn,
+            title="generic-task",
+            assignee="worker",
+            project_id=project_id,
+            workspace_kind="dir",
+            workspace_path=str(workdir),
+            session_affinity={"flow_id": "flow-generic"},
+        )
+        claimed = kb.claim_task(conn, card)
+        assert claimed is not None
+        lease = kb.reserve_session_affinity(conn, claimed, workspace_path=str(workdir))
+        assert lease is not None
+        assert kb.register_session_affinity(
+            conn, claimed, lease, session_id="generic-session"
+        )
+        assert kb.request_review(
+            conn,
+            card,
+            summary="ready for generic review",
+            reviewer="reviewer",
+            expected_run_id=claimed.current_run_id,
+        )
+    finally:
+        conn.close()
+
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _profile: True)
+
+    conn = kb.connect()
+    try:
+        # Fails closed because generic Hermes does not qualify cross-profile review on affinity cards
+        result = kb.dispatch_once(conn, spawn_fn=lambda *a, **k: 999, max_spawn=1)
+        assert result.spawned == []
+
+        events = kb.list_events(conn, card)
+        spawn_failed = [e for e in events if e.kind == "spawn_failed"]
+        assert len(spawn_failed) == 1
+        payload = spawn_failed[0].payload
+        assert payload is not None
+        assert "session affinity lease is missing or stale" in payload["error"]
+    finally:
+        conn.close()
+
+
+def test_affinity_bound_supervisor_card_reviewer_subprocess_argv_and_env(tmp_path, monkeypatch):
+    """Subprocess argv and environment inspection proves complete reviewer isolation."""
+    profile_home = tmp_path / "profile"
+    candidate = tmp_path / "candidate-worktree"
+    profile_home.mkdir()
+    candidate.mkdir()
+
+    task = kb.Task(
+        id="t_cross_review",
+        title="integration review",
+        body=None,
+        assignee="reviewer",
+        status="running",
+        priority=0,
+        created_by="supervisor",
+        created_at=1,
+        started_at=1,
+        completed_at=None,
+        workspace_kind="worktree",
+        workspace_path=str(candidate),
+        claim_lock="claim-lock-123",
+        claim_expires=None,
+        tenant=None,
+        branch_name="project/t_cross_review",
+        project_id="p_review",
+        current_run_id=5,
+        session_affinity={"flow_id": "flow-review", "terminal": True},
+        skills=["sdlc-review"],
+        model_override=None,
+        provider_override=None,
+        reasoning_effort=None,
+    )
+
+    captured = {}
+
+    class FakeProc:
+        pid = 789
+
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    monkeypatch.setattr(kb, "_resolve_worker_cli_toolsets", lambda _home: None)
+
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "resolve_profile_env", lambda _profile: str(profile_home))
+    monkeypatch.setattr(
+        subprocess,
+        "Popen",
+        lambda argv, **kwargs: captured.update(argv=argv, kwargs=kwargs) or FakeProc(),
+    )
+
+    kb._default_spawn(
+        task,
+        str(candidate),
+        affinity=None,
+        session_workspace=None,
+    )
+
+    argv = captured["argv"]
+    # Reviewer profile
+    assert argv[argv.index("-p") + 1] == "reviewer"
+    # SDLC review skill
+    assert argv[argv.index("--skills") + 1] == "sdlc-review"
+    # No resume or in arguments
+    assert "--resume" not in argv
+    assert "--in" not in argv
+    assert "--no-restore-cwd" not in argv
+    # No model, provider, or reasoning overrides
+    assert "-m" not in argv
+    assert "--provider" not in argv
+    assert "--reasoning" not in argv
+
+    env = captured["kwargs"]["env"]
+    # Check that NO affinity routing or lease env vars exist
+    assert "HERMES_KANBAN_AFFINITY_TOKEN" not in env
+    assert "HERMES_KANBAN_AFFINITY_GENERATION" not in env
+    assert "HERMES_KANBAN_AFFINITY_FLOW_ID" not in env
+    assert "HERMES_KANBAN_FLOW_ID" not in env
+    assert "HERMES_KANBAN_AFFINITY_PROJECT_ID" not in env
+    assert "HERMES_KANBAN_SESSION_WORKSPACE" not in env
+    assert "HERMES_KANBAN_REVIEW_AFFINITY" not in env
+
+    # Valid task and workspace pins
+    assert env["HERMES_KANBAN_TASK"] == "t_cross_review"
+    assert env["HERMES_KANBAN_WORKSPACE"] == str(candidate)
+    assert env["TERMINAL_CWD"] == str(candidate)
+    assert env["HERMES_PROFILE"] == "reviewer"
+    assert captured["kwargs"]["cwd"] == str(candidate)

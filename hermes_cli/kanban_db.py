@@ -1320,29 +1320,13 @@ def get_session_affinity(
     return result
 
 
-def _review_flow_session_context(
+def _corroborate_aether_review_opt_in(
     conn: sqlite3.Connection,
     task: Task,
     *,
     board: Optional[str] = None,
-) -> Optional[tuple[dict[str, Any], str]]:
-    """Resolve an existing reviewer flow session for same-card review.
-
-    Same-card review deliberately keeps the implementation task and its
-    candidate workspace.  A reviewer may nevertheless already own one exact
-    flow-bound session through an ancestor (Aether's Supervisor topology).
-    This helper discovers that existing binding without persisting affinity on
-    the implementation card itself.
-
-    Generic Hermes review remains unchanged when no Aether opt-in can be
-    established. Once established, missing/inconsistent identity is an error,
-    not permission to start a fresh reviewer. A persisted opt-in snapshot or
-    corroborated legacy board/event identity establishes that boundary.
-    """
-    if task.session_affinity:
-        return None
-    if task.session_affinity_corrupt:
-        raise AffinityRegistrationError("review task affinity is corrupt")
+) -> Optional[dict[str, Any]]:
+    """Corroborate exact Aether opt-in and board identity per FR-737c."""
     meta = _read_board_meta_for_conn(conn, board)
     board_contract_id = str(meta.get("aether_contract_id") or "").strip()
     board_contract_version = str(meta.get("aether_contract_version") or "").strip()
@@ -1420,6 +1404,212 @@ def _review_flow_session_context(
             and opt_payload["aether_project_id"] != board_aether_project_id)
     ):
         raise AffinityRegistrationError("Aether review board/opt-in identity is inconsistent")
+    return opt_payload
+
+
+def _qualify_cross_profile_affinity_review(
+    conn: sqlite3.Connection,
+    task: Task,
+    *,
+    board: Optional[str] = None,
+) -> bool:
+    """Qualify fresh review dispatch for an affinity-bound Supervisor card.
+
+    When an Aether Supervisor integration card with direct flow affinity
+    requests review from an independent reviewer profile, the reviewer starts
+    in a fresh session under its own profile without inheriting or reserving
+    affinity.  Damaged Aether identity fails closed without fresh fallback.
+    """
+    if getattr(task, "session_affinity_corrupt", False):
+        raise AffinityRegistrationError("review task affinity is corrupt")
+    affinity = normalize_session_affinity(task.session_affinity)
+    if affinity is None:
+        return False
+    opt_payload = _corroborate_aether_review_opt_in(conn, task, board=board)
+    if opt_payload is None:
+        return False
+
+    # Review provenance of the claimed review run
+    if task.current_run_id is None:
+        raise AffinityRegistrationError("review task has no active run")
+    claimed_event = conn.execute(
+        """SELECT payload FROM task_events
+            WHERE task_id = ? AND run_id = ? AND kind = 'claimed'
+            ORDER BY id DESC LIMIT 1""",
+        (task.id, int(task.current_run_id)),
+    ).fetchone()
+    if claimed_event is None:
+        raise AffinityRegistrationError("claimed review run has no claim event")
+    try:
+        claimed_payload = (
+            json.loads(claimed_event["payload"])
+            if claimed_event["payload"]
+            else {}
+        )
+    except (TypeError, json.JSONDecodeError):
+        claimed_payload = {}
+    if (
+        not isinstance(claimed_payload, dict)
+        or claimed_payload.get("source_status") != "review"
+    ):
+        raise AffinityRegistrationError("claimed run is not a review run")
+
+    # Latest matching review_requested transition
+    requested_event = conn.execute(
+        """SELECT payload FROM task_events
+            WHERE task_id = ? AND kind = 'review_requested'
+            ORDER BY id DESC LIMIT 1""",
+        (task.id,),
+    ).fetchone()
+    if requested_event is None:
+        raise AffinityRegistrationError(
+            "review task has no review_requested event"
+        )
+    try:
+        requested_payload = (
+            json.loads(requested_event["payload"])
+            if requested_event["payload"]
+            else {}
+        )
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise AffinityRegistrationError(
+            "review task review_requested event is corrupt"
+        ) from exc
+    if not isinstance(requested_payload, dict):
+        raise AffinityRegistrationError(
+            "review task review_requested event is corrupt"
+        )
+    original_assignee = requested_payload.get("implementer")
+    reviewer = requested_payload.get("reviewer")
+    if not isinstance(original_assignee, str) or not original_assignee.strip():
+        raise AffinityRegistrationError(
+            "review handoff has no valid implementer provenance"
+        )
+    if not isinstance(reviewer, str) or not reviewer.strip():
+        raise AffinityRegistrationError(
+            "review handoff has no valid reviewer provenance"
+        )
+    original_canonical = _canonical_assignee(original_assignee)
+    reviewer_canonical = _canonical_assignee(reviewer)
+    current_canonical = _canonical_assignee(task.assignee)
+    if reviewer_canonical != current_canonical:
+        raise AffinityRegistrationError(
+            "current assignee does not match review handoff reviewer"
+        )
+    if original_canonical == current_canonical:
+        raise AffinityRegistrationError(
+            "review task assignee is not independent from original implementer"
+        )
+
+    # Card's normalized direct flow matches original Supervisor flow
+    flow_id = affinity["flow_id"]
+    ancestor_rows = conn.execute(
+        """WITH RECURSIVE ancestors(id) AS (
+               SELECT parent_id FROM task_links WHERE child_id = ?
+               UNION
+               SELECT l.parent_id
+                 FROM task_links l
+                 JOIN ancestors a ON l.child_id = a.id
+           )
+           SELECT t.id, t.project_id, t.assignee, t.session_affinity, t.workspace_path
+             FROM tasks t
+             JOIN ancestors a ON a.id = t.id
+            WHERE t.project_id = ? AND t.session_affinity IS NOT NULL""",
+        (task.id, task.project_id),
+    ).fetchall()
+    for arow in ancestor_rows:
+        if _canonical_assignee(arow["assignee"]) != original_canonical:
+            continue
+        try:
+            aparsed = normalize_session_affinity(json.loads(arow["session_affinity"]))
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise AffinityRegistrationError(
+                "supervisor flow affinity ancestor is corrupt"
+            ) from exc
+        if aparsed is not None and aparsed["flow_id"] != flow_id:
+            raise AffinityRegistrationError(
+                "card flow does not match supervisor flow"
+            )
+
+    # Exact registered original-profile row, session, and workspace exist
+    board_slug = _normalize_board_slug(board) or get_current_board()
+    row = conn.execute(
+        """SELECT * FROM kanban_session_affinity
+            WHERE board = ? AND project_id = ? AND flow_id = ? AND assignee = ?""",
+        (board_slug, task.project_id, flow_id, original_assignee),
+    ).fetchone()
+    if row is None:
+        raise AffinityRegistrationError(
+            "session affinity lease is missing or stale"
+        )
+    if not row["session_id"]:
+        raise AffinityRegistrationError(
+            "session affinity lease has no registered session"
+        )
+    if not row["workspace_path"]:
+        raise AffinityRegistrationError(
+            "session affinity workspace is unavailable"
+        )
+    supervisor_workspace = str(row["workspace_path"])
+    if not os.path.isabs(supervisor_workspace) or not os.path.isdir(supervisor_workspace):
+        raise AffinityRegistrationError(
+            "session affinity workspace is unavailable"
+        )
+
+    # Workspace consistency with flow's canonical workspace
+    for arow in ancestor_rows:
+        if _canonical_assignee(arow["assignee"]) != original_canonical:
+            continue
+        if arow["workspace_path"] and os.path.realpath(str(arow["workspace_path"])) != os.path.realpath(supervisor_workspace):
+            raise AffinityRegistrationError(
+                "session affinity workspace does not match the flow's canonical workspace"
+            )
+
+    # Respect live owner/lease
+    if row["lease_token"]:
+        owner = conn.execute(
+            "SELECT status, current_run_id, claim_lock FROM tasks WHERE id = ?",
+            (row["owner_task_id"],),
+        ).fetchone()
+        if (
+            owner is not None
+            and owner["status"] == "running"
+            and owner["current_run_id"] == row["owner_run_id"]
+            and owner["claim_lock"] == row["owner_claim_lock"]
+        ):
+            raise AffinityBusy(
+                f"affinity flow {flow_id!r} is already running"
+            )
+
+    return True
+
+
+def _review_flow_session_context(
+    conn: sqlite3.Connection,
+    task: Task,
+    *,
+    board: Optional[str] = None,
+) -> Optional[tuple[dict[str, Any], str]]:
+    """Resolve an existing reviewer flow session for same-card review.
+
+    Same-card review deliberately keeps the implementation task and its
+    candidate workspace.  A reviewer may nevertheless already own one exact
+    flow-bound session through an ancestor (Aether's Supervisor topology).
+    This helper discovers that existing binding without persisting affinity on
+    the implementation card itself.
+
+    Generic Hermes review remains unchanged when no Aether opt-in can be
+    established. Once established, missing/inconsistent identity is an error,
+    not permission to start a fresh reviewer. A persisted opt-in snapshot or
+    corroborated legacy board/event identity establishes that boundary.
+    """
+    if task.session_affinity:
+        return None
+    if task.session_affinity_corrupt:
+        raise AffinityRegistrationError("review task affinity is corrupt")
+    opt_payload = _corroborate_aether_review_opt_in(conn, task, board=board)
+    if opt_payload is None:
+        return None
     reviewer = _canonical_assignee(task.assignee)
     rows = conn.execute(
         """WITH RECURSIVE ancestors(id) AS (
@@ -7164,6 +7354,7 @@ def claim_review_task(
                     or not reviewer.strip()
                     or (
                         isinstance(implementer, str)
+                        and implementer.strip()
                         and _canonical_assignee(reviewer)
                         == _canonical_assignee(implementer)
                     )
@@ -13034,12 +13225,17 @@ def _dispatch_once_locked(
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
         affinity_lease = None
         derived_flow_review = False
+        cross_profile_affinity_review = False
         session_workspace = str(workspace)
         try:
             if claimed.session_affinity or claimed.session_affinity_corrupt:
-                affinity_lease = reserve_session_affinity(
-                    conn, claimed, workspace_path=str(workspace), board=board,
-                )
+                if _qualify_cross_profile_affinity_review(conn, claimed, board=board):
+                    cross_profile_affinity_review = True
+                    affinity_lease = None
+                else:
+                    affinity_lease = reserve_session_affinity(
+                        conn, claimed, workspace_path=str(workspace), board=board,
+                    )
             else:
                 review_reservation = _reserve_review_flow_session(
                     conn, claimed, board=board
@@ -13082,6 +13278,15 @@ def _dispatch_once_locked(
             # list untouched for possible rework; suppress it only for this
             # review subprocess.
             claimed.skills = []
+            claimed.model_override = None
+            claimed.provider_override = None
+            claimed.reasoning_effort = None
+        elif cross_profile_affinity_review:
+            # Same-card review of a direct-affinity Supervisor card: suppress
+            # Supervisor-pinned skills, model, provider, and reasoning overrides
+            # for the reviewer subprocess, while leaving persisted card fields
+            # untouched on disk for rework. Supply reviewer procedure.
+            claimed.skills = ["sdlc-review"]
             claimed.model_override = None
             claimed.provider_override = None
             claimed.reasoning_effort = None
