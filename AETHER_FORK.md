@@ -496,6 +496,28 @@ Rollback reverts the implementation commit. Retire after an adopted upstream rel
 cross-profile review dispatch on affinity-bound cards or native review delegation without lease
 corruption; source tests do not establish installed runtime adoption.
 
+## Rooted Aether parentage (Aether #460)
+
+From exact fork base `58750d6cf8182c0ff5093719b9e7cc5026621fbf`, native
+`create_task(parents=...)` and `link_tasks` reject prospective Aether ancestry that
+would add or substitute a root. The guard corroborates persisted collaboration opt-in
+events against the metadata attached to the connection's actual board database and
+requires the exact Aether Project, contract and version identity; an ambient/default
+board or isolated Aether-looking metadata key cannot opt a generic board into the rule.
+
+Validation runs inside each existing write transaction, before task/link/event/status/
+notification-subscription changes. `link_tasks` checks the child and its descendants,
+so a new edge cannot invalidate an already rooted descendant. A valid root-to-decision-
+to-unit chain retains the original root; generic Hermes multi-root DAGs remain valid.
+No historical edge is synthesized or rewritten, and the existing reviewer fail-closed
+guard remains responsible for pre-damaged graphs.
+
+The scoped regression surface is `tests/hermes_cli/test_kanban_collaboration.py` and
+`tests/hermes_cli/test_kanban_session_affinity.py`, alongside
+`hermes_cli/kanban_db.py`. This is fork-source behavior only: it does not change an
+installed runtime or release pin. Portable HLP-460 packaging and any later adoption are
+separate reviewed work.
+
 ## Distribution identity and release binding
 
 The fork keeps its own distribution and version identity: `hermes-agent` `0.20.1`
