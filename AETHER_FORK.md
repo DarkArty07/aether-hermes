@@ -475,6 +475,27 @@ Rollback reverts this scoped source commit. Retire after an adopted exact upstre
 release passes the loader/registration regressions without the downstream fix;
 source tests do not establish installed reconnection or delivery.
 
+## Cross-profile review dispatch on affinity-bound Supervisor card (Aether #475)
+
+From base `30b4846a2c8063528d491f48950b3b341b0ce7d7`, qualify a fresh review dispatch
+under the reviewer's own profile without inheriting or reserving session affinity when
+an affinity-bound Supervisor card transitions to review under corroborated Aether opt-in
+and board identity. The reviewer starts with `affinity=None` in the candidate worktree,
+with Supervisor-pinned skills, model, provider, and reasoning overrides suppressed for the
+subprocess, while persisted card fields and the original Supervisor session remain untouched
+on disk. On `request_changes`, the card returns to ready and restores the original Supervisor
+assignee and registered session for rework. Damaged Aether identity, missing review events,
+or missing/corrupt original affinity rows fail closed without fresh fallback or transferred lease.
+
+Evidence: causal RED (`session affinity: session affinity lease is missing or stale`)
+reproduced at unchanged base (73 passed, 1 failed); candidate commit GREEN with 88 passed
+in `tests/hermes_cli/test_kanban_session_affinity.py` plus 41 regression tests; fail-closed
+negative matrix, rework/re-review cycle, subprocess argv/env isolation, and untouched outer
+board verified. No live model or router call was made.
+Rollback reverts the implementation commit. Retire after an adopted upstream release supports
+cross-profile review dispatch on affinity-bound cards or native review delegation without lease
+corruption; source tests do not establish installed runtime adoption.
+
 ## Distribution identity and release binding
 
 The fork keeps its own distribution and version identity: `hermes-agent` `0.20.1`
