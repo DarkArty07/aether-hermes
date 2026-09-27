@@ -1383,7 +1383,14 @@ def test_recognized_aether_identity_damage_never_spawns_fresh_review(
                 workspace_kind="dir", workspace_path=str(canonical),
             )
             conn.execute("UPDATE tasks SET status='done' WHERE id=?", (other,))
-            kb.link_tasks(conn, other, unit)
+            # Deliberately construct a pre-existing damaged graph directly in
+            # storage. The public link API must now refuse creating this state;
+            # this control still proves review dispatch fails closed on legacy
+            # or externally damaged rows.
+            conn.execute(
+                "INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)",
+                (other, unit),
+            )
         conn.commit()
     finally:
         conn.close()

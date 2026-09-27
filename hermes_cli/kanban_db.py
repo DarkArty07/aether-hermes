@@ -1407,6 +1407,309 @@ def _corroborate_aether_review_opt_in(
     return opt_payload
 
 
+def _read_bound_board_metadata(conn: sqlite3.Connection) -> dict[str, Any]:
+    """Read board metadata anchored to this connection's actual database file.
+
+    Unlike ``read_board_metadata()``, this must not fall back to the ambient or
+    default board: parentage validation is a storage invariant and has to use
+    the board that owns ``conn``. An unrecognized/in-memory database has no
+    corroborating board metadata and therefore cannot opt into this guard.
+    """
+    try:
+        row = next(
+            (
+                r
+                for r in conn.execute("PRAGMA database_list").fetchall()
+                if r["name"] == "main"
+            ),
+            None,
+        )
+        if row is None or not row["file"]:
+            return {}
+        db_path = Path(row["file"]).expanduser().resolve(strict=False)
+    except (OSError, sqlite3.Error, TypeError, ValueError):
+        return {}
+
+    if db_path.parent.parent.name == "boards":
+        metadata_path = db_path.parent / "board.json"
+    elif db_path.name == "kanban.db":
+        # The legacy/default board keeps its DB at <Hermes root>/kanban.db,
+        # while its metadata lives beside other board metadata.
+        metadata_path = db_path.parent / "kanban" / "boards" / "default" / "board.json"
+    else:
+        return {}
+    try:
+        raw = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def _aether_root_identity_for_conn(
+    conn: sqlite3.Connection,
+) -> tuple[set[str], set[str], str]:
+    """Return valid canonical roots and malformed Aether claims for this board.
+
+    A lone Aether-looking metadata key is insufficient. Recognition requires
+    the connection's actual board file to contain the complete Aether
+    Project/contract/version binding plus a persisted opt-in event and task with
+    the same exact identity. Mismatched or malformed claims are returned
+    separately so unrelated generic DAG branches on the same board remain
+    usable while parentage that touches a damaged claim fails closed.
+    """
+    meta = _read_bound_board_metadata(conn)
+    contract_id = str(meta.get("aether_contract_id") or "").strip()
+    contract_version = str(meta.get("aether_contract_version") or "").strip()
+    project_id = str(meta.get("project_id") or "").strip()
+    aether_project_id = str(meta.get("aether_project_id") or "").strip()
+    complete_identity = all((
+        contract_id,
+        contract_version,
+        project_id,
+        aether_project_id,
+    ))
+
+    events = conn.execute(
+        """SELECT e.task_id, e.payload, t.project_id
+             FROM task_events e
+             JOIN tasks t ON t.id = e.task_id
+            WHERE e.kind = 'collaboration_opted_in'
+              AND e.id = (SELECT MAX(last.id) FROM task_events last
+                           WHERE last.task_id = e.task_id
+                             AND last.kind = 'collaboration_opted_in')"""
+    ).fetchall()
+    roots: set[str] = set()
+    invalid_claims: set[str] = set()
+    for event in events:
+        try:
+            payload = json.loads(event["payload"]) if event["payload"] else {}
+        except (TypeError, json.JSONDecodeError):
+            payload = None
+        event_project_id = (
+            str(payload.get("project_id") or "").strip()
+            if isinstance(payload, dict)
+            else ""
+        )
+        snapshot_project_id = (
+            str(payload.get("aether_project_id") or "").strip()
+            if isinstance(payload, dict)
+            else ""
+        )
+        # The snapshot is written only when native opt-in saw the complete
+        # Aether board binding. Keep recognizing that persisted claim if the
+        # binding is later removed or changed, but never treat it as valid
+        # unless the current board still corroborates the exact same identity.
+        if snapshot_project_id:
+            exact_identity = (
+                complete_identity
+                and event["project_id"] == project_id
+                and event_project_id == project_id
+                and str(payload.get("contract_id") or "").strip() == contract_id
+                and str(payload.get("contract_version") or "").strip()
+                == contract_version
+                and snapshot_project_id == aether_project_id
+            )
+            if (
+                not exact_identity
+                or payload.get("mode") != "advisory"
+                or parent_ids(conn, event["task_id"])
+            ):
+                invalid_claims.add(event["task_id"])
+            else:
+                roots.add(event["task_id"])
+            continue
+
+        # Legacy native opt-ins predate the Aether Project snapshot. They are
+        # recognized only while the actual board still supplies the full exact
+        # identity; a generic opt-in or a lone Aether-looking key stays generic.
+        relevant_to_board = bool(project_id) and (
+            event["project_id"] == project_id or event_project_id == project_id
+        )
+        if not complete_identity or not relevant_to_board:
+            continue
+        if (
+            not isinstance(payload, dict)
+            or payload.get("mode") != "advisory"
+            or event["project_id"] != project_id
+            or event_project_id != project_id
+            or str(payload.get("contract_id") or "").strip() != contract_id
+            or str(payload.get("contract_version") or "").strip() != contract_version
+            or parent_ids(conn, event["task_id"])
+        ):
+            invalid_claims.add(event["task_id"])
+        else:
+            roots.add(event["task_id"])
+    return roots, invalid_claims, project_id
+
+
+def _ancestor_task_ids(conn: sqlite3.Connection, task_id: str) -> set[str]:
+    rows = conn.execute(
+        """WITH RECURSIVE ancestors(id) AS (
+               SELECT ?
+               UNION
+               SELECT l.parent_id
+                 FROM task_links l
+                 JOIN ancestors a ON l.child_id = a.id
+           )
+           SELECT id FROM ancestors""",
+        (task_id,),
+    ).fetchall()
+    return {row["id"] for row in rows}
+
+
+def _find_ancestor_roots_with_prospective_parents(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    linked_child_id: str,
+    new_parent_ids: Iterable[str],
+) -> set[str]:
+    """Find roots after adding parents to one existing node, without writing."""
+    prospective_parents = tuple(new_parent_ids)
+    visited: set[str] = set()
+    roots: set[str] = set()
+    queue = [task_id]
+    while queue:
+        current_id = queue.pop(0)
+        if current_id in visited:
+            continue
+        visited.add(current_id)
+        current_parents = parent_ids(conn, current_id)
+        if current_id == linked_child_id:
+            current_parents = tuple(
+                dict.fromkeys((*current_parents, *prospective_parents))
+            )
+        if not current_parents:
+            roots.add(current_id)
+        else:
+            queue.extend(
+                parent_id for parent_id in current_parents if parent_id not in visited
+            )
+    return roots
+
+
+def _validate_prospective_aether_parentage(
+    conn: sqlite3.Connection,
+    parents: Iterable[str],
+    *,
+    affected_task_id: Optional[str] = None,
+    prospective_project_id: Optional[str] = None,
+) -> None:
+    """Refuse a new edge that gives an Aether flow anything but its same root.
+
+    For ``create_task``, ``parents`` are the new node's incoming edges and
+    ``affected_task_id`` is omitted. For ``link_tasks``, the proposed parent is
+    passed in ``parents`` and the child plus all of its current descendants are
+    checked before any row, event, status, or subscription is written.
+
+    The invariant is per node, not per graph: an opted-in node must keep the
+    one corroborated canonical root it already had. Adding the child's first
+    parent is legitimate promotion (a rootless decision joining the canonical
+    root); adding a second root, or attaching an existing rooted flow under a
+    different root, is root substitution and is refused. Generic multi-root
+    DAGs never contain a corroborated root, so they stay usable.
+    """
+    aether_roots, invalid_claims, board_project_id = _aether_root_identity_for_conn(
+        conn
+    )
+    if not aether_roots and not invalid_claims:
+        return
+    parent_ids_to_check = tuple(str(parent_id) for parent_id in parents)
+    parent_roots: set[str] = set()
+    parent_ancestors: set[str] = set()
+    for parent_id in parent_ids_to_check:
+        parent_roots.update(_find_ancestor_roots(conn, parent_id))
+        parent_ancestors.update(_ancestor_task_ids(conn, parent_id))
+
+    if affected_task_id is None:
+        prospective_nodes: Iterable[Optional[str]] = (None,)
+    else:
+        prospective_nodes = _descendants_of(conn, affected_task_id)
+
+    for task_id in prospective_nodes:
+        if task_id is None:
+            prospective_roots = parent_roots
+        else:
+            prospective_roots = _find_ancestor_roots_with_prospective_parents(
+                conn,
+                task_id,
+                linked_child_id=affected_task_id,
+                new_parent_ids=parent_ids_to_check,
+            )
+        participating_aether_roots = prospective_roots & aether_roots
+        # The root this node already carries in the committed graph. A node
+        # that is not yet part of a corroborated flow has none.
+        current_aether_roots: set[str] = (
+            set()
+            if task_id is None
+            else _find_ancestor_roots(conn, task_id) & aether_roots
+        )
+        existing_ancestors = (
+            set() if task_id is None else _ancestor_task_ids(conn, task_id)
+        )
+        if (existing_ancestors | parent_ancestors) & invalid_claims:
+            raise ValueError(
+                "prospective parentage touches a malformed or mismatched Aether "
+                "collaboration claim; refusing to create an unreviewable flow"
+            )
+        if not current_aether_roots and not participating_aether_roots:
+            # Neither the current nor the prospective graph reaches a
+            # corroborated root: this branch stays generic.
+            continue
+        if task_id is None:
+            node_project_id = prospective_project_id
+        else:
+            task_row = conn.execute(
+                "SELECT project_id FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            node_project_id = task_row["project_id"] if task_row is not None else None
+        if node_project_id != board_project_id:
+            raise ValueError(
+                "prospective parentage would change the canonical Aether collaboration "
+                f"Project for {task_id or 'new task'}; expected {board_project_id!r}, "
+                f"got {node_project_id!r}"
+            )
+        # An already rooted node keeps exactly the corroborated root it had: no
+        # substitution, no demotion to a generic or second root, no extra root.
+        # A node that was not yet part of a corroborated flow may be promoted
+        # under that one root and only that root, which is the supported
+        # root -> decision -> unit insertion.
+        preserved = (
+            current_aether_roots
+            and participating_aether_roots == current_aether_roots
+            and len(current_aether_roots) == 1
+            and prospective_roots == participating_aether_roots
+        )
+        promoted = (
+            not current_aether_roots
+            and len(participating_aether_roots) == 1
+            and prospective_roots == participating_aether_roots
+        )
+        if not (preserved or promoted):
+            affected = repr(task_id) if task_id is not None else "new task"
+            raise ValueError(
+                "prospective parentage would change the canonical Aether collaboration "
+                f"root for {affected}; expected exactly one corroborated Aether root "
+                f"but found {sorted(prospective_roots)!r} (existing "
+                f"{sorted(current_aether_roots)!r})"
+            )
+
+
+def _descendants_of(conn: sqlite3.Connection, root_id: str) -> set[str]:
+    rows = conn.execute(
+        """WITH RECURSIVE descendants(id) AS (
+               SELECT ?
+               UNION
+               SELECT l.child_id
+                 FROM task_links l
+                 JOIN descendants d ON d.id = l.parent_id
+           )
+           SELECT id FROM descendants""",
+        (root_id,),
+    ).fetchall()
+    return {row["id"] for row in rows}
+
+
 def _qualify_cross_profile_affinity_review(
     conn: sqlite3.Connection,
     task: Task,
@@ -4681,6 +4984,13 @@ def create_task(
                     if missing:
                         raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
 
+                # Validate the full prospective ancestry before inserting any
+                # task, edge, event, subscription, or workspace-side state.
+                if parents:
+                    _validate_prospective_aether_parentage(
+                        conn, parents, prospective_project_id=project_id
+                    )
+
                 # Project-linked worktree: a fresh worktree dir under the repo
                 # plus a deterministic branch (project slug + task id). Together
                 # these kill the random ``wt/<task-id>`` worker fallback and the
@@ -5219,6 +5529,11 @@ def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
             raise ValueError(
                 f"linking {parent_id} -> {child_id} would create a cycle"
             )
+        # Check the child and every descendant before this edge can affect
+        # ancestry, status, events, or inherited notification subscriptions.
+        _validate_prospective_aether_parentage(
+            conn, (parent_id,), affected_task_id=child_id
+        )
         conn.execute(
             "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
             (parent_id, child_id),

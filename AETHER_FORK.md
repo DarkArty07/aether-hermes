@@ -496,6 +496,43 @@ Rollback reverts the implementation commit. Retire after an adopted upstream rel
 cross-profile review dispatch on affinity-bound cards or native review delegation without lease
 corruption; source tests do not establish installed runtime adoption.
 
+## Rooted Aether parentage (Aether #460)
+
+From exact fork base `58750d6cf8182c0ff5093719b9e7cc5026621fbf`, native
+`create_task(parents=...)` and `link_tasks` reject prospective Aether ancestry that
+would add or substitute a root. The guard corroborates persisted collaboration opt-in
+events against metadata attached to the connection's actual board database and
+requires the exact Aether Project, contract and version identity for a valid canonical
+root; an ambient/default board or isolated Aether-looking metadata key cannot opt a
+generic board into the rule. When an opt-in event carries the native Aether Project
+snapshot but the current board metadata is missing or inconsistent, the claim is treated
+as damaged and affected parentage is refused rather than falling back to generic DAG
+behavior.
+
+Validation runs inside each existing write transaction, before task/link/event/status/
+notification-subscription changes. `link_tasks` checks the child and its descendants
+against the prospective ancestry, including removal of a rootless node's old self-root
+when its first parent is attached. Thus a valid root-to-decision-to-unit chain retains
+the original root; unrelated generic Hermes multi-root DAGs remain valid. No historical
+edge is synthesized or rewritten, and the existing reviewer fail-closed guard remains
+responsible for pre-damaged graphs.
+
+The invariant is per node, not per graph: an affected node's corroborated root set must
+be unchanged — exactly one, the same one — rather than the final graph merely reaching
+at most one recognized root. A previously rootless node may be promoted under the
+canonical root (the supported root-to-decision-to-unit insertion), but an already
+rooted node may not be substituted: attaching a generic root or a second corroborated
+root above an existing opted-in root is refused before any link, status change, event or
+notification-subscription write, because either would give existing descendants a
+different collaboration root and leave the flow pre-damaged for the fail-closed review
+guard.
+
+The scoped regression surface is `tests/hermes_cli/test_kanban_collaboration.py` and
+`tests/hermes_cli/test_kanban_session_affinity.py`, alongside
+`hermes_cli/kanban_db.py`. This is fork-source behavior only: it does not change an
+installed runtime or release pin. Portable HLP-460 packaging and any later adoption are
+separate reviewed work.
+
 ## Distribution identity and release binding
 
 The fork keeps its own distribution and version identity: `hermes-agent` `0.20.1`
