@@ -501,16 +501,21 @@ corruption; source tests do not establish installed runtime adoption.
 From exact fork base `58750d6cf8182c0ff5093719b9e7cc5026621fbf`, native
 `create_task(parents=...)` and `link_tasks` reject prospective Aether ancestry that
 would add or substitute a root. The guard corroborates persisted collaboration opt-in
-events against the metadata attached to the connection's actual board database and
-requires the exact Aether Project, contract and version identity; an ambient/default
-board or isolated Aether-looking metadata key cannot opt a generic board into the rule.
+events against metadata attached to the connection's actual board database and
+requires the exact Aether Project, contract and version identity for a valid canonical
+root; an ambient/default board or isolated Aether-looking metadata key cannot opt a
+generic board into the rule. When an opt-in event carries the native Aether Project
+snapshot but the current board metadata is missing or inconsistent, the claim is treated
+as damaged and affected parentage is refused rather than falling back to generic DAG
+behavior.
 
 Validation runs inside each existing write transaction, before task/link/event/status/
-notification-subscription changes. `link_tasks` checks the child and its descendants,
-so a new edge cannot invalidate an already rooted descendant. A valid root-to-decision-
-to-unit chain retains the original root; generic Hermes multi-root DAGs remain valid.
-No historical edge is synthesized or rewritten, and the existing reviewer fail-closed
-guard remains responsible for pre-damaged graphs.
+notification-subscription changes. `link_tasks` checks the child and its descendants
+against the prospective ancestry, including removal of a rootless node's old self-root
+when its first parent is attached. Thus a valid root-to-decision-to-unit chain retains
+the original root; unrelated generic Hermes multi-root DAGs remain valid. No historical
+edge is synthesized or rewritten, and the existing reviewer fail-closed guard remains
+responsible for pre-damaged graphs.
 
 The scoped regression surface is `tests/hermes_cli/test_kanban_collaboration.py` and
 `tests/hermes_cli/test_kanban_session_affinity.py`, alongside

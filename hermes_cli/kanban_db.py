@@ -1462,9 +1462,12 @@ def _aether_root_identity_for_conn(
     contract_version = str(meta.get("aether_contract_version") or "").strip()
     project_id = str(meta.get("project_id") or "").strip()
     aether_project_id = str(meta.get("aether_project_id") or "").strip()
-    if not all((contract_id, contract_version, project_id)):
-        return set(), set(), ""
-    has_aether_project_id = bool(aether_project_id)
+    complete_identity = all((
+        contract_id,
+        contract_version,
+        project_id,
+        aether_project_id,
+    ))
 
     events = conn.execute(
         """SELECT e.task_id, e.payload, t.project_id
@@ -1487,11 +1490,42 @@ def _aether_root_identity_for_conn(
             if isinstance(payload, dict)
             else ""
         )
-        # Events for another Project on a shared board are not claims about this
-        # Aether flow. A matching task OR persisted event Project is enough to
-        # recognize a possibly damaged claim, but exact identity is required
-        # before it can become a canonical root.
-        if event["project_id"] != project_id and event_project_id != project_id:
+        snapshot_project_id = (
+            str(payload.get("aether_project_id") or "").strip()
+            if isinstance(payload, dict)
+            else ""
+        )
+        # The snapshot is written only when native opt-in saw the complete
+        # Aether board binding. Keep recognizing that persisted claim if the
+        # binding is later removed or changed, but never treat it as valid
+        # unless the current board still corroborates the exact same identity.
+        if snapshot_project_id:
+            exact_identity = (
+                complete_identity
+                and event["project_id"] == project_id
+                and event_project_id == project_id
+                and str(payload.get("contract_id") or "").strip() == contract_id
+                and str(payload.get("contract_version") or "").strip()
+                == contract_version
+                and snapshot_project_id == aether_project_id
+            )
+            if (
+                not exact_identity
+                or payload.get("mode") != "advisory"
+                or parent_ids(conn, event["task_id"])
+            ):
+                invalid_claims.add(event["task_id"])
+            else:
+                roots.add(event["task_id"])
+            continue
+
+        # Legacy native opt-ins predate the Aether Project snapshot. They are
+        # recognized only while the actual board still supplies the full exact
+        # identity; a generic opt-in or a lone Aether-looking key stays generic.
+        relevant_to_board = bool(project_id) and (
+            event["project_id"] == project_id or event_project_id == project_id
+        )
+        if not complete_identity or not relevant_to_board:
             continue
         if (
             not isinstance(payload, dict)
@@ -1500,11 +1534,6 @@ def _aether_root_identity_for_conn(
             or event_project_id != project_id
             or str(payload.get("contract_id") or "").strip() != contract_id
             or str(payload.get("contract_version") or "").strip() != contract_version
-            or not has_aether_project_id
-            or (
-                payload.get("aether_project_id") is not None
-                and str(payload.get("aether_project_id")).strip() != aether_project_id
-            )
             or parent_ids(conn, event["task_id"])
         ):
             invalid_claims.add(event["task_id"])
@@ -1526,6 +1555,37 @@ def _ancestor_task_ids(conn: sqlite3.Connection, task_id: str) -> set[str]:
         (task_id,),
     ).fetchall()
     return {row["id"] for row in rows}
+
+
+def _find_ancestor_roots_with_prospective_parents(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    linked_child_id: str,
+    new_parent_ids: Iterable[str],
+) -> set[str]:
+    """Find roots after adding parents to one existing node, without writing."""
+    prospective_parents = tuple(new_parent_ids)
+    visited: set[str] = set()
+    roots: set[str] = set()
+    queue = [task_id]
+    while queue:
+        current_id = queue.pop(0)
+        if current_id in visited:
+            continue
+        visited.add(current_id)
+        current_parents = parent_ids(conn, current_id)
+        if current_id == linked_child_id:
+            current_parents = tuple(
+                dict.fromkeys((*current_parents, *prospective_parents))
+            )
+        if not current_parents:
+            roots.add(current_id)
+        else:
+            queue.extend(
+                parent_id for parent_id in current_parents if parent_id not in visited
+            )
+    return roots
 
 
 def _validate_prospective_aether_parentage(
@@ -1560,10 +1620,15 @@ def _validate_prospective_aether_parentage(
         prospective_nodes = _descendants_of(conn, affected_task_id)
 
     for task_id in prospective_nodes:
-        existing_roots = (
-            set() if task_id is None else _find_ancestor_roots(conn, task_id)
-        )
-        prospective_roots = existing_roots | parent_roots
+        if task_id is None:
+            prospective_roots = parent_roots
+        else:
+            prospective_roots = _find_ancestor_roots_with_prospective_parents(
+                conn,
+                task_id,
+                linked_child_id=affected_task_id,
+                new_parent_ids=parent_ids_to_check,
+            )
         participating_aether_roots = prospective_roots & aether_roots
         existing_ancestors = (
             set() if task_id is None else _ancestor_task_ids(conn, task_id)

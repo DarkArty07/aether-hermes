@@ -1065,6 +1065,58 @@ def test_aether_link_tasks_preserves_same_root_across_descendants_atomically(
     assert kb.get_collaboration_root(conn, unit) == root
 
 
+def test_aether_link_tasks_allows_new_rootless_decision_chain(
+    board_db: tuple[Path, sqlite3.Connection],
+) -> None:
+    """Linking fresh rootless nodes beneath the canonical root preserves that root."""
+    kanban_home, conn = board_db
+    project_id, canonical, _ = _aether_parentage_fixture(kanban_home, conn)
+    root = kb.create_task(
+        conn,
+        title="canonical root",
+        assignee="supervisor",
+        project_id=project_id,
+        workspace_kind="dir",
+        workspace_path=canonical,
+    )
+    assert kb.opt_in_collaboration(
+        conn,
+        root,
+        contract_id="oc_hf460",
+        contract_version="1",
+        session_id="origin-session",
+        board="test_board",
+    )
+    decision = kb.create_task(
+        conn, title="rootless decision", assignee="supervisor", project_id=project_id
+    )
+    existing_unit = kb.create_task(
+        conn,
+        title="existing rootless descendant",
+        assignee="implementer",
+        project_id=project_id,
+        parents=(decision,),
+    )
+
+    kb.link_tasks(conn, root, decision)
+    assert kb.get_collaboration_root(conn, decision) == root
+    assert kb.get_collaboration_root(conn, existing_unit) == root
+
+    later_unit = kb.create_task(
+        conn, title="later rootless unit", assignee="implementer", project_id=project_id
+    )
+    kb.link_tasks(conn, decision, later_unit)
+    assert kb.get_collaboration_root(conn, later_unit) == root
+
+    # Aether identity on the board must not restrict an unrelated generic DAG.
+    generic_a = kb.create_task(conn, title="generic root A", assignee="worker")
+    generic_b = kb.create_task(conn, title="generic root B", assignee="worker")
+    generic_child = kb.create_task(conn, title="generic child", assignee="worker")
+    kb.link_tasks(conn, generic_a, generic_child)
+    kb.link_tasks(conn, generic_b, generic_child)
+    assert kb.get_collaboration_root(conn, generic_child) is None
+
+
 def test_aether_link_rejects_project_mismatch_before_side_effects(
     board_db: tuple[Path, sqlite3.Connection],
     tmp_path: Path,
@@ -1156,6 +1208,84 @@ def test_aether_parentage_rejects_incomplete_project_identity_claim_atomically(
         )
     assert _parentage_snapshot(conn) == before
     assert kb.get_collaboration_root(conn, root) == root
+
+
+@pytest.mark.parametrize(
+    "damage", ["missing_contract", "changed_project", "missing_metadata"]
+)
+def test_aether_link_rejects_damaged_board_identity_atomically(
+    board_db: tuple[Path, sqlite3.Connection], damage: str
+) -> None:
+    """Persisted Aether opt-in snapshots stay guarded if board identity is damaged."""
+    kanban_home, conn = board_db
+    project_id, canonical, candidate = _aether_parentage_fixture(kanban_home, conn)
+    root = kb.create_task(
+        conn,
+        title="canonical root",
+        assignee="supervisor",
+        project_id=project_id,
+        workspace_kind="dir",
+        workspace_path=canonical,
+    )
+    assert kb.opt_in_collaboration(
+        conn,
+        root,
+        contract_id="oc_hf460",
+        contract_version="1",
+        session_id="origin-session",
+        board="test_board",
+    )
+    decision = kb.create_task(
+        conn,
+        title="decision",
+        assignee="supervisor",
+        project_id=project_id,
+        parents=(root,),
+        workspace_kind="dir",
+        workspace_path=canonical,
+    )
+    unit = kb.create_task(
+        conn,
+        title="unit",
+        assignee="implementer",
+        project_id=project_id,
+        parents=(decision,),
+        workspace_kind="dir",
+        workspace_path=candidate,
+    )
+    unrelated = kb.create_task(
+        conn,
+        title="unrelated root",
+        assignee="supervisor",
+        project_id=project_id,
+    )
+    kb.add_notify_sub(
+        conn,
+        task_id=unrelated,
+        platform="tui",
+        chat_id="unrelated-chat",
+        delivery_mode="notify",
+    )
+
+    metadata_path = kb.board_metadata_path("test_board")
+    if damage == "missing_metadata":
+        metadata_path.unlink()
+    else:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if damage == "missing_contract":
+            metadata.pop("aether_contract_id")
+        else:
+            metadata["project_id"] = "different-project"
+        metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    before = _parentage_snapshot(conn)
+    with pytest.raises(
+        ValueError, match="malformed or mismatched Aether collaboration claim"
+    ):
+        kb.link_tasks(conn, unrelated, unit)
+    assert _parentage_snapshot(conn) == before
+    assert kb.get_collaboration_root(conn, decision) == root
+    assert kb.get_collaboration_root(conn, unit) == root
 
 
 def test_generic_multiroot_create_is_unchanged_by_aether_parentage_guard(
