@@ -533,6 +533,34 @@ The scoped regression surface is `tests/hermes_cli/test_kanban_collaboration.py`
 installed runtime or release pin. Portable HLP-460 packaging and any later adoption are
 separate reviewed work.
 
+## Codex message-id prefix guard (Aether #554)
+
+From base `007cfb77676b6b024d2c0986f4585e6cfdcf18d6`, implementation
+`971698cafbf477f65f6d0792dc708b759f24a500` (fork PR #24, merge
+`96cdb97ede6e1726ad9651eb6d91553356563dcd`) keeps a replayed assistant message `id`
+only when it also starts with `msg`, in both `_chat_messages_to_responses_input` and
+`_preflight_codex_input_items`. Codex Responses rejects a foreign id, such as a UUID
+minted by another provider, with a non-retryable HTTP 400 that repeats on every later
+turn of an affinity-bound worker session. The id is optional replay metadata. Content,
+phase, valid `msg` ids and tool-call pairing are unchanged, and GitHub Responses still
+drops every id.
+
+Upstream released `v2026.9.24` (commit `f97608f178d1ffeca59860195ab7da295f7c8e5f`) and
+main at `eb7e8620324b32424c06218f6a28094df2e921f8` drop non-`msg` ids only when the
+current issuer is the ChatGPT Codex backend, inside a refactored helper. This fork's
+guard applies to every non-GitHub Responses issuer. The same two-line guard had been
+applied locally to the installed Aether RC17 runtime; this commit is its reviewed
+source.
+
+Evidence: six parametrized regressions in `tests/agent/test_codex_responses_adapter.py`;
+the four foreign-id cases were RED before the fix. In a disposable venv with the `dev`
+extra, the Codex adapter, run-agent Codex Responses, provider parity, sanitization,
+multimodal tool-result and native-compaction suites passed (227) with the fix, and the
+same files passed (221) at the base. Revert the implementation commit to roll back.
+Retirement requires an adopted upstream release whose guard covers the issuers Aether
+uses. Inherited Actions remain disabled (NOT RUN, never green). This source change
+claims no installed-runtime, configuration or credential change.
+
 ## Distribution identity and release binding
 
 The fork keeps its own distribution and version identity: `hermes-agent` `0.20.1`
