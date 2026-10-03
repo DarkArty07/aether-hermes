@@ -382,6 +382,67 @@ def test_preflight_codex_api_kwargs_drops_oversized_message_id_end_to_end():
 
 
 # ---------------------------------------------------------------------------
+# Aether #554: a foreign message id (for example a UUID minted by another
+# provider) passes the length guard, but Codex Responses rejects an assistant
+# input[].id that does not start with ``msg`` -- a non-retryable HTTP 400 that
+# repeats on every later turn of an affinity-bound session. The id is optional
+# replay metadata, so a foreign id is dropped and ``msg`` ids are still kept.
+# ---------------------------------------------------------------------------
+
+_FOREIGN_UUID_ITEM_ID = "3f2b8c1e-9d4a-4e6f-8b2a-1c5d7e9f0a3b"
+_ID_CASES = [
+    (_FOREIGN_UUID_ITEM_ID, False),
+    ("item_123", False),
+    (_VALID_ITEM_ID, True),
+]
+
+
+def _assistant_message_item(item_id):
+    return {
+        "type": "message",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{"type": "output_text", "text": "pong"}],
+        "id": item_id,
+        "phase": "final_answer",
+    }
+
+
+@pytest.mark.parametrize(("item_id", "kept"), _ID_CASES)
+def test_chat_messages_to_responses_input_keeps_only_msg_message_ids(item_id, kept):
+    messages = [
+        {"role": "user", "content": "ping"},
+        {
+            "role": "assistant",
+            "content": "pong",
+            "codex_message_items": [_assistant_message_item(item_id)],
+        },
+    ]
+
+    items = _chat_messages_to_responses_input(messages)
+
+    replayed = next(
+        i for i in items if i.get("type") == "message" and i.get("role") == "assistant"
+    )
+    assert ("id" in replayed) is kept
+    if kept:
+        assert replayed["id"] == item_id
+    assert replayed["phase"] == "final_answer"
+    assert replayed["content"] == [{"type": "output_text", "text": "pong"}]
+
+
+@pytest.mark.parametrize(("item_id", "kept"), _ID_CASES)
+def test_preflight_codex_input_items_keeps_only_msg_message_ids(item_id, kept):
+    items = _preflight_codex_input_items([_assistant_message_item(item_id)])
+
+    assert ("id" in items[0]) is kept
+    if kept:
+        assert items[0]["id"] == item_id
+    assert items[0]["phase"] == "final_answer"
+    assert items[0]["content"] == [{"type": "output_text", "text": "pong"}]
+
+
+# ---------------------------------------------------------------------------
 # _preflight_codex_api_kwargs — built-in (provider-executed) tools must pass
 # through validation.  Regression guard for the xAI native web_search
 # injection: the preflight validator previously rejected any tool whose

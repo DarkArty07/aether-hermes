@@ -617,7 +617,7 @@ def _chat_messages_to_responses_input(
                             and item_id.strip()
                         ):
                             stripped_id = item_id.strip()
-                            if len(stripped_id) <= _MAX_RESPONSES_ITEM_ID_LENGTH:
+                            if stripped_id.startswith("msg") and len(stripped_id) <= _MAX_RESPONSES_ITEM_ID_LENGTH:
                                 replay_item["id"] = stripped_id
                         phase = raw_item.get("phase")
                         if isinstance(phase, str) and phase.strip():
@@ -921,7 +921,7 @@ def _preflight_codex_input_items(
                 and item_id.strip()
             ):
                 stripped_id = item_id.strip()
-                if len(stripped_id) <= _MAX_RESPONSES_ITEM_ID_LENGTH:
+                if stripped_id.startswith("msg") and len(stripped_id) <= _MAX_RESPONSES_ITEM_ID_LENGTH:
                     normalized_item["id"] = stripped_id
             phase = item.get("phase")
             if isinstance(phase, str) and phase.strip():
